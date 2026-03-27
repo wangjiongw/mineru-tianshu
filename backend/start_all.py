@@ -38,6 +38,7 @@ class TianshuLauncher:
         mcp_port=8002,
         paddleocr_vl_vllm_engine_enabled=False,  # 新增paddle ocr vllm engine 配置
         paddleocr_vl_vllm_api_list=[],  # 新增paddle ocr vllm engine 配置
+        mineru_vllm_api_list=[],  # 新增mineru vllm api list 配置
     ):
         self.output_dir = output_dir
         self.api_port = api_port
@@ -50,6 +51,7 @@ class TianshuLauncher:
         self.processes = []
         self.paddleocr_vl_vllm_engine_enabled = paddleocr_vl_vllm_engine_enabled
         self.paddleocr_vl_vllm_api_list = paddleocr_vl_vllm_api_list
+        self.mineru_vllm_api_list = mineru_vllm_api_list
 
     def check_ocr_models(self):
         """检查并下载所有 OCR 模型（异步，不阻塞启动）"""
@@ -146,6 +148,9 @@ class TianshuLauncher:
                 worker_cmd.extend(["--paddleocr-vl-vllm-engine-enabled"])
             # 添加 paddleocr-vl-vllm-api-list 参数
             worker_cmd.extend(["--paddleocr-vl-vllm-api-list", str(self.paddleocr_vl_vllm_api_list)])
+            # 添加 mineru-vllm-api-list 参数
+            if self.mineru_vllm_api_list:
+                worker_cmd.extend(["--mineru-vllm-api-list", str(self.mineru_vllm_api_list)])
 
             worker_proc = subprocess.Popen(worker_cmd, cwd=Path(__file__).parent, env=worker_env)
             self.processes.append(("LitServe Workers", worker_proc))
@@ -351,6 +356,13 @@ def main():
         default=[],
         help='PaddleOCR VL VLLM API 列表（Python list 字面量格式，如: \'["http://0.0.0.0:17300/v1", "http://0.0.0.0:17301/v1"]\'）',
     )
+    # 配置 MinerU VLLM API
+    parser.add_argument(
+        "--mineru-vllm-api-list",
+        type=parse_list_arg,
+        default=[],
+        help='MinerU VLLM API 列表（Python list 字面量格式，如: \'["http://localhost:30025/v1", "http://localhost:30026/v1"]\'）',
+    )
 
     args = parser.parse_args()
 
@@ -385,6 +397,7 @@ def main():
         mcp_port=args.mcp_port,
         paddleocr_vl_vllm_engine_enabled=args.paddleocr_vl_vllm_engine_enabled,
         paddleocr_vl_vllm_api_list=args.paddleocr_vl_vllm_api_list,
+        mineru_vllm_api_list=args.mineru_vllm_api_list,
     )
 
     # 设置信号处理
