@@ -25,9 +25,12 @@ function getApiBaseUrl(): string {
     const apiPort = import.meta.env.VITE_API_PORT || '8000' // 后端端口，默认 8000
     baseUrl = `${protocol}//${hostname}:${apiPort}`
   }
-  // 3. 开发环境：使用 localhost
+  // 3. 开发环境：同样使用当前 hostname + 后端端口（支持 Kubernetes 端口映射）
   else {
-    baseUrl = 'http://localhost:8000'
+    const protocol = window.location.protocol
+    const hostname = window.location.hostname
+    const apiPort = import.meta.env.VITE_API_PORT || '8000'
+    baseUrl = `${protocol}//${hostname}:${apiPort}`
   }
 
   // ✅ [核心修复]：把 BaseURL 洗得干干净净，只留纯域名！

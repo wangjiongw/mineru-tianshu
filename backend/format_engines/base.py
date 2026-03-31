@@ -45,6 +45,7 @@ class FormatEngine(ABC):
                 "format": str,              # 格式名称
                 "markdown": str,            # Markdown 格式的内容（用于 RAG）
                 "json_content": dict,       # 结构化 JSON 数据（用于 RAG）
+                "mineru_model": dict,       # 模型输出的结构化数据（用于 llm-aid）
                 "metadata": dict,           # 元数据信息（可选）
                 "summary": str,             # 简要摘要（可选）
             }

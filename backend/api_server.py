@@ -12,6 +12,7 @@ import json
 import os
 import re
 import uuid
+import hashlib
 import shutil  # ✅ 用于删除非空目录
 import mimetypes  # ✅ 用于自动识别文件类型
 from datetime import datetime
@@ -273,12 +274,16 @@ async def submit_task(
         unique_filename = f"{uuid.uuid4().hex}_{file.filename}"
         temp_file_path = UPLOAD_DIR / unique_filename
 
+        file_hash = hashlib.sha256()
         with open(temp_file_path, "wb") as temp_file:
             while True:
                 chunk = await file.read(1 << 23)
                 if not chunk:
                     break
                 temp_file.write(chunk)
+                file_hash.update(chunk)
+
+        file_hash = file_hash.hexdigest()
 
         options = {
             "lang": lang,
@@ -329,21 +334,31 @@ async def submit_task(
 
         options["upload_images"] = os.getenv("RUSTFS_ENABLED", "true").lower() == "true"
 
-        task_id = db.create_task(
+        task_result = db.create_task(
             file_name=file.filename,
             file_path=str(temp_file_path),
             backend=backend,
             options=options,
             priority=priority,
             user_id=current_user.user_id,
+            file_hash=file_hash,
+            lang=lang,
+            method=method,
         )
 
-        logger.info(f"✅ Task submitted: {task_id} - {file.filename}")
+        logger.info(f"✅ Task submitted: {task_result['task_id']} - {file.filename}")
+        message = "Task submitted successfully"
+        if task_result.get("deduped"):
+            message = "Task already exists"
+            if task_result.get("requeued"):
+                message = "Existing task requeued"
+
         return {
             "success": True,
-            "task_id": task_id,
-            "status": "pending",
-            "message": "Task submitted successfully",
+            "task_id": task_result["task_id"],
+            "status": task_result["status"],
+            "deduped": task_result.get("deduped", False),
+            "message": message,
             "file_name": file.filename,
             "user_id": current_user.user_id,
             "created_at": datetime.now().isoformat(),
@@ -366,8 +381,9 @@ async def get_task_status(
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    if not current_user.has_permission(Permission.TASK_VIEW_ALL):
-        if task.get("user_id") != current_user.user_id:
+    can_view_all = current_user.has_permission(Permission.TASK_VIEW_ALL)
+    if not can_view_all:
+        if task.get("user_id") != current_user.user_id and not task.get("shared_read"):
             raise HTTPException(status_code=403, detail="Permission denied: You can only view your own tasks")
 
     source_url = None
@@ -392,6 +408,7 @@ async def get_task_status(
         "started_at": task["started_at"],
         "completed_at": task["completed_at"],
         "user_id": task.get("user_id"),
+        "shared_read": task.get("shared_read"),
     }
 
     if not task.get("is_parent"):
@@ -434,8 +451,9 @@ async def get_task_status(
             json_files = [
                 f for f in result_dir.rglob("*.json")
                 if not f.parent.name.startswith("page_")
-                and (f.name in ["content.json", "result.json"] or "_content_list.json" in f.name)
+                and (f.name in ["content.json", "result.json", "mineru_model.json"] or "_content_list.json" in f.name)
             ]
+            mineru_model_file = next((f for f in result_dir.rglob("*.json") if f.name == "mineru_model.json"), None)
             
             if md_files or json_files:
                 try:
@@ -468,7 +486,8 @@ async def get_task_status(
                              pass
 
                     if format in ["markdown", "both"] and md_files:
-                        md_file = next((f for f in md_files if f.name == "result.md"), md_files[0])
+                        md_file = next((f for f in md_files if f.name == "result.md"),
+                                       max(md_files, key=lambda f: f.stat().st_size))
                         image_dir = md_file.parent / "images"
                         with open(md_file, "r", encoding="utf-8") as f:
                             md_content = f.read()
@@ -490,6 +509,13 @@ async def get_task_status(
                             response["data"]["json_content"] = json_content
                         except Exception:
                             pass
+
+                        if mineru_model_file:
+                            try:
+                                with open(mineru_model_file, "r", encoding="utf-8") as f:
+                                    response["data"]["mineru_model_content"] = json_lib.load(f)
+                            except Exception:
+                                pass
                     elif format == "json" and not json_files:
                         response["data"]["message"] = "JSON format not available for this backend"
 
@@ -522,6 +548,8 @@ async def delete_task(task_id: str, current_user: User = Depends(get_current_act
 
     # 权限检查
     if not current_user.has_permission(Permission.TASK_DELETE_ALL):
+        if task.get("shared_read"):
+            raise HTTPException(status_code=403, detail="Permission denied: shared tasks can only be deleted by admin")
         if task.get("user_id") != current_user.user_id:
             raise HTTPException(status_code=403, detail="Permission denied: You can only delete your own tasks")
 
@@ -663,7 +691,9 @@ async def clear_task_cache_endpoint(task_id: str, current_user: User = Depends(g
         raise HTTPException(status_code=404, detail="Task not found")
     
     if not current_user.has_permission(Permission.TASK_DELETE_ALL):
-         if task.get("user_id") != current_user.user_id:
+        if task.get("shared_read"):
+            raise HTTPException(status_code=403, detail="Permission denied: shared tasks can only be cleared by admin")
+        if task.get("user_id") != current_user.user_id:
             raise HTTPException(status_code=403, detail="Permission denied")
 
     output_dir = OUTPUT_DIR / task_id
@@ -706,7 +736,7 @@ async def list_tasks(
     params = []
 
     if not can_view_all:
-        conditions.append("user_id = ?")
+        conditions.append("(user_id = ? OR shared_read = 1)")
         params.append(current_user.user_id)
 
     if status:

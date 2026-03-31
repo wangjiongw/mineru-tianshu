@@ -3,7 +3,7 @@
 """
 
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 from loguru import logger
 import shutil
 import re
@@ -15,21 +15,24 @@ class StandardOutputNormalizer(BaseOutputNormalizer):
     标准输出规范化器（MinerU 等）
 
     将不同引擎的输出统一为标准格式：
-    - result.md: 主 Markdown 文件
-    - images/: 图片目录（统一名称）
-    - result.json: 结构化数据（如果有）
+    - full.md:         原始 Markdown，图片路径保持 images/xxx.jpg
+    - result.md:       处理版，图片路径替换为 RustFS URL 或本地 API 路径
+    - images/:         图片目录（统一名称）
+    - result.json:     结构化数据（content_list）
+    - mineru_model.json: MinerU 模型输出（如果存在）
     """
 
     def _normalize_local_files(self, output_dir: Path) -> Dict[str, Any]:
         result = {
-            "markdown_file": None,
+            "markdown_file": None,   # result.md，供 base 类做 URL 替换
+            "full_md_file": None,    # full.md，保持 images/xxx.jpg 不变
             "json_file": None,
             "image_dir": None,
             "image_count": 0,
         }
 
-        # 1. 规范化 Markdown 文件
-        result["markdown_file"] = self._normalize_markdown(output_dir)
+        # 1. 规范化 Markdown — 同时生成 full.md 和 result.md
+        result["full_md_file"], result["markdown_file"] = self._normalize_markdown(output_dir)
 
         # 2. 规范化图片目录
         result["image_dir"], result["image_count"] = self._normalize_images(output_dir)
@@ -37,45 +40,72 @@ class StandardOutputNormalizer(BaseOutputNormalizer):
         # 3. 规范化 JSON 文件
         result["json_file"] = self._normalize_json(output_dir)
 
-        # 4. 如果有图片目录，更新 Markdown 中的图片引用
-        if result["image_dir"] and result["markdown_file"]:
-            self._update_markdown_image_refs(result["markdown_file"])
+        # 4. 复制 MinerU model JSON
+        self._copy_model_json(output_dir)
+
+        # 5. 两个 md 文件都先统一为 images/xxx.jpg（base 类后续只修改 result.md）
+        if result["image_dir"]:
+            for md in [result["full_md_file"], result["markdown_file"]]:
+                if md:
+                    self._update_markdown_image_refs(md)
+
+        # 6. 清理 MinerU 原始输出中不再需要的文件
+        self._cleanup_original_files(output_dir)
 
         return result
 
-    def _normalize_markdown(self, output_dir: Path) -> Optional[Path]:
+    def _normalize_markdown(self, output_dir: Path) -> Tuple[Optional[Path], Optional[Path]]:
         """
-        规范化 Markdown 文件
+        规范化 Markdown 文件，同时生成 full.md 和 result.md。
 
-        查找并重命名为标准名称：result.md
+        Returns:
+            (full_md_path, result_md_path)
         """
-        # 查找所有 .md 文件（递归）
-        md_files = list(output_dir.rglob("*.md"))
+        full_md = output_dir / "full.md"
+        result_md = output_dir / "result.md"
+
+        # 两个文件都已存在，直接返回
+        if full_md.exists() and result_md.exists():
+            logger.info("✅ full.md and result.md already exist")
+            return full_md, result_md
+
+        # 查找所有 .md 文件（递归），排除已存在的标准文件
+        md_files = [
+            f for f in output_dir.rglob("*.md")
+            if f.name not in ("full.md", "result.md")
+        ]
 
         if not md_files:
+            # 如果只有其中一个存在，用它补另一个
+            if full_md.exists() and not result_md.exists():
+                shutil.copy2(full_md, result_md)
+                logger.info("📄 Copied full.md -> result.md")
+                return full_md, result_md
+            if result_md.exists() and not full_md.exists():
+                shutil.copy2(result_md, full_md)
+                logger.info("📄 Copied result.md -> full.md")
+                return full_md, result_md
             logger.warning("⚠️  No markdown files found")
-            return None
-
-        # 如果已经有 result.md，直接返回
-        standard_md = output_dir / self.STANDARD_MARKDOWN_NAME
-        if standard_md.exists():
-            logger.info(f"✅ Standard markdown file already exists: {standard_md.name}")
-            return standard_md
+            return None, None
 
         # 选择最大的 .md 文件（通常是主文件）
         main_md = max(md_files, key=lambda f: f.stat().st_size)
         logger.info(f"📄 Found main markdown: {main_md.relative_to(output_dir)}")
 
-        # 如果不在根目录，移动到根目录
-        if main_md.parent != output_dir:
-            logger.info("   Moving to root directory...")
-            shutil.copy2(main_md, standard_md)
-        else:
-            # 重命名
-            logger.info(f"   Renaming to {self.STANDARD_MARKDOWN_NAME}...")
-            main_md.rename(standard_md)
+        # 同时 copy 为 full.md 和 result.md
+        if not full_md.exists():
+            shutil.copy2(main_md, full_md)
+            logger.info(f"   Copied -> full.md")
+        if not result_md.exists():
+            shutil.copy2(main_md, result_md)
+            logger.info(f"   Copied -> result.md")
 
-        return standard_md
+        # 若原文件在根目录且不是标准名，删除原文件
+        if main_md.parent == output_dir:
+            main_md.unlink()
+            logger.info(f"   Removed original: {main_md.name}")
+
+        return full_md, result_md
 
     def _normalize_images(self, output_dir: Path) -> tuple[Optional[Path], int]:
         """
@@ -163,6 +193,7 @@ class StandardOutputNormalizer(BaseOutputNormalizer):
             f
             for f in output_dir.rglob("*.json")
             if not f.parent.name.startswith("page_")  # 排除 PaddleOCR-VL 的分页文件
+            and f.name != "mineru_model.json"          # 排除已生成的 model json
         ]
 
         if not json_files:
@@ -175,15 +206,22 @@ class StandardOutputNormalizer(BaseOutputNormalizer):
             logger.info(f"✅ Standard JSON file already exists: {standard_json.name}")
             return standard_json
 
-        # 选择主 JSON 文件（优先选择 content_list.json 或最大的文件）
+        # 选择主 JSON 文件（优先选择 content_list.json 或最大的文件，排除 model json）
         main_json = None
         for f in json_files:
+            if f.name == "mineru_model.json":
+                continue
             if "content_list" in f.name or "result" in f.name:
                 main_json = f
                 break
 
         if not main_json:
-            main_json = max(json_files, key=lambda f: f.stat().st_size)
+            candidates = [f for f in json_files if f.name != "mineru_model.json"]
+            if candidates:
+                main_json = max(candidates, key=lambda f: f.stat().st_size)
+
+        if not main_json:
+            return None
 
         logger.info(f"📄 Found main JSON: {main_json.relative_to(output_dir)}")
 
@@ -197,6 +235,52 @@ class StandardOutputNormalizer(BaseOutputNormalizer):
             main_json.rename(standard_json)
 
         return standard_json
+
+    def _copy_model_json(self, output_dir: Path):
+        """
+        复制 MinerU 的 *_model.json 到根目录，命名为 mineru_model.json。
+        """
+        dest = output_dir / "mineru_model.json"
+        if dest.exists():
+            logger.info("✅ mineru_model.json already exists")
+            return
+
+        model_jsons = [
+            f for f in output_dir.rglob("*_model.json")
+            if f.name != "mineru_model.json"
+        ]
+        if model_jsons:
+            shutil.copy2(model_jsons[0], dest)
+            logger.info(f"📄 Copied model JSON: {model_jsons[0].name} -> mineru_model.json")
+        else:
+            logger.debug("ℹ️  No *_model.json found, skipping")
+
+    def _cleanup_original_files(self, output_dir: Path):
+        """
+        清理 MinerU 原始输出中不再需要的文件：
+        - *_layout.pdf
+        - *.origin.pdf
+        - 子目录中的 images/ 文件夹（根目录的 images/ 保留）
+        """
+        standard_image_dir = output_dir / self.STANDARD_IMAGE_DIR
+
+        # 删除 *_layout.pdf 和 *.origin.pdf
+        for pattern in ("*_layout.pdf", "*.origin.pdf"):
+            for f in output_dir.rglob(pattern):
+                try:
+                    f.unlink()
+                    logger.info(f"🗑️  Deleted: {f.relative_to(output_dir)}")
+                except Exception as e:
+                    logger.warning(f"⚠️  Failed to delete {f.name}: {e}")
+
+        # 删除子目录中的 images/ 文件夹（不删除根目录的标准 images/）
+        for img_dir in output_dir.rglob("images"):
+            if img_dir.is_dir() and img_dir != standard_image_dir:
+                try:
+                    shutil.rmtree(img_dir)
+                    logger.info(f"🗑️  Deleted directory: {img_dir.relative_to(output_dir)}")
+                except Exception as e:
+                    logger.warning(f"⚠️  Failed to delete directory {img_dir.name}: {e}")
 
     def _update_markdown_image_refs(self, markdown_file: Path):
         """

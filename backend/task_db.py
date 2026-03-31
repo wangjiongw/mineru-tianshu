@@ -110,6 +110,10 @@ class TaskDB:
                     started_at TIMESTAMP,
                     completed_at TIMESTAMP,
                     worker_id TEXT,
+                    shared_read INTEGER DEFAULT 0,
+                    file_hash TEXT,
+                    lang TEXT,
+                    method TEXT,
                     retry_count INTEGER DEFAULT 0
                 )
             """)
@@ -144,13 +148,57 @@ class TaskDB:
                 cursor.execute("ALTER TABLE tasks ADD COLUMN user_id TEXT")
                 logger.info("✅ user_id field added")
 
-            # 迁移：添加 data 字段（如果不存在）- 用于存储 pdf_path, json_content 等
+            # 迁移：添加 shared_read 字段（如果不存在）
             try:
-                cursor.execute("SELECT data FROM tasks LIMIT 1")
+                cursor.execute("SELECT shared_read FROM tasks LIMIT 1")
             except sqlite3.OperationalError:
-                logger.info("📊 Migrating database schema: adding data field")
-                cursor.execute("ALTER TABLE tasks ADD COLUMN data TEXT")
-                logger.info("✅ data field added")
+                logger.info("📊 Migrating database schema: adding shared_read field")
+                cursor.execute("ALTER TABLE tasks ADD COLUMN shared_read INTEGER DEFAULT 0")
+                logger.info("✅ shared_read field added")
+
+            # 迁移：添加 file_hash/lang/method 字段（如果不存在）
+            try:
+                cursor.execute("SELECT file_hash FROM tasks LIMIT 1")
+            except sqlite3.OperationalError:
+                logger.info("📊 Migrating database schema: adding file_hash field")
+                cursor.execute("ALTER TABLE tasks ADD COLUMN file_hash TEXT")
+                logger.info("✅ file_hash field added")
+
+            try:
+                cursor.execute("SELECT lang FROM tasks LIMIT 1")
+            except sqlite3.OperationalError:
+                logger.info("📊 Migrating database schema: adding lang field")
+                cursor.execute("ALTER TABLE tasks ADD COLUMN lang TEXT")
+                logger.info("✅ lang field added")
+
+            try:
+                cursor.execute("SELECT method FROM tasks LIMIT 1")
+            except sqlite3.OperationalError:
+                logger.info("📊 Migrating database schema: adding method field")
+                cursor.execute("ALTER TABLE tasks ADD COLUMN method TEXT")
+                logger.info("✅ method field added")
+
+            cursor.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_task_dedup ON tasks(file_hash, backend, lang, method)"
+            )
+
+    def get_task_by_dedup(self, file_hash: str, backend: str, lang: str, method: str) -> Optional[Dict]:
+        with self.get_cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT * FROM tasks
+                WHERE file_hash = ? AND backend = ? AND lang = ? AND method = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+            """,
+                (file_hash, backend, lang, method),
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def set_task_shared_read(self, task_id: str) -> None:
+        with self.get_cursor() as cursor:
+            cursor.execute("UPDATE tasks SET shared_read = 1 WHERE task_id = ?", (task_id,))
 
     def create_task(
         self,
@@ -160,19 +208,64 @@ class TaskDB:
         options: dict = None,
         priority: int = 0,
         user_id: str = None,
-    ) -> str:
+        file_hash: str = None,
+        lang: str = None,
+        method: str = None,
+    ) -> Dict:
         """
-        创建新任务
+        创建新任务（含去重）
         """
         task_id = str(uuid.uuid4())
-        with self.get_cursor() as cursor:
-            cursor.execute(
-                """
-                INSERT INTO tasks (task_id, file_name, file_path, backend, options, priority, user_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-                (task_id, file_name, file_path, backend, json.dumps(options or {}), priority, user_id),
-            )
+        try:
+            with self.get_cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO tasks (task_id, file_name, file_path, backend, options, priority, user_id, file_hash, lang, method)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                    (
+                        task_id,
+                        file_name,
+                        file_path,
+                        backend,
+                        json.dumps(options or {}),
+                        priority,
+                        user_id,
+                        file_hash,
+                        lang,
+                        method,
+                    ),
+                )
+        except sqlite3.IntegrityError:
+            existing = self.get_task_by_dedup(file_hash, backend, lang, method)
+            if not existing:
+                raise
+
+            if user_id and existing.get("user_id") != user_id and not existing.get("shared_read"):
+                self.set_task_shared_read(existing["task_id"])
+                existing["shared_read"] = 1
+
+            status = existing.get("status")
+            requeued = False
+            if status in ("failed", "timeout"):
+                if self.retry_task(existing["task_id"]):
+                    status = "pending"
+                    requeued = True
+                    self._enqueue_to_redis(
+                        existing["task_id"],
+                        existing.get("priority", 0),
+                        {
+                            "file_name": existing.get("file_name"),
+                            "backend": existing.get("backend"),
+                        },
+                    )
+
+            return {
+                "task_id": existing["task_id"],
+                "status": status,
+                "deduped": True,
+                "requeued": requeued,
+            }
 
         # 入队到 Redis（如果可用）
         self._enqueue_to_redis(
@@ -184,7 +277,12 @@ class TaskDB:
             },
         )
 
-        return task_id
+        return {
+            "task_id": task_id,
+            "status": "pending",
+            "deduped": False,
+            "requeued": False,
+        }
 
     def _enqueue_to_redis(self, task_id: str, priority: int, task_data: dict = None) -> bool:
         """将任务加入 Redis 队列"""
@@ -882,17 +980,17 @@ if __name__ == "__main__":
     db = TaskDB("test_tianshu.db")
 
     # 创建测试任务
-    task_id = db.create_task(
+    task_result = db.create_task(
         file_name="test.pdf",
         file_path="/tmp/test.pdf",
         backend="pipeline",
         options={"lang": "ch", "formula_enable": True},
         priority=1,
     )
-    print(f"Created task: {task_id}")
+    print(f"Created task: {task_result['task_id']}")
 
     # 查询任务
-    task = db.get_task(task_id)
+    task = db.get_task(task_result["task_id"])
     print(f"Task details: {task}")
 
     # 获取统计

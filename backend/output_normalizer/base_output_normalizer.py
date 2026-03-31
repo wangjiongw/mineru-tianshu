@@ -5,6 +5,7 @@
 from pathlib import Path
 from typing import Dict, Any
 from loguru import logger
+from urllib.parse import quote
 import re
 import json
 import os
@@ -93,6 +94,8 @@ class BaseOutputNormalizer:
 
         if not rustfs_enabled:
             logger.info("ℹ️  RustFS is disabled (RUSTFS_ENABLED=false), using local file service")
+            if result.get("markdown_file") and result.get("image_dir"):
+                self._replace_local_urls(result["markdown_file"], result["image_dir"])
             result["rustfs_enabled"] = False
             result["images_uploaded"] = False
             return
@@ -122,8 +125,45 @@ class BaseOutputNormalizer:
             logger.error(f"   Error details: {type(e).__name__}: {str(e)}")
             result["rustfs_enabled"] = False
             result["images_uploaded"] = False
-            # RustFS 上传失败不应中断主流程，继续使用本地路径
-            logger.warning("⚠️  Continuing with local image paths (RustFS upload failed)")
+            # RustFS 上传失败不应中断主流程，fallback 到本地路径
+            logger.warning("⚠️  Falling back to local image paths (RustFS upload failed)")
+            if result.get("markdown_file") and result.get("image_dir"):
+                self._replace_local_urls(result["markdown_file"], result["image_dir"])
+
+    def _replace_local_urls(self, result_md: Path, image_dir: Path):
+        """
+        将 result.md 中的 images/xxx.jpg 替换为本地 API 路径。
+
+        路径格式：/api/v1/files/output/{rel_dir}/images/{filename}
+        其中 rel_dir 是 output_dir 相对于 OUTPUT_PATH 的路径。
+        """
+        try:
+            output_base = os.getenv("OUTPUT_PATH", "")
+            output_dir = image_dir.parent  # image_dir = output_dir / "images"
+
+            if output_base:
+                try:
+                    rel_dir = output_dir.relative_to(Path(output_base))
+                except ValueError:
+                    rel_dir = Path(output_dir.name)
+            else:
+                rel_dir = Path(output_dir.name)
+
+            url_mapping: Dict[str, str] = {}
+            for img_file in image_dir.iterdir():
+                if img_file.is_file():
+                    rel_path = str(rel_dir / "images" / img_file.name).replace("\\", "/")
+                    encoded = quote(rel_path, safe="/")
+                    url_mapping[img_file.name] = f"/api/v1/files/output/{encoded}"
+
+            if url_mapping:
+                logger.info(f"🔗 Replacing image URLs with local API paths in {result_md.name}")
+                self._replace_markdown_urls(result_md, url_mapping)
+            else:
+                logger.debug("ℹ️  No images found for local URL replacement")
+
+        except Exception as e:
+            logger.warning(f"⚠️  Failed to replace local URLs: {e}")
 
     def _upload_images_to_rustfs(self, image_dir: Path) -> Dict[str, str]:
         """

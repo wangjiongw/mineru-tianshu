@@ -269,10 +269,10 @@ class MinerUPipelineEngine:
             table_enable = options.get("table_enable", True)
             
             f_draw_layout_bbox = options.get("draw_layout_bbox", True)      
-            f_draw_span_bbox = options.get("draw_span_bbox", True)          
+            f_draw_span_bbox = options.get("draw_span_bbox", False)          
             f_dump_md = options.get("dump_markdown", True)                  
             f_dump_middle_json = options.get("dump_middle_json", True)      
-            f_dump_model_output = options.get("dump_model_output", True)    
+            f_dump_model_output = options.get("dump_model_output", False)    
             f_dump_content_list = options.get("dump_content_list", True)    
             f_dump_orig_pdf = options.get("dump_orig_pdf", True)            
 
@@ -304,7 +304,7 @@ class MinerUPipelineEngine:
                 pdf_bytes = file_bytes
 
             lang = options.get("lang", "auto")
-            if lang == "auto": lang = "ch"
+            if lang == "auto": lang = "en"
 
             # 使用临时纯英文目录处理
             with tempfile.TemporaryDirectory(prefix="mineru_proc_") as temp_dir:
