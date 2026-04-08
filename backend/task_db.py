@@ -178,6 +178,14 @@ class TaskDB:
                 cursor.execute("ALTER TABLE tasks ADD COLUMN method TEXT")
                 logger.info("✅ method field added")
 
+            # 迁移：添加 data 字段（如果不存在）
+            try:
+                cursor.execute("SELECT data FROM tasks LIMIT 1")
+            except sqlite3.OperationalError:
+                logger.info("📊 Migrating database schema: adding data field")
+                cursor.execute("ALTER TABLE tasks ADD COLUMN data TEXT")
+                logger.info("✅ data field added")
+
             cursor.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_task_dedup ON tasks(file_hash, backend, lang, method)"
             )

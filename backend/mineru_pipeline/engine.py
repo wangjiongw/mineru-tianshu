@@ -28,6 +28,20 @@ from threading import Lock
 from loguru import logger
 import img2pdf
 
+# 解除 pypdf 所有流解压缩的大小限制（默认均为 75MB，高清大图 PDF 会触发 LimitReachedError）
+# 设为 0 表示不限制；涵盖 ZLIB / LZW / JBIG2 / RLE 四种压缩方式以及流声明长度检查
+try:
+    import pypdf.filters
+    pypdf.filters.ZLIB_MAX_OUTPUT_LENGTH = 0
+    pypdf.filters.ZLIB_MAX_RECOVERY_INPUT_LENGTH = 0
+    pypdf.filters.LZW_MAX_OUTPUT_LENGTH = 0
+    pypdf.filters.MAX_DECLARED_STREAM_LENGTH = 0
+    pypdf.filters.MAX_ARRAY_BASED_STREAM_OUTPUT_LENGTH = 0
+    pypdf.filters.JBIG2_MAX_OUTPUT_LENGTH = 0
+    pypdf.filters.RUN_LENGTH_MAX_OUTPUT_LENGTH = 0
+except Exception:
+    pass
+
 # 尝试导入 torch 用于显存管理
 try:
     import torch
