@@ -28,17 +28,21 @@ from threading import Lock
 from loguru import logger
 import img2pdf
 
-# 解除 pypdf 所有流解压缩的大小限制（默认均为 75MB，高清大图 PDF 会触发 LimitReachedError）
-# 设为 0 表示不限制；涵盖 ZLIB / LZW / JBIG2 / RLE 四种压缩方式以及流声明长度检查
+# 解除 pypdf 默认的 75MB 流大小限制（高清大图 PDF 会触发 LimitReachedError）
+# 注意：必须设为“极大值”而非 0 —— pypdf 用 `if length > MAX` 做比较，
+# 设成 0 会让所有 length>0 的 stream 都触发 LimitReachedError（等于禁用全部 stream）。
+# ZLIB_MAX_OUTPUT_LENGTH 还会传给 zlib.decompress(max_length=) 及参与 remaining_limit 递减，
+# 故必须是很大的正整数；这里取 1TB，实际等同于不限制。
 try:
     import pypdf.filters
-    pypdf.filters.ZLIB_MAX_OUTPUT_LENGTH = 0
-    pypdf.filters.ZLIB_MAX_RECOVERY_INPUT_LENGTH = 0
-    pypdf.filters.LZW_MAX_OUTPUT_LENGTH = 0
-    pypdf.filters.MAX_DECLARED_STREAM_LENGTH = 0
-    pypdf.filters.MAX_ARRAY_BASED_STREAM_OUTPUT_LENGTH = 0
-    pypdf.filters.JBIG2_MAX_OUTPUT_LENGTH = 0
-    pypdf.filters.RUN_LENGTH_MAX_OUTPUT_LENGTH = 0
+    _UNLIMITED = 10**12
+    pypdf.filters.ZLIB_MAX_OUTPUT_LENGTH = _UNLIMITED
+    pypdf.filters.ZLIB_MAX_RECOVERY_INPUT_LENGTH = _UNLIMITED
+    pypdf.filters.LZW_MAX_OUTPUT_LENGTH = _UNLIMITED
+    pypdf.filters.MAX_DECLARED_STREAM_LENGTH = _UNLIMITED
+    pypdf.filters.MAX_ARRAY_BASED_STREAM_OUTPUT_LENGTH = _UNLIMITED
+    pypdf.filters.JBIG2_MAX_OUTPUT_LENGTH = _UNLIMITED
+    pypdf.filters.RUN_LENGTH_MAX_OUTPUT_LENGTH = _UNLIMITED
 except Exception:
     pass
 
