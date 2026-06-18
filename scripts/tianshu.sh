@@ -29,6 +29,7 @@ VLLM_MODEL_PATH="/share/wangjiong/model_zoo/modelscope/models/OpenDataLab/MinerU
 VLLM_BASE_PORT=30025
 VLLM_NUM_INSTANCES=8
 VLLM_MAX_MODEL_LEN=8192
+VLLM_READY_TIMEOUT="${VLLM_READY_TIMEOUT:-900}"   # vllm 健康检查总超时(秒);首次含 NPU kernel 编译,默认 15min,可调大
 
 # Worker 配置
 WORKER_BASE_PORT=8101
@@ -44,11 +45,22 @@ MCP_PORT=8002
 # 前端配置
 FRONTEND_PORT=3000
 
-# 路径配置
-DATABASE_PATH="/share/wangjiong/databases/mineru/mineru_tianshu.db"
-OUTPUT_PATH="/share/wangjiong/databases/mineru/mineru_outputs"
-UPLOAD_PATH="/share/wangjiong/databases/mineru/mineru_uploads"
-LOG_DIR="/share/wangjiong/databases/mineru/mineru_logs"
+# 路径配置 —— 按实例隔离(集群多实例共享 /share 时,各实例在 DATA_ROOT/<实例名>/ 下独立存放)
+DATA_ROOT="/share/wangjiong/databases/mineru_database"
+INSTANCE_ID="${INSTANCE_ID:-$(hostname)}"               # 实例标识,默认主机名/pod 名;可 export 覆盖
+INSTANCE_DATA_DIR="${DATA_ROOT}/${INSTANCE_ID}"         # 本实例的独立数据目录
+
+# 可写数据路径(按实例隔离)
+DATABASE_PATH="${INSTANCE_DATA_DIR}/mineru_tianshu.db"
+OUTPUT_PATH="${INSTANCE_DATA_DIR}/mineru_outputs"
+UPLOAD_PATH="${INSTANCE_DATA_DIR}/mineru_uploads"
+LOG_DIR="${INSTANCE_DATA_DIR}/mineru_logs"
+
+# 只读资产(多实例共享,不隔离)
+MODELSCOPE_CACHE="${MODELSCOPE_CACHE:-/share/wangjiong/model_zoo/modelscope}"
+
+# JWT 认证配置
+JWT_EXPIRE_MINUTES="${JWT_EXPIRE_MINUTES:-43200}"  # 默认 30 天（30*24*60）
 
 # 日志子目录
 VLLM_LOG_DIR="${LOG_DIR}/vllm"
@@ -61,9 +73,13 @@ REDIS_HOST="localhost"
 REDIS_PORT="6379"
 REDIS_DB="0"
 REDIS_PASSWORD="redis123"
-REDIS_QUEUE_KEY="tianshu:task_queue"
-REDIS_PROCESSING_KEY="tianshu:processing"
+REDIS_QUEUE_KEY="tianshu:task_queue:${INSTANCE_ID}"
+REDIS_PROCESSING_KEY="tianshu:processing:${INSTANCE_ID}"
 REDIS_TASK_TIMEOUT="3600"
+
+# Redis 进程启动选项（由 start_redis 使用）
+REDIS_BIND="${REDIS_BIND:-127.0.0.1}"        # 监听地址（多机部署改 0.0.0.0）
+REDIS_APPENDONLY="${REDIS_APPENDONLY:-no}"   # 是否开启 AOF 持久化（no=纯内存，重启丢队列；SQLite 仍是事实源）
 
 # ============================================================================
 # 内部变量
@@ -105,6 +121,39 @@ init_dirs() {
 }
 
 # ============================================================================
+# 实例冲突检测(多实例共享 DATA_ROOT 时,防止不同实例写同一数据目录)
+# ============================================================================
+
+check_instance_conflict() {
+    local dir="$INSTANCE_DATA_DIR"
+    local lockfile="${dir}/.instance.lock"
+    mkdir -p "$dir"
+    if [ -f "$lockfile" ]; then
+        local owner
+        owner=$(head -1 "$lockfile" 2>/dev/null)
+        if [ -n "$owner" ] && [ "$owner" != "$INSTANCE_ID" ]; then
+            log_error "数据目录已被其他实例占用,中止启动"
+            log_error "  目录:       $dir"
+            log_error "  占用实例:   $owner"
+            log_error "  本实例:     $INSTANCE_ID"
+            log_error "解决方法:"
+            log_error "  1) 本实例使用唯一 INSTANCE_ID(默认即 hostname),无需额外设置"
+            log_error "  2) 若 '$owner' 已确认停止,删除残留锁:  rm $lockfile"
+            return 1
+        fi
+    fi
+    echo "$INSTANCE_ID" > "$lockfile"     # 写入/更新本实例锁
+    return 0
+}
+
+release_instance_lock() {
+    local lockfile="${INSTANCE_DATA_DIR}/.instance.lock"
+    if [ -f "$lockfile" ] && [ "$(head -1 "$lockfile" 2>/dev/null)" = "$INSTANCE_ID" ]; then
+        rm -f "$lockfile"
+    fi
+}
+
+# ============================================================================
 # VLLM 服务管理
 # ============================================================================
 
@@ -117,9 +166,15 @@ start_vllm() {
         local log_file="${VLLM_LOG_DIR}/vllm_npu${i}_port${port}.log"
         local pid_file="${VLLM_LOG_DIR}/vllm_npu${i}.pid"
 
-        # 跳过已运行的实例
-        if [ -f "$pid_file" ] && ps -p "$(cat "$pid_file")" > /dev/null 2>&1; then
+        # 跳过已运行的实例(端口检测优先:实例隔离使 pid 文件分目录存放,
+        # 仅靠 pid 文件会误判"未运行"而重复启动 vllm;端口已就绪即视为在运行)
+        if curl -s "http://localhost:${port}/v1/models" > /dev/null 2>&1; then
             log_info "VLLM #${i} (NPU=${i}, Port=${port}) 已在运行"
+            started=$((started + 1))
+            continue
+        fi
+        if [ -f "$pid_file" ] && ps -p "$(cat "$pid_file")" > /dev/null 2>&1; then
+            log_info "VLLM #${i} (NPU=${i}, Port=${port}) 进程存在但端口未就绪,等待中"
             started=$((started + 1))
             continue
         fi
@@ -161,7 +216,7 @@ start_vllm() {
     # 健康检查
     log_info "等待 VLLM 健康检查..."
     local healthy=0
-    for round in $(seq 1 24); do
+    for round in $(seq 1 $((VLLM_READY_TIMEOUT / 10))); do
         healthy=0
         for i in $(seq 0 $((VLLM_NUM_INSTANCES - 1))); do
             local port=$((VLLM_BASE_PORT + i))
@@ -177,7 +232,7 @@ start_vllm() {
         sleep 10
     done
     echo ""
-    log_warn "VLLM 健康检查: ${healthy}/${VLLM_NUM_INSTANCES} 就绪 (部分可能仍在初始化)"
+    log_warn "VLLM 健康检查超时(${VLLM_READY_TIMEOUT}s): ${healthy}/${VLLM_NUM_INSTANCES} 就绪 (部分可能仍在初始化;可调大 VLLM_READY_TIMEOUT)"
 }
 
 stop_vllm() {
@@ -244,6 +299,7 @@ start_api() {
     OUTPUT_PATH="$OUTPUT_PATH" \
     UPLOAD_PATH="$UPLOAD_PATH" \
     API_PORT="$API_PORT" \
+    JWT_EXPIRE_MINUTES="$JWT_EXPIRE_MINUTES" \
     REDIS_QUEUE_ENABLED="$REDIS_QUEUE_ENABLED" \
     REDIS_HOST="$REDIS_HOST" \
     REDIS_PORT="$REDIS_PORT" \
@@ -362,14 +418,20 @@ status_mcp() {
 start_workers() {
     log_step "启动 Workers (${WORKER_NUM_INSTANCES} 个独立进程)"
 
-    # 预检查: VLLM 和 API
+    # 预检查: 等待 VLLM 全部就绪(vllm 加载慢,带超时轮询而非一次探测)
     local vllm_ok=0
-    for i in $(seq 0 $((VLLM_NUM_INSTANCES - 1))); do
-        local port=$((VLLM_BASE_PORT + i))
-        curl -s "http://localhost:${port}/v1/models" > /dev/null 2>&1 && vllm_ok=$((vllm_ok + 1))
+    for round in $(seq 1 $((VLLM_READY_TIMEOUT / 10))); do
+        vllm_ok=0
+        for i in $(seq 0 $((VLLM_NUM_INSTANCES - 1))); do
+            local port=$((VLLM_BASE_PORT + i))
+            curl -s "http://localhost:${port}/v1/models" > /dev/null 2>&1 && vllm_ok=$((vllm_ok + 1))
+        done
+        [ "$vllm_ok" -eq "$VLLM_NUM_INSTANCES" ] && break
+        log_info "等待 VLLM 就绪 (${vllm_ok}/${VLLM_NUM_INSTANCES})..."
+        sleep 10
     done
     if [ "$vllm_ok" -lt "$VLLM_NUM_INSTANCES" ]; then
-        log_error "VLLM 未就绪 (${vllm_ok}/${VLLM_NUM_INSTANCES})，请先启动 VLLM"
+        log_error "VLLM 未就绪 (${vllm_ok}/${VLLM_NUM_INSTANCES}),请先启动 VLLM 或调大 VLLM_READY_TIMEOUT"
         return 1
     fi
 
@@ -403,6 +465,7 @@ start_workers() {
 
         DATABASE_PATH="$DATABASE_PATH" \
         OUTPUT_PATH="$OUTPUT_PATH" \
+        MODELSCOPE_CACHE="$MODELSCOPE_CACHE" \
         WORKER_PORT="$port" \
         ASCEND_VISIBLE_DEVICES="$i" \
         ASCEND_RT_VISIBLE_DEVICES="$i" \
@@ -542,11 +605,117 @@ status_frontend() {
 }
 
 # ============================================================================
+# Redis 管理
+# ============================================================================
+
+start_redis() {
+    log_step "启动 Redis (端口 ${REDIS_PORT})"
+
+    local pid_file="${LOG_DIR}/redis.pid"
+    local log_file="${LOG_DIR}/redis.log"
+
+    # 已运行则跳过
+    if [ -f "$pid_file" ] && ps -p "$(cat "$pid_file")" > /dev/null 2>&1; then
+        log_info "Redis 已在运行 (PID: $(cat "$pid_file"))"
+        return 0
+    fi
+
+    # 端口已被监听则视为就绪（兼容外部/手动启动的实例）
+    if (ss -ltn 2>/dev/null || netstat -ltn 2>/dev/null) | grep -q ":${REDIS_PORT} "; then
+        log_info "Redis 端口 ${REDIS_PORT} 已被监听，视为运行中"
+        return 0
+    fi
+
+    # 定位 redis-server / redis-cli
+    local redis_bin="${REDIS_BIN:-$(command -v redis-server || true)}"
+    local redis_cli_bin="${REDIS_CLI_BIN:-$(command -v redis-cli || true)}"
+    if [ -z "$redis_bin" ]; then
+        log_error "未找到 redis-server，请先安装： mamba install -c conda-forge redis-server"
+        return 1
+    fi
+
+    mkdir -p "$LOG_DIR"
+    log_info "启动 Redis: ${redis_bin} (bind=${REDIS_BIND}, port=${REDIS_PORT}, appendonly=${REDIS_APPENDONLY})"
+
+    "$redis_bin" \
+        --daemonize yes \
+        --port "$REDIS_PORT" \
+        --bind "$REDIS_BIND" \
+        --requirepass "$REDIS_PASSWORD" \
+        --save "" \
+        --appendonly "$REDIS_APPENDONLY" \
+        --loglevel warning \
+        --pidfile "$pid_file" \
+        --logfile "$log_file"
+
+    # 健康检查（鉴权 PING）
+    local ok=0
+    if [ -n "$redis_cli_bin" ]; then
+        for _ in $(seq 1 15); do
+            if "$redis_cli_bin" -p "$REDIS_PORT" -a "$REDIS_PASSWORD" --no-auth-warning ping 2>/dev/null | grep -q "PONG"; then
+                ok=1
+                break
+            fi
+            sleep 1
+        done
+    fi
+
+    if [ "$ok" -eq 1 ]; then
+        log_info "Redis 就绪 (端口 ${REDIS_PORT})"
+    else
+        log_error "Redis 启动后鉴权失败，查看: $log_file"
+        return 1
+    fi
+}
+
+stop_redis() {
+    log_step "停止 Redis"
+
+    local pid_file="${LOG_DIR}/redis.pid"
+    local redis_cli_bin="${REDIS_CLI_BIN:-$(command -v redis-cli || true)}"
+
+    # 优先 redis-cli 优雅关闭
+    if [ -n "$redis_cli_bin" ]; then
+        "$redis_cli_bin" -p "$REDIS_PORT" -a "$REDIS_PASSWORD" --no-auth-warning shutdown nosave 2>/dev/null || true
+    fi
+    sleep 1
+
+    # 兜底：pidfile kill
+    if [ -f "$pid_file" ]; then
+        local pid
+        pid=$(cat "$pid_file")
+        if ps -p "$pid" > /dev/null 2>&1; then
+            kill "$pid" 2>/dev/null || true
+            sleep 1
+            ps -p "$pid" > /dev/null 2>&1 && kill -9 "$pid" 2>/dev/null || true
+        fi
+        rm -f "$pid_file"
+    fi
+
+    pkill -f "redis-server.*:${REDIS_PORT}" 2>/dev/null || true
+    log_info "Redis 已停止"
+}
+
+status_redis() {
+    echo -e "${CYAN}Redis (端口 ${REDIS_PORT})${NC}"
+    local redis_cli_bin="${REDIS_CLI_BIN:-$(command -v redis-cli || true)}"
+    if [ -n "$redis_cli_bin" ] && \
+       "$redis_cli_bin" -p "$REDIS_PORT" -a "$REDIS_PASSWORD" --no-auth-warning ping 2>/dev/null | grep -q "PONG"; then
+        local clients
+        clients=$("$redis_cli_bin" -p "$REDIS_PORT" -a "$REDIS_PASSWORD" --no-auth-warning info clients 2>/dev/null | grep "^connected_clients:" | cut -d: -f2 | tr -d '\r')
+        echo "  ✅ 运行中 - localhost:${REDIS_PORT} (connected_clients: ${clients:-?})"
+    else
+        echo "  ❌ 未运行"
+    fi
+}
+
+# ============================================================================
 # 组合命令
 # ============================================================================
 
 cmd_start() {
     local target="${1:-all}"
+    local rc=0
 
     separator
     echo -e "${CYAN}  MinerU Tianshu - 启动服务${NC}"
@@ -556,25 +725,34 @@ cmd_start() {
 
     init_dirs
 
+    # 多实例冲突检测:确保本数据目录未被别的活跃实例占用
+    check_instance_conflict || return 1
+
     case "$target" in
-        vllm)    start_vllm ;;
-        api)     start_api ;;
-        mcp)     start_mcp ;;
-        worker)  start_workers ;;
-        frontend) start_frontend ;;
+        redis)   start_redis    || rc=1 ;;
+        vllm)    start_vllm     || rc=1 ;;
+        api)     start_api      || rc=1 ;;
+        mcp)     start_mcp      || rc=1 ;;
+        worker)  start_workers  || rc=1 ;;
+        frontend) start_frontend || rc=1 ;;
         all)
-            start_vllm
-            start_api
-            start_mcp
-            start_workers
-            start_frontend
+            start_redis    || rc=1
+            start_vllm     || rc=1
+            start_api      || rc=1
+            start_mcp      || rc=1
+            start_workers  || rc=1
+            start_frontend || rc=1
             ;;
-        *) log_error "未知服务: $target (可选: vllm|api|mcp|worker|frontend|all)"; exit 1 ;;
+        *) log_error "未知服务: $target (可选: vllm|api|redis|mcp|worker|frontend|all)"; exit 1 ;;
     esac
 
     echo ""
     separator
-    log_info "启动完成"
+    if [ "$rc" -eq 0 ]; then
+        log_info "启动完成"
+    else
+        log_error "启动完成,但有服务失败 (见上方日志;用 'logs <服务>' 排查)"
+    fi
     separator
 }
 
@@ -587,15 +765,22 @@ cmd_stop() {
         mcp)     stop_mcp ;;
         worker)  stop_workers ;;
         frontend) stop_frontend ;;
+        redis)   stop_redis ;;
         all)
             stop_frontend
             stop_workers
             stop_mcp
             stop_api
             stop_vllm
+            stop_redis
             ;;
-        *) log_error "未知服务: $target (可选: vllm|api|mcp|worker|frontend|all)"; exit 1 ;;
+        *) log_error "未知服务: $target (可选: vllm|api|redis|mcp|worker|frontend|all)"; exit 1 ;;
     esac
+
+    # 仅在停止整个实例(all)时释放数据目录锁;单服务停止不释放(api 仍占用目录)
+    if [ "$target" = "all" ]; then
+        release_instance_lock
+    fi
 }
 
 cmd_restart() {
@@ -609,6 +794,9 @@ cmd_status() {
     separator
     echo -e "${CYAN}  MinerU Tianshu - 服务状态${NC}"
     separator
+    echo -e "  实例: ${INSTANCE_ID}    数据目录: ${INSTANCE_DATA_DIR}"
+    echo ""
+    status_redis
     echo ""
     status_vllm
     echo ""
@@ -629,13 +817,14 @@ cmd_logs() {
     local target="${1:-all}"
 
     case "$target" in
+        redis)   tail -f "${LOG_DIR}/redis.log" ;;
         vllm)    tail -f "${VLLM_LOG_DIR}"/*.log ;;
         worker)  tail -f "${WORKER_LOG_DIR}"/*.log ;;
         api)     tail -f "${API_LOG_DIR}"/*.log ;;
         mcp)     tail -f "${API_LOG_DIR}/mcp.log" ;;
         frontend) tail -f "${LOG_DIR}/frontend.log" ;;
-        all)     tail -f "${LOG_DIR}"/*/*.log "${LOG_DIR}"/frontend.log ;;
-        *) log_error "未知服务: $target (可选: vllm|worker|api|mcp|frontend|all)"; exit 1 ;;
+        all)     tail -f "${LOG_DIR}"/*/*.log "${LOG_DIR}"/frontend.log "${LOG_DIR}"/redis.log ;;
+        *) log_error "未知服务: $target (可选: vllm|worker|api|mcp|redis|frontend|all)"; exit 1 ;;
     esac
 }
 
@@ -745,6 +934,7 @@ MinerU Tianshu - 统一启动脚本
   help           显示帮助
 
 服务 (可选，不指定则操作全部):
+  redis          Redis 队列服务 (端口 ${REDIS_PORT})
   vllm           VLLM 推理服务 (端口 ${VLLM_BASE_PORT}-${VLLM_BASE_PORT}$((VLLM_NUM_INSTANCES-1)))
   api            API Server (端口 ${API_PORT})
   mcp            MCP Server (端口 ${MCP_PORT})
@@ -763,13 +953,16 @@ MinerU Tianshu - 统一启动脚本
 
 配置:
   脚本顶部可修改以下配置:
+    DATA_ROOT            数据根(所有实例在 <DATA_ROOT>/<INSTANCE_ID>/ 下隔离存放)
+    INSTANCE_ID          实例标识(默认 hostname;export 覆盖可指定特定实例)
     VLLM_MODEL_PATH      模型路径
     VLLM_BASE_PORT       VLLM 起始端口
     VLLM_NUM_INSTANCES   VLLM 实例数量
+    VLLM_READY_TIMEOUT   VLLM 健康检查超时秒数(默认 900;首次加载/kernel 编译慢可调大)
     WORKER_BASE_PORT     Worker 起始端口
     WORKER_NUM_INSTANCES Worker 数量
-    DATABASE_PATH        数据库路径
-    OUTPUT_PATH          输出路径
+    DATABASE_PATH        数据库路径(自动派生自 INSTANCE_DATA_DIR)
+    OUTPUT_PATH          输出路径(自动派生)
 EOF
 }
 
