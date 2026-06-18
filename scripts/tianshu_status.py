@@ -134,8 +134,6 @@ def probe_vllm(cfg: dict) -> List[bool]:
     for i in range(cfg["vllm_count"]):
         host = cfg["base_url"].rsplit(":", 1)[0]
         port = cfg["vllm_base_port"] + i
-        ok = requests.get(f"{host}:{port}/v1/models", timeout=2).status_code == 200 \
-            if True else False
         try:
             ok = requests.get(f"{host}:{port}/v1/models", timeout=2).status_code == 200
         except Exception:
@@ -634,6 +632,7 @@ def main():
     client = build_client(args)
 
     cfg = {
+        "base_url":        client.base_url,
         "vllm_base_port":  int(os.environ.get("VLLM_BASE_PORT",  DEFAULTS["vllm_base_port"])),
         "vllm_count":      int(os.environ.get("VLLM_COUNT",      DEFAULTS["vllm_count"])),
         "worker_base_port":int(os.environ.get("WORKER_BASE_PORT",DEFAULTS["worker_base_port"])),
