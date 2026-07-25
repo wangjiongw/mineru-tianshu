@@ -1,0 +1,87 @@
+# ============================================================================
+# MinerU Tianshu 日志自动管理 - Crontab 配置示例
+# ============================================================================
+#
+# 使用方法：
+#   1. 复制此文件到 crontab
+#   2. crontab -e
+#   3. 将下面的内容粘贴到编辑器中
+#   4. 保存并退出
+#
+# 或者使用命令：
+#   crontab - config/log_rotation_crontab.example
+#
+# ============================================================================
+
+# 环境变量
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+
+# ============================================================================
+# 每日任务
+# ============================================================================
+
+# 每天凌晨3点 - 归档7天前的日志文件
+0 3 * * * bash /data/projects/mineru/mineru-tianshu/scripts/log_manager.sh archive >> /data/projects/mineru/mineru-tianshu/data/logs/cron_archive.log 2>&1
+
+# 每天凌晨3点30分 - 轮转过大的日志文件（>10MB）
+30 3 * * * bash /data/projects/mineru/mineru-tianshu/scripts/log_manager.sh rotate >> /data/projects/mineru/mineru-tianshu/data/logs/cron_rotate.log 2>&1
+
+# 每天凌晨4点 - 清理30天前的归档
+0 4 * * * bash /data/projects/mineru/mineru-tianshu/scripts/log_manager.sh clean >> /data/projects/mineru/mineru-tianshu/data/logs/cron_clean.log 2>&1
+
+# ============================================================================
+# 每周任务
+# ============================================================================
+
+# 每周日凌晨5点 - 生成日志统计报告并发送邮件（可选）
+0 5 * * 0 bash /data/projects/mineru/mineru-tianshu/scripts/log_manager.sh stats > /tmp/weekly_log_stats.txt 2>&1
+
+# ============================================================================
+# 每月任务
+# ============================================================================
+
+# 每月1号凌晨6点 - 彻底清理所有超过60天的归档
+0 6 1 * * find /data/projects/mineru/mineru-tianshu/data/logs/archive -type d -mtime +60 -exec rm -rf {} \; 2>/dev/null
+
+# ============================================================================
+# 说明
+# ============================================================================
+
+# Crontab 时间格式:
+#   * * * * * 命令
+#   │ │ │ │ │
+#   │ │ │ │ └─ 星期几 (0-7, 0和7都表示周日)
+#   │ │ │ └─── 月份 (1-12)
+#   │ │ └───── 日期 (1-31)
+#   │ └─────── 小时 (0-23)
+#   └───────── 分钟 (0-59)
+#
+# 示例:
+#   0 3 * * *       - 每天凌晨3点执行
+#   */30 * * * *     - 每30分钟执行一次
+#   0 */2 * * *      - 每2小时执行一次
+#   0 0 * * 0        - 每周日凌晨0点执行
+#   0 0 1 * *        - 每月1号凌晨0点执行
+
+# ============================================================================
+# 注意事项
+# ============================================================================
+
+# 1. 确保脚本有执行权限:
+#    chmod +x /data/projects/mineru/mineru-tianshu/scripts/log_manager.sh
+#
+# 2. 首次使用前，建议手动测试一次:
+#    bash /data/projects/mineru/mineru-tianshu/scripts/log_manager.sh archive
+#
+# 3. 查看cron执行日志:
+#    tail -f /data/projects/mineru/mineru-tianshu/data/logs/cron_*.log
+#
+# 4. 如果不想使用cron，可以使用systemd timer（推荐生产环境）
+#
+# ============================================================================
+
+# 备份：取消下面的注释可以停止所有定时任务
+# # 0 3 * * * bash /data/projects/mineru/mineru-tianshu/scripts/log_manager.sh archive
+# # 30 3 * * * bash /data/projects/mineru/mineru-tianshu/scripts/log_manager.sh rotate
+# # 0 4 * * * bash /data/projects/mineru/mineru-tianshu/scripts/log_manager.sh clean
