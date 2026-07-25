@@ -202,6 +202,17 @@ Key options: `JWT_SECRET_KEY` (required, generate your own), `REDIS_QUEUE_ENABLE
 ### Multi-instance isolation (`tianshu.sh`)
 On the NPU path, `tianshu.sh` isolates each instance's writable data under `DATA_ROOT/<INSTANCE_ID>/` (see Data Paths above). Key config-block vars: `DATA_ROOT` (default `/share/wangjiong/databases/mineru_database`), `INSTANCE_ID` (default `$(hostname)`, override with `export INSTANCE_ID=...`), derived `INSTANCE_DATA_DIR` → `DATABASE_PATH`/`OUTPUT_PATH`/`UPLOAD_PATH`/`LOG_DIR`; Redis keys get an `:${INSTANCE_ID}` suffix. A `.instance.lock` guards against two different instances writing the same dir. **No backend change** — all paths/keys are read from env (`task_db.py:53`, `auth_db.py:39`, `api_server.py`, `litserve_worker.py:211`, `redis_queue.py:59-60`).
 
+### Result aggregation (multi-instance)
+Each instance's results already live on the shared `/share` under `DATA_ROOT/<INSTANCE_ID>/mineru_outputs/<hash>_<filename>/` (`result.md`, `full.md`, `result.json`, `mineru_model.json`, `images/`). **RustFS exists only on the Docker path** — the NPU bare-metal deployment has no RustFS service, so images stay in the local `images/` dir (`full.md` references them as relative `images/...`); there is no automatic cross-instance upload.
+
+Since the data is already on shared storage, `scripts/aggregate_results.py` **defaults to index-only** (no copy) — it scans all instances and writes `manifest.jsonl`/`manifest.md` (each entry points at the **original** location) plus `duplicates.txt` (cross-instance `<hash>_<filename>` collisions = part-sharding overlap; should be empty). Downstream on the same cluster reads the original dirs directly; no extra storage is used (`/share` is ~90% full).
+```bash
+python scripts/aggregate_results.py \
+  --data-root /share/wangjiong/databases/mineru_database \
+  --output    /share/wangjiong/databases/aggregated     # only manifest + duplicates written
+```
+Add `--copy` (physical duplicate, for export off `/share`) or `--link` (symlink view, no extra space) when a real aggregated tree is needed; `--layout flat` / `--instances a,b` / `--include md,json` narrow it. **No dedup action**: pre-sharding guarantees one file never lands on two instances; `duplicates.txt` only reports.
+
 ### Docker Compose Variants
 `docker-compose.yml` (GPU/CUDA), `docker-compose.cpu.yml`, `docker-compose.dev.yml`, `docker-compose.offline.yml`.
 
