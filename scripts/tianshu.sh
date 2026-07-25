@@ -25,11 +25,21 @@ set -o pipefail
 PROJECT_ROOT="/data/projects/mineru/mineru-tianshu"
 
 # VLLM 服务配置
-VLLM_MODEL_PATH="/share/wangjiong/model_zoo/modelscope/models/OpenDataLab/MinerU2___5-2509-1___2B"
+VLLM_MODEL_PATH="/share/wangjiong/model_zoo/modelscope/models/OpenDataLab/MinerU2___5-Pro-2605-1___2B"
 VLLM_BASE_PORT=30025
 VLLM_NUM_INSTANCES=8
 VLLM_MAX_MODEL_LEN=8192
+VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.3}"  # vLLM 显存占用上限(默认 0.92 会把 52G 全分给 KV cache 导致推理 OOM;
+#                                                                # 0.3 → ~19G 总占用,其中 ~15G KV cache 仍支持 ~150 并发,给推理 spike 留足 45G 空间)
 VLLM_READY_TIMEOUT="${VLLM_READY_TIMEOUT:-900}"   # vllm 健康检查总超时(秒);首次含 NPU kernel 编译,默认 15min,可调大
+# 锁定 vllm 可执行文件到绝对路径:其 shebang 指向 /usr/local/python3.11.15/bin/python3,
+# 独立于当前 shell 的 PATH 与默认 python(默认 python 仍保持 conda mineru 环境)。
+# 避免 PATH 漂移导致不同实例加载不同版本的 vllm_ascend —— 例如 conda mineru 环境里的
+# vllm 0.13.0 与 CANN 9.0.0 不兼容会编译失败,而此处的 0.20.2 已验证可用。
+VLLM_BIN="${VLLM_BIN:-/usr/local/python3.11.15/bin/vllm}"
+# Worker / API / MCP 用的 Python:锁定到 conda mineru 环境(magic_pdf、paddleocr 等 mineru
+# pipeline 依赖只装在这里)。与 VLLM_BIN 互补 —— 两套 Python 环境各司其职,均不依赖当前 shell 的 PATH。
+PYTHON_BIN="${PYTHON_BIN:-/data/miniconda3/envs/mineru/bin/python}"
 
 # Worker 配置
 WORKER_BASE_PORT=8101
@@ -55,6 +65,12 @@ DATABASE_PATH="${INSTANCE_DATA_DIR}/mineru_tianshu.db"
 OUTPUT_PATH="${INSTANCE_DATA_DIR}/mineru_outputs"
 UPLOAD_PATH="${INSTANCE_DATA_DIR}/mineru_uploads"
 LOG_DIR="${INSTANCE_DATA_DIR}/mineru_logs"
+# Triton kernel JIT 编译缓存根目录(按实例隔离)。
+# 每个 vLLM 实例分配独立子目录(npu0, npu1, ...)，避免多实例并发编译同一 kernel 时
+# 在共享缓存目录产生临时目录清理竞态(MLIRCompilationError: [Errno 39] Directory not empty)。
+# 放在 /tmp 下以缩短路径(原 INSTANCE_DATA_DIR 路径 + kernel hash 超 107 字符会触发 socket path limit)。
+# /tmp 是 per-pod 的,天然跨 POD 隔离;重启后丢失只导致一次性重新编译,无数据损失。
+TRITON_CACHE_ROOT="${TRITON_CACHE_ROOT:-/tmp/triton}"
 
 # 只读资产(多实例共享,不隔离)
 MODELSCOPE_CACHE="${MODELSCOPE_CACHE:-/share/wangjiong/model_zoo/modelscope}"
@@ -66,6 +82,7 @@ JWT_EXPIRE_MINUTES="${JWT_EXPIRE_MINUTES:-43200}"  # 默认 30 天（30*24*60）
 VLLM_LOG_DIR="${LOG_DIR}/vllm"
 WORKER_LOG_DIR="${LOG_DIR}/worker"
 API_LOG_DIR="${LOG_DIR}/api"
+SCHEDULER_LOG_DIR="${LOG_DIR}/scheduler"
 
 # Redis 队列配置
 REDIS_QUEUE_ENABLED="true"
@@ -80,6 +97,17 @@ REDIS_TASK_TIMEOUT="3600"
 # Redis 进程启动选项（由 start_redis 使用）
 REDIS_BIND="${REDIS_BIND:-127.0.0.1}"        # 监听地址（多机部署改 0.0.0.0）
 REDIS_APPENDONLY="${REDIS_APPENDONLY:-no}"   # 是否开启 AOF 持久化（no=纯内存，重启丢队列；SQLite 仍是事实源）
+
+# 调度器（孤儿任务恢复 + 队列监控）
+SCHEDULER_MONITOR_INTERVAL="${SCHEDULER_MONITOR_INTERVAL:-300}"   # 监控周期(秒,默认 5 分钟)
+SCHEDULER_HEALTH_INTERVAL="${SCHEDULER_HEALTH_INTERVAL:-900}"     # 健康检查周期(秒,默认 15 分钟)
+SCHEDULER_STALE_TIMEOUT="${SCHEDULER_STALE_TIMEOUT:-10}"          # 孤儿任务判定阈值(分钟,默认 10)
+SCHEDULER_CLEANUP_DAYS="${SCHEDULER_CLEANUP_DAYS:-7}"             # 旧任务文件清理(天)
+
+# PDF 自动拆分（降低单次推理峰值内存，缓解 worker 原生崩溃）
+PDF_SPLIT_ENABLED="${PDF_SPLIT_ENABLED:-true}"
+PDF_SPLIT_THRESHOLD_PAGES="${PDF_SPLIT_THRESHOLD_PAGES:-50}"      # 原默认 500，下调以降低峰值内存
+PDF_SPLIT_CHUNK_SIZE="${PDF_SPLIT_CHUNK_SIZE:-50}"
 
 # ============================================================================
 # 内部变量
@@ -115,7 +143,7 @@ separator() {
 # ============================================================================
 
 init_dirs() {
-    mkdir -p "$VLLM_LOG_DIR" "$WORKER_LOG_DIR" "$API_LOG_DIR" \
+    mkdir -p "$VLLM_LOG_DIR" "$WORKER_LOG_DIR" "$API_LOG_DIR" "$SCHEDULER_LOG_DIR" \
              "$OUTPUT_PATH" "$UPLOAD_PATH" \
              "${PROJECT_ROOT}/data/db" "${PROJECT_ROOT}/models"
 }
@@ -181,16 +209,24 @@ start_vllm() {
 
         log_info "启动 VLLM #${i}: NPU=${i}, Port=${port}"
 
+        local triton_cache_dir="${TRITON_CACHE_ROOT}/npu${i}"
+        mkdir -p "$triton_cache_dir"
+        local vllm_tmp_dir="/tmp/vllm_tmp_npu${i}"
+        mkdir -p "$vllm_tmp_dir"
+
         nohup bash -lc "
             export ASCEND_VISIBLE_DEVICES='${i}'
             export ASCEND_RT_VISIBLE_DEVICES='${i}'
             export DEVICE_ID=0
             export ASCEND_DEVICE_ID=0
-            exec vllm serve '${VLLM_MODEL_PATH}' \
+            export TRITON_CACHE_DIR='${triton_cache_dir}'
+            export TMPDIR='${vllm_tmp_dir}'
+            exec ${VLLM_BIN} serve '${VLLM_MODEL_PATH}' \
                 --host 0.0.0.0 \
                 --tensor-parallel-size 1 \
                 --port ${port} \
                 --max-model-len ${VLLM_MAX_MODEL_LEN} \
+                --gpu-memory-utilization ${VLLM_GPU_MEMORY_UTILIZATION} \
                 --dtype float16 \
                 --trust-remote-code
         " > "$log_file" 2>&1 &
@@ -308,7 +344,7 @@ start_api() {
     REDIS_QUEUE_KEY="$REDIS_QUEUE_KEY" \
     REDIS_PROCESSING_KEY="$REDIS_PROCESSING_KEY" \
     REDIS_TASK_TIMEOUT="$REDIS_TASK_TIMEOUT" \
-    nohup python api_server.py > "$log_file" 2>&1 &
+    nohup ${PYTHON_BIN} api_server.py > "$log_file" 2>&1 &
 
     local pid=$!
     echo "$pid" > "$pid_file"
@@ -373,7 +409,7 @@ start_mcp() {
     API_BASE_URL="http://localhost:${API_PORT}" \
     MCP_PORT="$MCP_PORT" \
     MCP_HOST="0.0.0.0" \
-    nohup python mcp_server.py > "$log_file" 2>&1 &
+    nohup ${PYTHON_BIN} mcp_server.py > "$log_file" 2>&1 &
 
     local pid=$!
     echo "$pid" > "$pid_file"
@@ -479,7 +515,10 @@ start_workers() {
         REDIS_QUEUE_KEY="$REDIS_QUEUE_KEY" \
         REDIS_PROCESSING_KEY="$REDIS_PROCESSING_KEY" \
         REDIS_TASK_TIMEOUT="$REDIS_TASK_TIMEOUT" \
-        nohup python litserve_worker.py \
+        PDF_SPLIT_ENABLED="$PDF_SPLIT_ENABLED" \
+        PDF_SPLIT_THRESHOLD_PAGES="$PDF_SPLIT_THRESHOLD_PAGES" \
+        PDF_SPLIT_CHUNK_SIZE="$PDF_SPLIT_CHUNK_SIZE" \
+        nohup ${PYTHON_BIN} litserve_worker.py \
             --accelerator "$WORKER_ACCELERATOR" \
             --port "$port" \
             --workers-per-device 1 \
@@ -536,6 +575,150 @@ status_workers() {
         fi
     done
     echo "  运行中: ${running}/${WORKER_NUM_INSTANCES}"
+}
+
+# ============================================================================
+# Worker Watchdog（子进程原生崩溃后自动补齐 worker 数量）
+# ============================================================================
+
+start_watchdog() {
+    log_step "启动 Worker Watchdog"
+
+    local pid_file="${WORKER_LOG_DIR}/watchdog.pid"
+    local log_file="${WORKER_LOG_DIR}/watchdog.log"
+
+    if [ -f "$pid_file" ] && ps -p "$(cat "$pid_file")" > /dev/null 2>&1; then
+        log_info "Worker Watchdog 已在运行 (PID: $(cat "$pid_file"))"
+        return 0
+    fi
+
+    # watchdog 就是一个后台子 shell：每 60s 数一遍存活 worker，少了就调本脚本 start worker 补齐
+    nohup bash -c '
+        TIANSHU_SCRIPT="'"${PROJECT_ROOT}"'/scripts/tianshu.sh"
+        EXPECTED='"${WORKER_NUM_INSTANCES}"'
+        INTERVAL=60
+        while true; do
+            sleep '"${INTERVAL}"'
+            RUNNING=$(pgrep -f "litserve_worker.py.*--port" 2>/dev/null | wc -l)
+            if [ "$RUNNING" -lt "$EXPECTED" ]; then
+                echo "[$(date "+%F %T")] watchdog: workers $RUNNING/$EXPECTED, restarting..." >> "'"${log_file}"'"
+                bash "$TIANSHU_SCRIPT" start worker >> "'"${log_file}"'" 2>&1
+            fi
+        done
+    ' > /dev/null 2>&1 &
+
+    local pid=$!
+    echo "$pid" > "$pid_file"
+    log_info "Worker Watchdog 已启动 (PID: $pid, 每 60s 检查一次)"
+}
+
+stop_watchdog() {
+    local pid_file="${WORKER_LOG_DIR}/watchdog.pid"
+    if [ -f "$pid_file" ]; then
+        local pid=$(cat "$pid_file")
+        kill "$pid" 2>/dev/null || true
+        # watchdog 是 bash -c 子 shell，连带其子进程一起清掉
+        pkill -P "$pid" 2>/dev/null || true
+        rm -f "$pid_file"
+    fi
+    log_info "Worker Watchdog 已停止"
+}
+
+status_watchdog() {
+    echo -e "${CYAN}Worker Watchdog${NC}"
+    local pid_file="${WORKER_LOG_DIR}/watchdog.pid"
+    if [ -f "$pid_file" ] && ps -p "$(cat "$pid_file")" > /dev/null 2>&1; then
+        echo "  ✅ 运行中 (PID: $(cat "$pid_file"))"
+    else
+        echo "  ❌ 未运行"
+    fi
+}
+
+# ============================================================================
+# 调度器管理（孤儿任务恢复 + 队列监控 + 旧文件清理）
+# ============================================================================
+
+start_scheduler() {
+    log_step "启动 Task Scheduler"
+
+    mkdir -p "$SCHEDULER_LOG_DIR"
+
+    local pid_file="${SCHEDULER_LOG_DIR}/scheduler.pid"
+    local log_file="${SCHEDULER_LOG_DIR}/scheduler.log"
+
+    if [ -f "$pid_file" ] && ps -p "$(cat "$pid_file")" > /dev/null 2>&1; then
+        log_info "Task Scheduler 已在运行 (PID: $(cat "$pid_file"))"
+        return 0
+    fi
+
+    # 预检查: worker 至少有一个在跑（scheduler --wait-for-workers 会等，但先快速失败更友好）
+    local running_workers=$(pgrep -f "litserve_worker.py.*--port" 2>/dev/null | wc -l)
+    if [ "$running_workers" -eq 0 ]; then
+        log_error "无运行中的 Worker，请先启动 Worker (scheduler 依赖 worker 健康检查)"
+        return 1
+    fi
+
+    cd "$BACKEND_DIR"
+
+    DATABASE_PATH="$DATABASE_PATH" \
+    OUTPUT_PATH="$OUTPUT_PATH" \
+    REDIS_QUEUE_ENABLED="$REDIS_QUEUE_ENABLED" \
+    REDIS_HOST="$REDIS_HOST" \
+    REDIS_PORT="$REDIS_PORT" \
+    REDIS_DB="$REDIS_DB" \
+    REDIS_PASSWORD="$REDIS_PASSWORD" \
+    REDIS_QUEUE_KEY="$REDIS_QUEUE_KEY" \
+    REDIS_PROCESSING_KEY="$REDIS_PROCESSING_KEY" \
+    REDIS_TASK_TIMEOUT="$REDIS_TASK_TIMEOUT" \
+    nohup ${PYTHON_BIN} task_scheduler.py \
+        --litserve-url "http://localhost:${WORKER_BASE_PORT}/predict" \
+        --monitor-interval "$SCHEDULER_MONITOR_INTERVAL" \
+        --health-check-interval "$SCHEDULER_HEALTH_INTERVAL" \
+        --stale-task-timeout "$SCHEDULER_STALE_TIMEOUT" \
+        --cleanup-old-files-days "$SCHEDULER_CLEANUP_DAYS" \
+        --wait-for-workers \
+        > "$log_file" 2>&1 &
+
+    local pid=$!
+    echo "$pid" > "$pid_file"
+    log_info "Task Scheduler 启动中 (PID: $pid)..."
+
+    sleep 3
+
+    if ps -p "$pid" > /dev/null 2>&1; then
+        log_info "Task Scheduler 就绪 - 孤儿恢复阈值 ${SCHEDULER_STALE_TIMEOUT}m, 监控周期 ${SCHEDULER_MONITOR_INTERVAL}s"
+    else
+        log_error "Task Scheduler 启动失败，查看: $log_file"
+        return 1
+    fi
+}
+
+stop_scheduler() {
+    log_step "停止 Task Scheduler"
+
+    local pid_file="${SCHEDULER_LOG_DIR}/scheduler.pid"
+    if [ -f "$pid_file" ]; then
+        local pid=$(cat "$pid_file")
+        kill "$pid" 2>/dev/null || true
+        rm -f "$pid_file"
+    fi
+    pkill -f "python task_scheduler.py" 2>/dev/null || true
+    log_info "Task Scheduler 已停止"
+}
+
+status_scheduler() {
+    echo -e "${CYAN}Task Scheduler (孤儿恢复阈值 ${SCHEDULER_STALE_TIMEOUT}m)${NC}"
+    local pid_file="${SCHEDULER_LOG_DIR}/scheduler.pid"
+    if [ -f "$pid_file" ] && ps -p "$(cat "$pid_file")" > /dev/null 2>&1; then
+        echo "  ✅ 运行中 (PID: $(cat "$pid_file"))"
+        # 显示最近一次 orphan recovery 日志
+        if [ -f "${SCHEDULER_LOG_DIR}/scheduler.log" ]; then
+            local last=$(grep "recover_orphans\|Orphan recovery" "${SCHEDULER_LOG_DIR}/scheduler.log" 2>/dev/null | tail -1)
+            [ -n "$last" ] && echo "  最近恢复: $last"
+        fi
+    else
+        echo "  ❌ 未运行"
+    fi
 }
 
 # ============================================================================
@@ -729,11 +912,13 @@ cmd_start() {
     check_instance_conflict || return 1
 
     case "$target" in
-        redis)   start_redis    || rc=1 ;;
-        vllm)    start_vllm     || rc=1 ;;
-        api)     start_api      || rc=1 ;;
-        mcp)     start_mcp      || rc=1 ;;
-        worker)  start_workers  || rc=1 ;;
+        redis)    start_redis    || rc=1 ;;
+        vllm)     start_vllm     || rc=1 ;;
+        api)      start_api      || rc=1 ;;
+        mcp)      start_mcp      || rc=1 ;;
+        worker)   start_workers  || rc=1 ;;
+        watchdog) start_watchdog || rc=1 ;;
+        scheduler) start_scheduler || rc=1 ;;
         frontend) start_frontend || rc=1 ;;
         all)
             start_redis    || rc=1
@@ -741,9 +926,11 @@ cmd_start() {
             start_api      || rc=1
             start_mcp      || rc=1
             start_workers  || rc=1
+            start_watchdog || rc=1
+            start_scheduler || rc=1
             start_frontend || rc=1
             ;;
-        *) log_error "未知服务: $target (可选: vllm|api|redis|mcp|worker|frontend|all)"; exit 1 ;;
+        *) log_error "未知服务: $target (可选: vllm|api|redis|mcp|worker|watchdog|scheduler|frontend|all)"; exit 1 ;;
     esac
 
     echo ""
@@ -760,21 +947,25 @@ cmd_stop() {
     local target="${1:-all}"
 
     case "$target" in
-        vllm)    stop_vllm ;;
-        api)     stop_api ;;
-        mcp)     stop_mcp ;;
-        worker)  stop_workers ;;
+        vllm)     stop_vllm ;;
+        api)      stop_api ;;
+        mcp)      stop_mcp ;;
+        worker)   stop_workers ;;
+        watchdog) stop_watchdog ;;
+        scheduler) stop_scheduler ;;
         frontend) stop_frontend ;;
-        redis)   stop_redis ;;
+        redis)    stop_redis ;;
         all)
             stop_frontend
+            stop_scheduler
+            stop_watchdog
             stop_workers
             stop_mcp
             stop_api
             stop_vllm
             stop_redis
             ;;
-        *) log_error "未知服务: $target (可选: vllm|api|redis|mcp|worker|frontend|all)"; exit 1 ;;
+        *) log_error "未知服务: $target (可选: vllm|api|redis|mcp|worker|watchdog|scheduler|frontend|all)"; exit 1 ;;
     esac
 
     # 仅在停止整个实例(all)时释放数据目录锁;单服务停止不释放(api 仍占用目录)
@@ -806,6 +997,10 @@ cmd_status() {
     echo ""
     status_workers
     echo ""
+    status_watchdog
+    echo ""
+    status_scheduler
+    echo ""
     status_frontend
     echo ""
     separator
@@ -817,14 +1012,16 @@ cmd_logs() {
     local target="${1:-all}"
 
     case "$target" in
-        redis)   tail -f "${LOG_DIR}/redis.log" ;;
-        vllm)    tail -f "${VLLM_LOG_DIR}"/*.log ;;
-        worker)  tail -f "${WORKER_LOG_DIR}"/*.log ;;
-        api)     tail -f "${API_LOG_DIR}"/*.log ;;
-        mcp)     tail -f "${API_LOG_DIR}/mcp.log" ;;
-        frontend) tail -f "${LOG_DIR}/frontend.log" ;;
-        all)     tail -f "${LOG_DIR}"/*/*.log "${LOG_DIR}"/frontend.log "${LOG_DIR}"/redis.log ;;
-        *) log_error "未知服务: $target (可选: vllm|worker|api|mcp|redis|frontend|all)"; exit 1 ;;
+        redis)     tail -f "${LOG_DIR}/redis.log" ;;
+        vllm)      tail -f "${VLLM_LOG_DIR}"/*.log ;;
+        worker)    tail -f "${WORKER_LOG_DIR}"/worker_*.log ;;
+        watchdog)  tail -f "${WORKER_LOG_DIR}/watchdog.log" ;;
+        scheduler) tail -f "${SCHEDULER_LOG_DIR}"/*.log ;;
+        api)       tail -f "${API_LOG_DIR}"/*.log ;;
+        mcp)       tail -f "${API_LOG_DIR}/mcp.log" ;;
+        frontend)  tail -f "${LOG_DIR}/frontend.log" ;;
+        all)       tail -f "${LOG_DIR}"/*/*.log "${LOG_DIR}"/frontend.log "${LOG_DIR}"/redis.log ;;
+        *) log_error "未知服务: $target (可选: vllm|worker|watchdog|scheduler|api|mcp|redis|frontend|all)"; exit 1 ;;
     esac
 }
 
@@ -939,6 +1136,8 @@ MinerU Tianshu - 统一启动脚本
   api            API Server (端口 ${API_PORT})
   mcp            MCP Server (端口 ${MCP_PORT})
   worker         Workers (端口 ${WORKER_BASE_PORT}-${WORKER_BASE_PORT}$((WORKER_NUM_INSTANCES-1)))
+  watchdog       Worker 看门狗 (worker 崩溃后自动补齐,每 60s 检查)
+  scheduler      任务调度器 (孤儿恢复+队列监控,默认 10 分钟判定孤儿)
   frontend       前端界面 (端口 ${FRONTEND_PORT})
   all            所有服务
 
@@ -949,6 +1148,7 @@ MinerU Tianshu - 统一启动脚本
   bash scripts/tianshu.sh restart         # 重启所有
   bash scripts/tianshu.sh status          # 查看状态
   bash scripts/tianshu.sh logs worker     # 查看 Worker 日志
+  bash scripts/tianshu.sh logs scheduler  # 查看调度器日志
   bash scripts/tianshu.sh test            # 运行验证测试
 
 配置:
