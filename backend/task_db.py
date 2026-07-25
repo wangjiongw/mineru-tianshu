@@ -456,7 +456,7 @@ class TaskDB:
                             result_path = ?,
                             data = ?
                         WHERE task_id = ?
-                        AND status = 'processing'
+                        AND status IN ('processing', 'merging')
                         AND worker_id = ?
                     """
                     cursor.execute(sql, (status, result_path, data, task_id, worker_id))
@@ -468,7 +468,7 @@ class TaskDB:
                             result_path = ?,
                             data = ?
                         WHERE task_id = ?
-                        AND status = 'processing'
+                        AND status IN ('processing', 'merging')
                     """
                     cursor.execute(sql, (status, result_path, data, task_id))
 
@@ -482,7 +482,7 @@ class TaskDB:
                             completed_at = CURRENT_TIMESTAMP,
                             error_message = ?
                         WHERE task_id = ?
-                        AND status = 'processing'
+                        AND status IN ('processing', 'merging')
                         AND worker_id = ?
                     """
                     cursor.execute(sql, (status, error_message, task_id, worker_id))
@@ -493,7 +493,7 @@ class TaskDB:
                             completed_at = CURRENT_TIMESTAMP,
                             error_message = ?
                         WHERE task_id = ?
-                        AND status = 'processing'
+                        AND status IN ('processing', 'merging')
                     """
                     cursor.execute(sql, (status, error_message, task_id))
 
@@ -657,22 +657,141 @@ class TaskDB:
             
             return cursor.rowcount
 
-    def reset_stale_tasks(self, timeout_minutes: int = 60):
-        """重置超时的 processing 任务为 pending"""
+    def reset_stale_tasks(self, timeout_minutes: int = 60) -> int:
+        """重置超时的 processing 任务为 pending
+
+        历史入口：保留签名兼容 API 路由 /admin/reset-stale。
+        内部走 recover_orphans，同时清理 Redis（避免 SQLite/Redis 不同步）。
+        """
+        return self.recover_orphans(stale_minutes=timeout_minutes)["sqlite_reset"]
+
+    def heartbeat(self, task_id: str, worker_id: str) -> bool:
+        """转发心跳到 Redis processing hash
+
+        Worker 处理任务期间周期性调用；进程崩溃则心跳停止，
+        recover_orphans 会据此判定任务为孤儿并重排。
+        """
+        redis_queue = get_redis_queue()
+        if not redis_queue:
+            return False
+        return redis_queue.heartbeat(task_id, worker_id)
+
+    def recover_orphans(self, stale_minutes: int = 30, max_retries: int = 3) -> Dict:
+        """统一孤儿任务恢复：同时处理 SQLite 和 Redis 两层
+
+        1. SQLite 维度：扫描 started_at 超时的 processing/merging 任务。
+           - retry_count < max_retries：重置为 pending（允许重试）。
+           - retry_count >= max_retries：标记为 failed（毒丸任务兜底，避免无限循环）。
+        2. Redis 维度：重试的 task 调 fail(requeue=True) 重入队列；
+           放弃的 task 调 fail(requeue=False) 仅清除 processing hash。
+        3. 幽灵清理：Redis processing hash 中存在但 SQLite 已无记录的条目直接 HDEL。
+
+        Returns:
+            {"sqlite_reset": N, "sqlite_failed": F, "redis_requeued": M, "ghosts_purged": K}
+        """
+        result = {"sqlite_reset": 0, "sqlite_failed": 0, "redis_requeued": 0, "ghosts_purged": 0}
+        stale_task_ids: set = set()
+        fail_task_ids: set = set()
+
+        # 1. SQLite 维度：先查再改，拿到 task_id + worker_id + retry_count 供后续决策
+        #    注意:status 包含 'merging' —— 合并过程中 worker 崩溃的父任务也需要恢复
         with self.get_cursor() as cursor:
             cursor.execute(
                 """
-                UPDATE tasks
-                SET status = 'pending',
-                    worker_id = NULL,
-                    retry_count = retry_count + 1
-                WHERE status = 'processing'
+                SELECT task_id, worker_id, retry_count FROM tasks
+                WHERE status IN ('processing', 'merging')
                 AND started_at < datetime('now', '-' || ? || ' minutes')
-            """,
-                (timeout_minutes,),
+                """,
+                (stale_minutes,),
             )
-            reset_count = cursor.rowcount
-            return reset_count
+            stale_rows = cursor.fetchall()
+
+            if stale_rows:
+                for row in stale_rows:
+                    if row["retry_count"] >= max_retries:
+                        fail_task_ids.add(row["task_id"])
+                    else:
+                        stale_task_ids.add(row["task_id"])
+
+                # 重试：status=pending, retry_count+1
+                if stale_task_ids:
+                    placeholders = ",".join("?" * len(stale_task_ids))
+                    cursor.execute(
+                        f"""
+                        UPDATE tasks
+                        SET status = 'pending',
+                            worker_id = NULL,
+                            retry_count = retry_count + 1
+                        WHERE task_id IN ({placeholders})
+                        """,
+                        tuple(stale_task_ids),
+                    )
+                    result["sqlite_reset"] = cursor.rowcount
+
+                # 放弃：status=failed, 记录错误, 不改 worker_id（留证据）
+                if fail_task_ids:
+                    placeholders = ",".join("?" * len(fail_task_ids))
+                    cursor.execute(
+                        f"""
+                        UPDATE tasks
+                        SET status = 'failed',
+                            error_message = 'Task repeatedly crashed workers (native SIGSEGV/SIGABRT) after '
+                                            || retry_count || ' retries. Likely a poison task.',
+                            completed_at = datetime('now')
+                        WHERE task_id IN ({placeholders})
+                        """,
+                        tuple(fail_task_ids),
+                    )
+                    result["sqlite_failed"] = cursor.rowcount
+
+        # 2. Redis 维度
+        redis_queue = get_redis_queue()
+        if redis_queue and (stale_task_ids or fail_task_ids):
+            for row in stale_rows:
+                tid = row["task_id"]
+                old_worker = row["worker_id"] or "unknown"
+                requeue = tid in stale_task_ids
+                try:
+                    if redis_queue.fail(tid, old_worker, requeue=requeue):
+                        if requeue:
+                            result["redis_requeued"] += 1
+                        else:
+                            logger.warning(
+                                f"☠️  recover_orphans: task {tid} permanently failed "
+                                f"(exceeded {max_retries} retries, likely poison task)"
+                            )
+                except Exception as e:
+                    logger.error(f"❌ recover_orphans: redis fail({tid}) failed: {e}")
+
+        # 3. 幽灵清理：Redis processing hash 中有、但 SQLite 已无此 task_id 的条目
+        if redis_queue:
+            try:
+                processing = redis_queue.client.hgetall(redis_queue.config.processing_key)
+                for tid in list(processing.keys()):
+                    if tid not in stale_task_ids and tid not in fail_task_ids:
+                        # 再确认一次 SQLite 是否真无此任务
+                        with self.get_cursor() as cursor:
+                            cursor.execute(
+                                "SELECT 1 FROM tasks WHERE task_id = ? AND status = 'processing'",
+                                (tid,),
+                            )
+                            if cursor.fetchone() is None:
+                                logger.warning(
+                                    f"👻 recover_orphans: purging ghost task {tid} "
+                                    f"(in Redis processing but absent/stale in SQLite)"
+                                )
+                                redis_queue.client.hdel(redis_queue.config.processing_key, tid)
+                                result["ghosts_purged"] += 1
+            except Exception as e:
+                logger.error(f"❌ recover_orphans: ghost scan failed: {e}")
+
+        if any(result.values()):
+            logger.info(
+                f"🔄 recover_orphans: reset={result['sqlite_reset']} "
+                f"failed={result['sqlite_failed']} "
+                f"requeued={result['redis_requeued']} ghosts={result['ghosts_purged']}"
+            )
+        return result
 
     # -------------------------------------------------------------------------
     # 新增功能：清理失败任务 (包含物理文件删除)
@@ -727,16 +846,35 @@ class TaskDB:
         return task_id
 
     def convert_to_parent_task(self, task_id: str, child_count: int = 0):
-        """将普通任务转换为父任务"""
+        """将普通任务转换为父任务
+
+        child_count=0 表示初始化父任务（拆分开始）：此时同步重置 child_completed=0，
+        并清除上一轮残留的子任务（防止重试场景下旧子任务成为孤儿）。
+        """
         with self.get_cursor() as cursor:
-            cursor.execute(
-                """
-                UPDATE tasks
-                SET is_parent = 1, child_count = ?, status = 'processing'
-                WHERE task_id = ?
-                """,
-                (child_count, task_id),
-            )
+            if child_count == 0:
+                # 初置：清除上一轮残留子任务 + 清零完成计数，防止重试场景下旧值残留导致合并提前触发
+                cursor.execute("DELETE FROM tasks WHERE parent_task_id = ?", (task_id,))
+                deleted = cursor.rowcount
+                cursor.execute(
+                    """
+                    UPDATE tasks
+                    SET is_parent = 1, child_count = 0, child_completed = 0, status = 'processing'
+                    WHERE task_id = ?
+                    """,
+                    (task_id,),
+                )
+                if deleted:
+                    logger.info(f"🧹 Cleared {deleted} stale children from previous split of {task_id}")
+            else:
+                cursor.execute(
+                    """
+                    UPDATE tasks
+                    SET is_parent = 1, child_count = ?, status = 'processing'
+                    WHERE task_id = ?
+                    """,
+                    (child_count, task_id),
+                )
         logger.info(f"🔄 Converted task {task_id} to parent task with {child_count} children")
 
     def create_child_task(
@@ -782,12 +920,21 @@ class TaskDB:
                 (parent_task_id,),
             )
 
+        # 入 Redis 队列,让 Redis-first worker 能及时拉到子任务
+        self._enqueue_to_redis(task_id, priority, {
+            "file_name": file_name,
+            "backend": backend,
+            "parent_task_id": parent_task_id,
+        })
+
         logger.debug(f"📄 Created child task: {task_id} (parent: {parent_task_id})")
         return task_id
 
     def on_child_task_completed(self, child_task_id: str) -> Optional[str]:
-        """子任务完成回调"""
+        """子任务完成回调。返回 parent_task_id 表示当前 worker 赢得合并权。"""
         with self.get_cursor() as cursor:
+            cursor.execute("BEGIN IMMEDIATE")
+
             # 获取父任务ID
             cursor.execute(
                 """
@@ -815,7 +962,7 @@ class TaskDB:
             # 检查是否所有子任务都完成了
             cursor.execute(
                 """
-                SELECT child_count, child_completed, file_name
+                SELECT child_count, child_completed, file_name, status
                 FROM tasks WHERE task_id = ?
             """,
                 (parent_task_id,),
@@ -823,12 +970,22 @@ class TaskDB:
             parent = cursor.fetchone()
 
             if parent and parent["child_completed"] >= parent["child_count"]:
-                # 所有子任务完成
-                logger.info(
-                    f"🎉 All subtasks completed for parent task {parent_task_id} "
-                    f"({parent['child_completed']}/{parent['child_count']}) - {parent['file_name']}"
-                )
-                return parent_task_id
+                # 原子 CAS：processing → merging。只有第一个到达的 worker 能赢(rowcount=1)。
+                if parent["status"] == "processing":
+                    cursor.execute(
+                        "UPDATE tasks SET status = 'merging' WHERE task_id = ? AND status = 'processing'",
+                        (parent_task_id,),
+                    )
+                    if cursor.rowcount > 0:
+                        logger.info(
+                            f"🎉 All subtasks completed for parent task {parent_task_id} "
+                            f"({parent['child_completed']}/{parent['child_count']}) - {parent['file_name']}"
+                        )
+                        return parent_task_id
+                    else:
+                        logger.info(f"↩️ Merge already claimed by another worker for {parent_task_id}")
+                else:
+                    logger.info(f"⏭️ Parent {parent_task_id} status={parent['status']}, skip merge claim")
 
             if parent:
                 logger.info(

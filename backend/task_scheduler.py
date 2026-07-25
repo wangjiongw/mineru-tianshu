@@ -47,7 +47,7 @@ class TaskScheduler:
         litserve_url="http://localhost:8001/predict",
         monitor_interval=300,
         health_check_interval=900,
-        stale_task_timeout=60,
+        stale_task_timeout=10,
         cleanup_old_files_days=7,
         cleanup_old_records_days=0,
         worker_auto_mode=True,
@@ -158,16 +158,22 @@ class TaskScheduler:
                         else:
                             logger.warning("⚠️  Workers health check failed")
 
-                    # 3. 定期重置超时任务
+                    # 3. 定期恢复孤儿任务（SQLite + Redis 两层同步，含幽灵清理）
                     stale_task_counter += 1
                     if stale_task_counter * self.monitor_interval >= self.stale_task_timeout * 60:
                         stale_task_counter = 0
                         try:
-                            reset_count = self.db.reset_stale_tasks(self.stale_task_timeout)
-                            if reset_count > 0:
-                                logger.warning(f"⚠️  Reset {reset_count} stale tasks (timeout: {self.stale_task_timeout}m)")
+                            stats = self.db.recover_orphans(self.stale_task_timeout)
+                            if any(stats.values()):
+                                logger.warning(
+                                    f"⚠️  Orphan recovery (stale > {self.stale_task_timeout}m): "
+                                    f"reset={stats['sqlite_reset']} "
+                                    f"failed={stats['sqlite_failed']} "
+                                    f"requeued={stats['redis_requeued']} "
+                                    f"ghosts={stats['ghosts_purged']}"
+                                )
                         except Exception as e:
-                            logger.error(f"Failed to reset stale tasks: {e}")
+                            logger.error(f"Failed to recover orphan tasks: {e}")
 
                     # 4. 定期清理旧任务文件
                     cleanup_counter += 1
@@ -246,7 +252,7 @@ if __name__ == "__main__":
         help="Health check interval in seconds (default: 900s = 15 minutes)",
     )
     parser.add_argument(
-        "--stale-task-timeout", type=int, default=60, help="Timeout for stale tasks in minutes (default: 60)"
+        "--stale-task-timeout", type=int, default=10, help="Timeout for stale tasks in minutes (default: 10)"
     )
     parser.add_argument(
         "--cleanup-old-files-days",

@@ -327,8 +327,25 @@ class MinerUWorkerAPI(ls.LitAPI):
                 logger.error(f"❌ Failed to init watermark engine: {e}")
 
         if self.enable_worker_loop:
+            # 心跳线程：周期性通知 Redis "我还活着"，崩溃后心跳停止 → recover_orphans 判定为孤儿
+            self._heartbeat_stop = threading.Event()
+            self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+            self._heartbeat_thread.start()
+
             self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
             self.worker_thread.start()
+
+    def _heartbeat_loop(self):
+        """后台心跳：每 30s 向 Redis 更新当前任务的 claimed_at"""
+        HEARTBEAT_INTERVAL = 30
+        while not self._heartbeat_stop.is_set():
+            try:
+                tid = self.current_task_id
+                if tid:
+                    self.task_db.heartbeat(tid, self.worker_id)
+            except Exception as e:
+                logger.warning(f"💓 {self.worker_id} heartbeat error: {e}")
+            self._heartbeat_stop.wait(HEARTBEAT_INTERVAL)
 
     def _worker_loop(self):
         logger.info(f"🔁 {self.worker_id} started task polling loop")
@@ -848,11 +865,23 @@ class MinerUWorkerAPI(ls.LitAPI):
         self.task_db.update_task_status(parent_task_id, "completed", result_path=str(parent_out))
         self._cleanup_child_task_files(children)
 
+        # 清理空的 splits 目录
+        try:
+            split_dir = Path(self.output_dir) / "splits" / parent_task_id
+            if split_dir.exists() and not any(split_dir.iterdir()):
+                split_dir.rmdir()
+        except Exception:
+            pass
+
     def _cleanup_child_task_files(self, children):
+        # 只删 completed 子任务的 chunk 文件；pending/processing 的子任务仍需要输入文件
         for child in children:
+            if child.get("status") != "completed":
+                continue
             try:
                 if child.get("file_path"): Path(child["file_path"]).unlink(missing_ok=True)
-            except: pass
+            except Exception:
+                pass
 
     # LitServe Interfaces
     def decode_request(self, request): return request.get("action", "health")
