@@ -75,6 +75,7 @@ class TaskDB:
         """
         conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30.0)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=30000")  # 锁等待 30s，避免高并发下立刻报 database is locked
         return conn
 
     @contextmanager
@@ -94,6 +95,11 @@ class TaskDB:
     def _init_db(self):
         """初始化数据库表"""
         with self.get_cursor() as cursor:
+            # 启用 WAL 模式：允许并发读写（8 workers + API + scheduler 同时写入不再互斥）
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute("PRAGMA wal_autocheckpoint=1000")
+
             # 创建表（如果不存在）
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS tasks (
