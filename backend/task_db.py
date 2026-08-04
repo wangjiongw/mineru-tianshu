@@ -701,16 +701,49 @@ class TaskDB:
 
         # 1. SQLite 维度：先查再改，拿到 task_id + worker_id + retry_count 供后续决策
         #    注意:status 包含 'merging' —— 合并过程中 worker 崩溃的父任务也需要恢复
+        #    排除：is_parent=1 且 children 未全部完成的 processing 任务
+        #    —— 这些父任务在正常等待 chunk 完成，不是孤儿，reset 会破坏合并流程
         with self.get_cursor() as cursor:
             cursor.execute(
                 """
-                SELECT task_id, worker_id, retry_count FROM tasks
+                SELECT task_id, worker_id, retry_count, is_parent, child_count, child_completed
+                FROM tasks
                 WHERE status IN ('processing', 'merging')
                 AND started_at < datetime('now', '-' || ? || ' minutes')
+                AND NOT (
+                    is_parent = 1
+                    AND status = 'processing'
+                    AND child_count > 0
+                    AND child_completed < child_count
+                )
                 """,
                 (stale_minutes,),
             )
             stale_rows = cursor.fetchall()
+
+            # 单独处理：父任务 children 全部完成但仍卡在 processing（合并竞态遗漏）
+            # → 设为 merging 而非 pending（park 住，防止 get_next_task 抢走重新拆分）
+            stuck_parents = [
+                r for r in stale_rows
+                if r["is_parent"] == 1
+                and r["child_count"] > 0
+                and r["child_completed"] >= r["child_count"]
+            ]
+            if stuck_parents:
+                stuck_ids = [r["task_id"] for r in stuck_parents]
+                placeholders = ",".join("?" * len(stuck_ids))
+                cursor.execute(
+                    f"UPDATE tasks SET status = 'merging' WHERE task_id IN ({placeholders})",
+                    stuck_ids,
+                )
+                logger.warning(
+                    f"🔧 recover_orphans: {len(stuck_ids)} parent task(s) had all children "
+                    f"completed but merge never fired (race condition). Set to 'merging' "
+                    f"(parked safely). Run scripts/fix_orphan_merges.py to merge them."
+                )
+                # 从 stale_rows 中移除，不走下面的 reset/failed 逻辑
+                stuck_set = set(stuck_ids)
+                stale_rows = [r for r in stale_rows if r["task_id"] not in stuck_set]
 
             if stale_rows:
                 for row in stale_rows:
@@ -976,16 +1009,21 @@ class TaskDB:
             parent = cursor.fetchone()
 
             if parent and parent["child_completed"] >= parent["child_count"]:
-                # 原子 CAS：processing → merging。只有第一个到达的 worker 能赢(rowcount=1)。
-                if parent["status"] == "processing":
+                # 原子 CAS：processing/pending → merging。
+                # processing = 正常流程；pending = orphan recovery 曾重置父任务，
+                #   但 children 已全部完成，仍需合并。两种状态都允许 CAS。
+                # merging/completed = 另一个 worker 已认领合并，跳过。
+                if parent["status"] in ("processing", "pending"):
                     cursor.execute(
-                        "UPDATE tasks SET status = 'merging' WHERE task_id = ? AND status = 'processing'",
+                        "UPDATE tasks SET status = 'merging' "
+                        "WHERE task_id = ? AND status IN ('processing', 'pending')",
                         (parent_task_id,),
                     )
                     if cursor.rowcount > 0:
                         logger.info(
                             f"🎉 All subtasks completed for parent task {parent_task_id} "
-                            f"({parent['child_completed']}/{parent['child_count']}) - {parent['file_name']}"
+                            f"({parent['child_completed']}/{parent['child_count']}, "
+                            f"was {parent['status']}) - {parent['file_name']}"
                         )
                         return parent_task_id
                     else:
