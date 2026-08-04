@@ -336,6 +336,16 @@ def submit_task(
 
         options["upload_images"] = os.getenv("RUSTFS_ENABLED", "true").lower() == "true"
 
+        # 优先级：调用者未显式指定 (priority=0) 时，回退到用户默认优先级
+        if priority == 0:
+            try:
+                auth_db = AuthDB()
+                user_priority = auth_db.get_user_default_priority(current_user.user_id)
+                if user_priority > 0:
+                    priority = user_priority
+            except Exception as e:
+                logger.warning(f"Failed to look up user default priority: {e}")
+
         task_result = db.create_task(
             file_name=file.filename,
             file_path=str(temp_file_path),

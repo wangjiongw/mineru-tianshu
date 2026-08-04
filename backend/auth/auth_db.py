@@ -157,6 +157,13 @@ class AuthDB:
                 # 字段已存在，忽略
                 pass
 
+            # 添加 default_priority 列到 users 表 (如果不存在)
+            try:
+                cursor.execute("ALTER TABLE users ADD COLUMN default_priority INTEGER DEFAULT 0")
+                logger.info("✅ Added default_priority column to users table")
+            except sqlite3.OperationalError:
+                pass
+
             # 创建默认管理员账户 (如果不存在)
             cursor.execute("SELECT COUNT(*) as count FROM users WHERE role = 'admin'")
             admin_count = cursor.fetchone()["count"]
@@ -333,6 +340,23 @@ class AuthDB:
             success = cursor.rowcount > 0
         if success:
             invalidate_user_cache(user_id)
+        return success
+
+    def get_user_default_priority(self, user_id: str) -> int:
+        """获取用户默认任务优先级"""
+        with self.get_cursor() as cursor:
+            cursor.execute("SELECT default_priority FROM users WHERE user_id = ?", (user_id,))
+            row = cursor.fetchone()
+            return row["default_priority"] if row else 0
+
+    def set_user_default_priority(self, user_id: str, priority: int) -> bool:
+        """设置用户默认任务优先级"""
+        with self.get_cursor() as cursor:
+            cursor.execute(
+                "UPDATE users SET default_priority = ? WHERE user_id = ?",
+                (priority, user_id),
+            )
+            success = cursor.rowcount > 0
         return success
 
     def change_password(self, user_id: str, old_password: str, new_password: str) -> bool:
