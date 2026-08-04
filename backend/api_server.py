@@ -211,11 +211,11 @@ router = APIRouter()
 
 
 @router.post("/tasks/submit", tags=["任务管理"])
-async def submit_task(
+def submit_task(
     file: UploadFile = File(..., description="文件: PDF/图片/Office/HTML/音频/视频等多种格式"),
     backend: str = Form(
-        "auto",
-        description="处理后端: pipeline, hybrid-auto-engine, vlm-auto-engine, hybrid-http-client, vlm-http-client, paddleocr-vl, etc.",
+        "hybrid-auto-engine",
+        description="处理后端: hybrid-auto-engine(默认,需vLLM), pipeline(纯CPU), vlm-auto-engine, paddleocr-vl, etc.",
     ),
     lang: str = Form("auto", description="语言: ch/en/auto..."),
     method: str = Form("auto", description="解析方法: auto/txt/ocr"),
@@ -248,6 +248,7 @@ async def submit_task(
     watermark_conf_threshold: float = Form(0.35, description="水印检测置信度阈值"),
     watermark_dilation: int = Form(10, description="水印掩码膨胀大小"),
     convert_office_to_pdf: bool = Form(False, description="是否将 Office 文件转换为 PDF 后再处理"),
+    effort: str = Form("high", description="Hybrid解析强度: medium/high"),
 
     useDocOrientationClassify: bool = Form(False, description="文档方向分类"),
     useDocUnwarping: bool = Form(False, description="文档去弯曲"),
@@ -277,7 +278,7 @@ async def submit_task(
         file_hash = hashlib.sha256()
         with open(temp_file_path, "wb") as temp_file:
             while True:
-                chunk = await file.read(1 << 23)
+                chunk = file.file.read(1 << 23)
                 if not chunk:
                     break
                 temp_file.write(chunk)
@@ -290,6 +291,7 @@ async def submit_task(
             "method": method,
             "formula_enable": formula_enable,
             "table_enable": table_enable,
+            "effort": effort,
             "start_page": start_page,
             "end_page": end_page,
             "force_ocr": force_ocr,
@@ -370,7 +372,7 @@ async def submit_task(
 
 
 @router.get("/tasks/{task_id}", tags=["任务管理"])
-async def get_task_status(
+def get_task_status(
     task_id: str,
     upload_images: bool = Query(False, description="【已废弃】图片已自动上传到 RustFS"),
     format: str = Query("markdown", description="返回格式: markdown(默认)/json/both"),
@@ -536,7 +538,7 @@ async def get_task_status(
 # ========================================================================
 
 @router.delete("/tasks/{task_id}", tags=["任务管理"])
-async def delete_task(task_id: str, current_user: User = Depends(get_current_active_user)):
+def delete_task(task_id: str, current_user: User = Depends(get_current_active_user)):
     """
     【重构】彻底删除任务及其本地文件
     不仅取消 pending 的任务，还会物理抹除文件和数据库记录。
@@ -576,7 +578,7 @@ async def delete_task(task_id: str, current_user: User = Depends(get_current_act
 
 
 @router.delete("/tasks/failed/clear", tags=["任务管理"])
-async def clear_failed_tasks_endpoint(current_user: User = Depends(require_permission(Permission.TASK_DELETE_ALL))):
+def clear_failed_tasks_endpoint(current_user: User = Depends(require_permission(Permission.TASK_DELETE_ALL))):
     """
     【重构】一键清理所有失败的任务，包含物理清除文件
     """
@@ -615,7 +617,7 @@ async def clear_failed_tasks_endpoint(current_user: User = Depends(require_permi
 # ========================================================================
 
 @router.post("/tasks/{task_id}/retry", tags=["任务管理"])
-async def retry_task(task_id: str, current_user: User = Depends(get_current_active_user)):
+def retry_task(task_id: str, current_user: User = Depends(get_current_active_user)):
     """
     重试失败的任务
     """
@@ -642,7 +644,7 @@ async def retry_task(task_id: str, current_user: User = Depends(get_current_acti
 
 
 @router.post("/tasks/{task_id}/pause", tags=["任务管理"])
-async def pause_task_endpoint(task_id: str, current_user: User = Depends(get_current_active_user)):
+def pause_task_endpoint(task_id: str, current_user: User = Depends(get_current_active_user)):
     """
     暂停任务
     """
@@ -662,7 +664,7 @@ async def pause_task_endpoint(task_id: str, current_user: User = Depends(get_cur
 
 
 @router.post("/tasks/{task_id}/resume", tags=["任务管理"])
-async def resume_task_endpoint(task_id: str, current_user: User = Depends(get_current_active_user)):
+def resume_task_endpoint(task_id: str, current_user: User = Depends(get_current_active_user)):
     """
     恢复任务
     """
@@ -682,7 +684,7 @@ async def resume_task_endpoint(task_id: str, current_user: User = Depends(get_cu
 
 
 @router.post("/tasks/{task_id}/clear-cache", tags=["任务管理"])
-async def clear_task_cache_endpoint(task_id: str, current_user: User = Depends(get_current_active_user)):
+def clear_task_cache_endpoint(task_id: str, current_user: User = Depends(get_current_active_user)):
     """
     清理任务缓存：仅删除 output 文件夹
     """
@@ -710,7 +712,7 @@ async def clear_task_cache_endpoint(task_id: str, current_user: User = Depends(g
 
 
 @router.get("/queue/stats", tags=["队列管理"])
-async def get_queue_stats(current_user: User = Depends(require_permission(Permission.QUEUE_VIEW))):
+def get_queue_stats(current_user: User = Depends(require_permission(Permission.QUEUE_VIEW))):
     stats = db.get_queue_stats()
     return {
         "success": True,
@@ -722,7 +724,7 @@ async def get_queue_stats(current_user: User = Depends(require_permission(Permis
 
 
 @router.get("/queue/tasks", tags=["队列管理"])
-async def list_tasks(
+def list_tasks(
     status: Optional[str] = Query(None, description="筛选状态"),
     limit: int = Query(100, description="返回数量限制", le=1000),
     page: int = Query(1, ge=1, description="页码"),  
@@ -782,7 +784,7 @@ async def list_tasks(
 
 
 @router.post("/admin/cleanup", tags=["系统管理"])
-async def cleanup_old_tasks(
+def cleanup_old_tasks(
     days: int = Query(7, description="清理N天前的任务"),
     current_user: User = Depends(require_permission(Permission.QUEUE_MANAGE)),
 ):
@@ -796,7 +798,7 @@ async def cleanup_old_tasks(
 
 
 @router.post("/admin/reset-stale", tags=["系统管理"])
-async def reset_stale_tasks(
+def reset_stale_tasks(
     timeout_minutes: int = Query(60, description="超时时间（分钟）"),
     current_user: User = Depends(require_permission(Permission.QUEUE_MANAGE)),
 ):
@@ -810,25 +812,26 @@ async def reset_stale_tasks(
 
 
 @router.get("/engines", tags=["系统信息"])
-async def list_engines():
+def list_engines():
     engines = {
         "document": [
             {
+                "name": "hybrid-auto-engine",
+                "display_name": "Hybrid High-Precision (高精度混合) — 推荐",
+                "description": "结合 Pipeline 的稳定性与 VLM 的理解能力，提供最高精度的解析效果。需要 vLLM 服务。",
+                "supported_formats": [".pdf", ".png", ".jpg", ".jpeg"],
+                "recommended": True,
+            },
+            {
                 "name": "pipeline",
                 "display_name": "Standard Pipeline (通用管道)",
-                "description": "基于 PDF-Extract-Kit 的传统多模型管道，速度快，无幻觉，适合大多数文档。",
+                "description": "基于 PDF-Extract-Kit 的传统多模型管道，纯 CPU 推理，无需 vLLM。",
                 "supported_formats": [".pdf", ".png", ".jpg", ".jpeg"],
             },
             {
                 "name": "vlm-auto-engine",
                 "display_name": "MinerU 2.5 VLM (视觉大模型)",
                 "description": "基于 MinerU 2.5 (1.2B) 视觉模型，擅长处理复杂排版、图表和非标准文档。",
-                "supported_formats": [".pdf", ".png", ".jpg", ".jpeg"],
-            },
-            {
-                "name": "hybrid-auto-engine",
-                "display_name": "Hybrid High-Precision (高精度混合)",
-                "description": "结合 Pipeline 的稳定性与 VLM 的理解能力，提供最高精度的解析效果。",
                 "supported_formats": [".pdf", ".png", ".jpg", ".jpeg"],
             },
         ],
@@ -886,7 +889,7 @@ async def list_engines():
 
 
 @router.get("/health", tags=["系统信息"])
-async def health_check():
+def health_check():
     try:
         stats = db.get_queue_stats()
         return {
@@ -901,7 +904,7 @@ async def health_check():
 
 
 @router.get("/files/output/{file_path:path}", tags=["文件服务"])
-async def serve_output_file(file_path: str):
+def serve_output_file(file_path: str):
     """提供输出文件的访问服务"""
     try:
         decoded_path = unquote(file_path).lstrip("/")
@@ -934,7 +937,7 @@ async def serve_output_file(file_path: str):
 
 
 @router.get("/files/upload/{file_path:path}", tags=["文件服务"])
-async def serve_upload_file(file_path: str):
+def serve_upload_file(file_path: str):
     """提供上传源文件的访问服务"""
     try:
         decoded_path = unquote(file_path).lstrip("/")
@@ -977,4 +980,12 @@ if __name__ == "__main__":
     logger.info("🚀 Starting MinerU Tianshu API Server...")
     logger.info(f"📖 API Documentation: http://localhost:{api_port}/docs")
 
-    uvicorn.run(app, host="0.0.0.0", port=api_port, log_level="info")
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=api_port,
+        log_level="info",
+        timeout_keep_alive=30,
+        limit_concurrency=50,
+        timeout_graceful_shutdown=10,
+    )

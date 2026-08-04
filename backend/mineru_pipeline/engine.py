@@ -255,10 +255,15 @@ class MinerUPipelineEngine:
             file_path_obj = Path(file_path)
             file_ext = file_path_obj.suffix.lower()
 
-            # 1. 确定 Backend
-            user_backend = options.get("parse_mode", "pipeline")
+            # 1. 确定 Backend — auto 优先使用 hybrid (vLLM 可用时), 否则 pipeline
+            user_backend = options.get("parse_mode", "auto")
             if user_backend == "auto":
-                user_backend = "pipeline"
+                if self.vlm_api_base:
+                    user_backend = "hybrid-auto-engine"
+                    logger.info("🔄 [Engine-Auto] vLLM detected → hybrid-auto-engine")
+                else:
+                    user_backend = "pipeline"
+                    logger.info("🔄 [Engine-Auto] vLLM unavailable → pipeline")
 
             backend = user_backend
             server_url = options.get("server_url")
@@ -296,6 +301,7 @@ class MinerUPipelineEngine:
 
             start_page_id = options.get("start_page_id", 0)
             end_page_id = options.get("end_page_id", None)
+            effort = options.get("effort", "high")
             
             try: start_page_id = int(start_page_id)
             except: start_page_id = 0
@@ -352,7 +358,8 @@ class MinerUPipelineEngine:
                     f_dump_middle_json=f_dump_middle_json,
                     f_dump_model_output=f_dump_model_output,
                     f_dump_orig_pdf=f_dump_orig_pdf,
-                    f_dump_content_list=f_dump_content_list
+                    f_dump_content_list=f_dump_content_list,
+                    effort=effort,
                 )
 
                 # 结果提取与搬运

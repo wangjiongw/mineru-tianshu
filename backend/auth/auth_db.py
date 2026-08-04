@@ -8,13 +8,44 @@ MinerU Tianshu - Authentication Database
 import sqlite3
 import hashlib
 import secrets
+import time
 import uuid
 from contextlib import contextmanager
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 from datetime import datetime, timedelta
 from loguru import logger
 
 from .models import User, UserCreate, UserRole
+
+# ----------------------------------------------------------------------------
+# 用户对象 TTL 缓存:避免每个认证请求都打 SQLite(在高并发/网络盘 DB 下是热点)
+# ----------------------------------------------------------------------------
+_user_cache: Dict[str, Tuple[float, Optional[User]]] = {}
+USER_CACHE_TTL = 60.0  # 秒
+_CACHE_MISS = object()  # 哨兵:区分"未缓存"和"缓存了 None"
+
+
+def _cache_get(user_id: str):
+    """返回缓存的 User(或 None);未缓存时返回 _CACHE_MISS"""
+    entry = _user_cache.get(user_id)
+    if not entry:
+        return _CACHE_MISS
+    ts, user = entry
+    if time.time() - ts > USER_CACHE_TTL:
+        return _CACHE_MISS
+    return user
+
+
+def _cache_put(user_id: str, user: Optional[User]) -> None:
+    _user_cache[user_id] = (time.time(), user)
+
+
+def invalidate_user_cache(user_id: str = None) -> None:
+    """失效缓存:user_id=None 清空全部;否则只清该用户"""
+    if user_id is None:
+        _user_cache.clear()
+    else:
+        _user_cache.pop(user_id, None)
 
 
 class AuthDB:
@@ -204,13 +235,16 @@ class AuthDB:
         return self.get_user_by_id(user_id)
 
     def get_user_by_id(self, user_id: str) -> Optional[User]:
-        """根据用户ID获取用户"""
+        """根据用户ID获取用户(带 TTL 缓存)"""
+        cached = _cache_get(user_id)
+        if cached is not _CACHE_MISS:
+            return cached
         with self.get_cursor() as cursor:
             cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
             row = cursor.fetchone()
-            if row:
-                return self._row_to_user(row)
-            return None
+            user = self._row_to_user(row) if row else None
+            _cache_put(user_id, user)
+            return user
 
     def get_user_by_username(self, username: str) -> Optional[User]:
         """根据用户名获取用户"""
@@ -253,9 +287,12 @@ class AuthDB:
                 return None
 
             # 更新最后登录时间
-            cursor.execute("UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE user_id = ?", (row["user_id"],))
+            user_id = row["user_id"]
+            cursor.execute("UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE user_id = ?", (user_id,))
+            user = self._row_to_user(row)
 
-            return self._row_to_user(row)
+        invalidate_user_cache(user_id)
+        return user
 
     def list_users(self, limit: int = 100, offset: int = 0) -> List[User]:
         """列出所有用户"""
@@ -293,7 +330,10 @@ class AuthDB:
 
         with self.get_cursor() as cursor:
             cursor.execute(f"UPDATE users SET {set_clause} WHERE user_id = ?", values)
-            return cursor.rowcount > 0
+            success = cursor.rowcount > 0
+        if success:
+            invalidate_user_cache(user_id)
+        return success
 
     def change_password(self, user_id: str, old_password: str, new_password: str) -> bool:
         """
@@ -330,14 +370,19 @@ class AuthDB:
             # 更新密码
             new_password_hash = self._hash_password(new_password)
             cursor.execute("UPDATE users SET password_hash = ? WHERE user_id = ?", (new_password_hash, user_id))
+            success = cursor.rowcount > 0
 
-            return cursor.rowcount > 0
+        if success:
+            invalidate_user_cache(user_id)
+        return success
 
     def delete_user(self, user_id: str) -> bool:
         """删除用户"""
         with self.get_cursor() as cursor:
             cursor.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
-            return cursor.rowcount > 0
+            success = cursor.rowcount > 0
+        invalidate_user_cache(user_id)
+        return success
 
     def create_api_key(self, user_id: str, name: str, expires_days: Optional[int] = None) -> Dict[str, str]:
         """
@@ -457,8 +502,11 @@ class AuthDB:
 
             if row:
                 # 更新最后登录时间
-                cursor.execute("UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE user_id = ?", (row["user_id"],))
-                return self._row_to_user(row)
+                user_id = row["user_id"]
+                cursor.execute("UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE user_id = ?", (user_id,))
+                user = self._row_to_user(row)
+                invalidate_user_cache(user_id)
+                return user
 
             # 创建新 SSO 用户
             user_id = str(uuid.uuid4())

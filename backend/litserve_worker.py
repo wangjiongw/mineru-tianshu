@@ -399,7 +399,7 @@ class MinerUWorkerAPI(ls.LitAPI):
 
             if backend == "paddleocr-vl-vllm" and self.paddleocr_vl_vllm_api:
                 self.vllm_controller.ensure_service(target_container=paddle_container, conflict_container=mineru_container)
-            elif backend in ["vlm-auto-engine", "hybrid-auto-engine"] and self.mineru_vllm_api:
+            elif backend in ["vlm-auto-engine", "hybrid-auto-engine", "auto"] and self.mineru_vllm_api:
                 self.vllm_controller.ensure_service(target_container=mineru_container, conflict_container=paddle_container)
 
             file_ext = Path(file_path).suffix.lower()
@@ -459,7 +459,13 @@ class MinerUWorkerAPI(ls.LitAPI):
                 elif file_ext in [".mp4", ".avi", ".mkv", ".mov"] and VIDEO_ENGINE_AVAILABLE:
                     result = self._process_video(file_path, options)
                 elif file_ext in [".pdf", ".png", ".jpg", ".jpeg"] and MINERU_PIPELINE_AVAILABLE:
-                    options["parse_mode"] = "pipeline"
+                    if self.mineru_vllm_api:
+                        options["parse_mode"] = "hybrid-auto-engine"
+                        options.setdefault("effort", "high")
+                        logger.info(f"🔄 [Auto] vLLM available → hybrid-auto-engine (effort=high) for {file_ext}")
+                    else:
+                        options["parse_mode"] = "pipeline"
+                        logger.info(f"🔄 [Auto] vLLM unavailable → pipeline fallback for {file_ext}")
                     result = self._process_with_mineru(file_path, options)
                 elif self.markitdown:
                     result = self._process_with_markitdown(file_path)

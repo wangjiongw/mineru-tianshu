@@ -29,7 +29,7 @@ def get_auth_db() -> AuthDB:
     return _auth_db
 
 
-async def get_current_user_from_token(
+def get_current_user_from_token(
     credentials: Optional[HTTPAuthorizationCredentials] = Security(bearer_scheme),
     auth_db: AuthDB = Depends(get_auth_db),
 ) -> Optional[User]:
@@ -56,7 +56,7 @@ async def get_current_user_from_token(
     return user
 
 
-async def get_current_user_from_apikey(
+def get_current_user_from_apikey(
     api_key: Optional[str] = Security(api_key_header),
     auth_db: AuthDB = Depends(get_auth_db),
 ) -> Optional[User]:
@@ -77,7 +77,7 @@ async def get_current_user_from_apikey(
     return user
 
 
-async def get_current_user(
+def get_current_user(
     user_from_token: Optional[User] = Depends(get_current_user_from_token),
     user_from_apikey: Optional[User] = Depends(get_current_user_from_apikey),
 ) -> User:
@@ -108,7 +108,7 @@ async def get_current_user(
     return user
 
 
-async def get_current_active_user(current_user: User = Depends(get_current_user)) -> User:
+def get_current_active_user(current_user: User = Depends(get_current_user)) -> User:
     """
     获取当前激活的用户
 
@@ -142,7 +142,7 @@ def require_permission(permission: Permission):
         Dependency: FastAPI 依赖项
     """
 
-    async def permission_checker(current_user: User = Depends(get_current_active_user)) -> User:
+    def permission_checker(current_user: User = Depends(get_current_active_user)) -> User:
         if not current_user.has_permission(permission):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -169,7 +169,7 @@ def require_role(role: UserRole):
         Dependency: FastAPI 依赖项
     """
 
-    async def role_checker(current_user: User = Depends(get_current_active_user)) -> User:
+    def role_checker(current_user: User = Depends(get_current_active_user)) -> User:
         if not current_user.has_role(role):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -180,7 +180,7 @@ def require_role(role: UserRole):
     return role_checker
 
 
-async def get_api_key_user(
+def get_api_key_user(
     user_from_apikey: Optional[User] = Depends(get_current_user_from_apikey),
 ) -> User:
     """
@@ -205,7 +205,7 @@ async def get_api_key_user(
 
 
 # 可选认证依赖 (不强制要求登录)
-async def get_optional_user(
+def get_optional_user(
     user_from_token: Optional[User] = Depends(get_current_user_from_token),
     user_from_apikey: Optional[User] = Depends(get_current_user_from_apikey),
 ) -> Optional[User]:

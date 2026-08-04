@@ -29,8 +29,9 @@ VLLM_MODEL_PATH="/share/wangjiong/model_zoo/modelscope/models/OpenDataLab/MinerU
 VLLM_BASE_PORT=30025
 VLLM_NUM_INSTANCES=8
 VLLM_MAX_MODEL_LEN=8192
-VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.3}"  # vLLM 显存占用上限(默认 0.92 会把 52G 全分给 KV cache 导致推理 OOM;
-#                                                                # 0.3 → ~19G 总占用,其中 ~15G KV cache 仍支持 ~150 并发,给推理 spike 留足 45G 空间)
+VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.80}" # vLLM 显存占用上限; 0.80 → ~52G (模型 ~5G + KV cache ~47G)
+#                                                                # hybrid/VLM 模式下全部推理走 vLLM,需要大 KV cache; 留 ~12G 给 3 个 worker 的 NPU context + 系统开销
+#                                                                # 注意: 0.92 会导致 vLLM(60G)+workers(6G) > 64G → OOM
 VLLM_READY_TIMEOUT="${VLLM_READY_TIMEOUT:-900}"   # vllm 健康检查总超时(秒);首次含 NPU kernel 编译,默认 15min,可调大
 # 锁定 vllm 可执行文件到绝对路径:其 shebang 指向 /usr/local/python3.11.15/bin/python3,
 # 独立于当前 shell 的 PATH 与默认 python(默认 python 仍保持 conda mineru 环境)。
@@ -102,7 +103,7 @@ REDIS_APPENDONLY="${REDIS_APPENDONLY:-no}"   # 是否开启 AOF 持久化（no=�
 SCHEDULER_MONITOR_INTERVAL="${SCHEDULER_MONITOR_INTERVAL:-300}"   # 监控周期(秒,默认 5 分钟)
 SCHEDULER_HEALTH_INTERVAL="${SCHEDULER_HEALTH_INTERVAL:-900}"     # 健康检查周期(秒,默认 15 分钟)
 SCHEDULER_STALE_TIMEOUT="${SCHEDULER_STALE_TIMEOUT:-10}"          # 孤儿任务判定阈值(分钟,默认 10)
-SCHEDULER_CLEANUP_DAYS="${SCHEDULER_CLEANUP_DAYS:-7}"             # 旧任务文件清理(天)
+SCHEDULER_CLEANUP_DAYS="${SCHEDULER_CLEANUP_DAYS:-0}"             # 旧任务文件清理(天, 0=禁用;批量处理时必须关闭否则边跑边删)
 
 # PDF 自动拆分（降低单次推理峰值内存，缓解 worker 原生崩溃）
 PDF_SPLIT_ENABLED="${PDF_SPLIT_ENABLED:-true}"
@@ -518,6 +519,7 @@ start_workers() {
         PDF_SPLIT_ENABLED="$PDF_SPLIT_ENABLED" \
         PDF_SPLIT_THRESHOLD_PAGES="$PDF_SPLIT_THRESHOLD_PAGES" \
         PDF_SPLIT_CHUNK_SIZE="$PDF_SPLIT_CHUNK_SIZE" \
+        MAX_CONCURRENT_TASKS="${MAX_CONCURRENT_TASKS:-3}" \
         nohup ${PYTHON_BIN} litserve_worker.py \
             --accelerator "$WORKER_ACCELERATOR" \
             --port "$port" \
@@ -578,38 +580,82 @@ status_workers() {
 }
 
 # ============================================================================
-# Worker Watchdog（子进程原生崩溃后自动补齐 worker 数量）
+# Watchdog（Worker 进程数补齐 + API 端口探活自动恢复）
 # ============================================================================
 
 start_watchdog() {
-    log_step "启动 Worker Watchdog"
+    log_step "启动 Watchdog (Worker + API)"
 
     local pid_file="${WORKER_LOG_DIR}/watchdog.pid"
     local log_file="${WORKER_LOG_DIR}/watchdog.log"
 
     if [ -f "$pid_file" ] && ps -p "$(cat "$pid_file")" > /dev/null 2>&1; then
-        log_info "Worker Watchdog 已在运行 (PID: $(cat "$pid_file"))"
+        log_info "Watchdog 已在运行 (PID: $(cat "$pid_file"))"
         return 0
     fi
 
-    # watchdog 就是一个后台子 shell：每 60s 数一遍存活 worker，少了就调本脚本 start worker 补齐
+    # 后台子 shell,每 60s 巡检:
+    #   1) Worker 进程数:不够就 start worker 补齐
+    #   2) API 端口探活:curl /docs 失败 → 清僵尸/卡死进程 → start api
+    #      (API 崩溃常是 C 扩展段错误 pypdf/magic_pdf/Pillow,Python 层无日志,只能靠外部探活兜底)
     nohup bash -c '
         TIANSHU_SCRIPT="'"${PROJECT_ROOT}"'/scripts/tianshu.sh"
         EXPECTED='"${WORKER_NUM_INSTANCES}"'
+        API_PORT='"${API_PORT}"'
+        API_PID_FILE="'"${API_LOG_DIR}"'/api.pid"
         INTERVAL=60
+        API_RESTART_COOLDOWN=300        # API 重启最小间隔(秒),防崩溃循环
+        API_LAST_RESTART=0
         while true; do
-            sleep '"${INTERVAL}"'
+            sleep "$INTERVAL"
+            NOW=$(date +%s)
+
+            # --- Worker 巡检 ---
             RUNNING=$(pgrep -f "litserve_worker.py.*--port" 2>/dev/null | wc -l)
             if [ "$RUNNING" -lt "$EXPECTED" ]; then
                 echo "[$(date "+%F %T")] watchdog: workers $RUNNING/$EXPECTED, restarting..." >> "'"${log_file}"'"
                 bash "$TIANSHU_SCRIPT" start worker >> "'"${log_file}"'" 2>&1
+            fi
+
+            # --- API 巡检 (端口探活,比单看 PID 可靠) ---
+            if ! curl -fsS --max-time 10 "http://localhost:${API_PORT}/docs" > /dev/null 2>&1; then
+                API_PID=""
+                [ -f "$API_PID_FILE" ] && API_PID=$(cat "$API_PID_FILE" 2>/dev/null)
+
+                if [ -n "$API_PID" ]; then
+                    if ps -p "$API_PID" > /dev/null 2>&1; then
+                        # 进程在表里:僵尸 vs 卡死
+                        if ps -p "$API_PID" -o state= 2>/dev/null | grep -q "^Z"; then
+                            echo "[$(date "+%F %T")] watchdog: API PID $API_PID is zombie, clearing stale pid file" >> "'"${log_file}"'"
+                        else
+                            echo "[$(date "+%F %T")] watchdog: API PID $API_PID alive but /docs unresponsive, killing" >> "'"${log_file}"'"
+                            kill -9 "$API_PID" 2>/dev/null || true
+                            sleep 2
+                        fi
+                    else
+                        echo "[$(date "+%F %T")] watchdog: API PID $API_PID gone (crashed, likely C-extension segfault)" >> "'"${log_file}"'"
+                    fi
+                    rm -f "$API_PID_FILE"
+                else
+                    echo "[$(date "+%F %T")] watchdog: API down (no pid file)" >> "'"${log_file}"'"
+                fi
+
+                # 冷却:避免反复崩溃-重启循环
+                ELAPSED=$((NOW - API_LAST_RESTART))
+                if [ "$ELAPSED" -lt "$API_RESTART_COOLDOWN" ]; then
+                    echo "[$(date "+%F %T")] watchdog: API restart cooldown (${ELAPSED}s/${API_RESTART_COOLDOWN}s), skip" >> "'"${log_file}"'"
+                else
+                    echo "[$(date "+%F %T")] watchdog: restarting API server..." >> "'"${log_file}"'"
+                    bash "$TIANSHU_SCRIPT" start api >> "'"${log_file}"'" 2>&1
+                    API_LAST_RESTART=$NOW
+                fi
             fi
         done
     ' > /dev/null 2>&1 &
 
     local pid=$!
     echo "$pid" > "$pid_file"
-    log_info "Worker Watchdog 已启动 (PID: $pid, 每 60s 检查一次)"
+    log_info "Watchdog 已启动 (PID: $pid, 每 60s 巡检 Worker 进程数 + API 端口探活)"
 }
 
 stop_watchdog() {
@@ -621,14 +667,14 @@ stop_watchdog() {
         pkill -P "$pid" 2>/dev/null || true
         rm -f "$pid_file"
     fi
-    log_info "Worker Watchdog 已停止"
+    log_info "Watchdog 已停止"
 }
 
 status_watchdog() {
-    echo -e "${CYAN}Worker Watchdog${NC}"
+    echo -e "${CYAN}Watchdog (Worker + API)${NC}"
     local pid_file="${WORKER_LOG_DIR}/watchdog.pid"
     if [ -f "$pid_file" ] && ps -p "$(cat "$pid_file")" > /dev/null 2>&1; then
-        echo "  ✅ 运行中 (PID: $(cat "$pid_file"))"
+        echo "  ✅ 运行中 (PID: $(cat "$pid_file")), 每 60s 巡检 Worker + API"
     else
         echo "  ❌ 未运行"
     fi
@@ -1136,7 +1182,7 @@ MinerU Tianshu - 统一启动脚本
   api            API Server (端口 ${API_PORT})
   mcp            MCP Server (端口 ${MCP_PORT})
   worker         Workers (端口 ${WORKER_BASE_PORT}-${WORKER_BASE_PORT}$((WORKER_NUM_INSTANCES-1)))
-  watchdog       Worker 看门狗 (worker 崩溃后自动补齐,每 60s 检查)
+  watchdog       看门狗 (Worker 崩溃补齐 + API 端口探活自动恢复,每 60s)
   scheduler      任务调度器 (孤儿恢复+队列监控,默认 10 分钟判定孤儿)
   frontend       前端界面 (端口 ${FRONTEND_PORT})
   all            所有服务
