@@ -73,6 +73,14 @@ LOG_DIR="${INSTANCE_DATA_DIR}/mineru_logs"
 # /tmp 是 per-pod 的,天然跨 POD 隔离;重启后丢失只导致一次性重新编译,无数据损失。
 TRITON_CACHE_ROOT="${TRITON_CACHE_ROOT:-/tmp/triton}"
 
+# vLLM AOT 编译缓存根目录(同样按实例 + NPU 隔离)。
+# 默认 vLLM 用 ~/.cache/vllm —— 但本集群 /data/persist_home/wangjiong 跨多 POD 共享,
+# 导致 8 NPU × N POD 的编译缓存全堆在同一 hash 目录里并发读写,触发:
+#   1) 跨 POD 加载彼此的缓存失败(CANN/load 环境细微差异) → 回退重新编译
+#   2) 并发编译写同一目录 → 损坏概率高
+# /tmp 是 per-POD 的,天然隔离;每个 NPU 一个子目录避免 8 实例并发写。
+VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-/tmp/vllm_cache}"
+
 # 只读资产(多实例共享,不隔离)
 MODELSCOPE_CACHE="${MODELSCOPE_CACHE:-/share/wangjiong/model_zoo/modelscope}"
 
@@ -183,6 +191,73 @@ release_instance_lock() {
 }
 
 # ============================================================================
+# CANN / Ascend 环境自动加载
+# ============================================================================
+# tianshu.sh 启动的所有服务(vllm/api/worker/mcp/scheduler)都依赖 CANN 算子库
+# (libopapi.so / libccec.so / libascendcl.so),这些 .so 的路径不在默认 linker
+# 搜索路径里,必须 source CANN 的 set_env.sh 让 LD_LIBRARY_PATH 包含
+# /usr/local/Ascend/ascend-toolkit/latest/lib64 及 plugin 子目录。
+#
+# 历史上依赖登录 shell(/etc/profile.d/cann.sh 或 ~/.bashrc)隐式加载,新机器若
+# 没配 profile 就会导致 vllm 启动时报:
+#   RuntimeError: aclnnXxx ... not in libopapi.so, or libopapi.so not found
+# 这里改为显式 source,不再依赖外部 profile 配置;nohup 启动的子进程会继承 export。
+
+ASCEND_SET_ENV="${ASCEND_SET_ENV:-/usr/local/Ascend/ascend-toolkit/set_env.sh}"
+# vllm-ascend 的 ATB(Ascend Transformer Boost)库 env;若存在则一并 source
+ASCEND_ATB_SET_ENV="${ASCEND_ATB_SET_ENV:-/usr/local/Ascend/nnal/atb/set_env.sh}"
+
+# vllm-ascend 的 custom transformer 算子包路径(包含 aclnnAddRmsNormBias 等融合算子)。
+# 这些算子不在 CANN 内置 libopapi.so 里,而是 vllm-ascend 自己编译的 libcust_opapi.so。
+# vllm_ascend.__init__ 默认只 export ASCEND_CUSTOM_OPP_PATH,不加 LD_LIBRARY_PATH;
+# 在 fusion pass 注册期间(torch.compiler.is_compiling()=True)兜底分支被禁用,
+# 导致首次编译时报 "aclnnAddRmsNormBias not in libopapi.so"。这里预先把算子库路径
+# 加到 LD_LIBRARY_PATH + ASCEND_CUSTOM_OPP_PATH,绕过兜底依赖。
+VLLM_ASCEND_HOME="${VLLM_ASCEND_HOME:-/vllm-workspace/vllm-ascend}"
+VLLM_ASCEND_VENDOR_DIR="${VLLM_ASCEND_HOME}/vllm_ascend/_cann_ops_custom/vendors/custom_transformer"
+
+source_ascend_env() {
+    # 跳过重复 source(避免 PATH / LD_LIBRARY_PATH 累积污染)
+    if [ -n "${TIANSHU_ASCEND_ENV_LOADED:-}" ]; then
+        return 0
+    fi
+
+    local found=0
+    if [ -f "$ASCEND_SET_ENV" ]; then
+        # shellcheck disable=SC1090
+        source "$ASCEND_SET_ENV" >/dev/null 2>&1 || true
+        found=1
+    fi
+    # ATB env(vllm-ascend 依赖)—— 若存在则加载
+    if [ -f "$ASCEND_ATB_SET_ENV" ]; then
+        # shellcheck disable=SC1090
+        source "$ASCEND_ATB_SET_ENV" >/dev/null 2>&1 || true
+    fi
+
+    # vllm-ascend custom 算子库 —— 让动态链接器在 fusion pass 注册阶段就能
+    # 找到 libcust_opapi.so(含 aclnnAddRmsNormBias 等融合算子实现)
+    if [ -d "${VLLM_ASCEND_VENDOR_DIR}/op_api/lib" ]; then
+        local vendor_lib_path="${VLLM_ASCEND_VENDOR_DIR}/op_api/lib"
+        case ":${LD_LIBRARY_PATH:-}:" in
+            *":${vendor_lib_path}:"*) ;;  # 已存在,跳过
+            *) export LD_LIBRARY_PATH="${vendor_lib_path}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" ;;
+        esac
+        case ":${ASCEND_CUSTOM_OPP_PATH:-}:" in
+            *":${VLLM_ASCEND_VENDOR_DIR}:"*) ;;  # 已存在,跳过
+            *) export ASCEND_CUSTOM_OPP_PATH="${VLLM_ASCEND_VENDOR_DIR}${ASCEND_CUSTOM_OPP_PATH:+:${ASCEND_CUSTOM_OPP_PATH}}" ;;
+        esac
+    fi
+
+    if [ "$found" -eq 1 ]; then
+        export TIANSHU_ASCEND_ENV_LOADED=1
+        log_info "CANN 环境已加载 ($ASCEND_SET_ENV)"
+    else
+        log_warn "CANN set_env.sh 未找到: $ASCEND_SET_ENV"
+        log_warn "若 vllm 启动报 'aclnnXxx not in libopapi.so',请检查 CANN 安装路径"
+    fi
+}
+
+# ============================================================================
 # VLLM 服务管理
 # ============================================================================
 
@@ -214,13 +289,31 @@ start_vllm() {
         mkdir -p "$triton_cache_dir"
         local vllm_tmp_dir="/tmp/vllm_tmp_npu${i}"
         mkdir -p "$vllm_tmp_dir"
+        # vLLM AOT 编译缓存:per-NPU 子目录,避免 8 实例并发写同一 hash 目录
+        local vllm_cache_dir="${VLLM_CACHE_ROOT}/npu${i}"
+        mkdir -p "$vllm_cache_dir"
 
         nohup bash -lc "
+            # 兜底:显式 source CANN 环境(防 bash -lc 新开登录 shell 时 profile 没配)
+            [ -f '${ASCEND_SET_ENV}' ] && source '${ASCEND_SET_ENV}' >/dev/null 2>&1 || true
+            [ -f '${ASCEND_ATB_SET_ENV}' ] && source '${ASCEND_ATB_SET_ENV}' >/dev/null 2>&1 || true
+            # 兜底:vllm-ascend custom 算子库(让 LD_LIBRARY_PATH 找到 libcust_opapi.so)
+            if [ -d '${VLLM_ASCEND_VENDOR_DIR}/op_api/lib' ]; then
+                case \":\\\$LD_LIBRARY_PATH:\" in
+                    *\":${VLLM_ASCEND_VENDOR_DIR}/op_api/lib:\"*) ;;
+                    *) export LD_LIBRARY_PATH='${VLLM_ASCEND_VENDOR_DIR}/op_api/lib':\\\$LD_LIBRARY_PATH ;;
+                esac
+                case \":\\\$ASCEND_CUSTOM_OPP_PATH:\" in
+                    *\":${VLLM_ASCEND_VENDOR_DIR}:\"*) ;;
+                    *) export ASCEND_CUSTOM_OPP_PATH='${VLLM_ASCEND_VENDOR_DIR}':\\\$ASCEND_CUSTOM_OPP_PATH ;;
+                esac
+            fi
             export ASCEND_VISIBLE_DEVICES='${i}'
             export ASCEND_RT_VISIBLE_DEVICES='${i}'
             export DEVICE_ID=0
             export ASCEND_DEVICE_ID=0
             export TRITON_CACHE_DIR='${triton_cache_dir}'
+            export VLLM_CACHE_ROOT='${vllm_cache_dir}'
             export TMPDIR='${vllm_tmp_dir}'
             exec ${VLLM_BIN} serve '${VLLM_MODEL_PATH}' \
                 --host 0.0.0.0 \
@@ -953,6 +1046,9 @@ cmd_start() {
     separator
 
     init_dirs
+
+    # 加载 CANN / Ascend 环境(LD_LIBRARY_PATH 等),供所有后续 nohup 子进程继承
+    source_ascend_env
 
     # 多实例冲突检测:确保本数据目录未被别的活跃实例占用
     check_instance_conflict || return 1
