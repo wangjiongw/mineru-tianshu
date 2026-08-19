@@ -310,3 +310,50 @@ def test_stop_after_fast_refresh_prevents_retry_submit(tmp_path, monkeypatch):
 
     assert rc == 130
     assert checkpoint["current_batch"]["batch_key"] == "oa-g001-b00001"
+
+
+
+def test_submit_bridges_task_db_and_redis_fields_to_manage_submit(tmp_path, monkeypatch):
+    args = make_args(tmp_path, apply=True, once=True)
+    seen = {}
+
+    def fake_submit_batch(conn, inventory, legacy, source_root, submit_args):
+        seen["conn"] = conn
+        seen["inventory"] = inventory
+        seen["legacy"] = legacy
+        seen["source_root"] = source_root
+        required = (
+            "batch_key",
+            "limit",
+            "priority",
+            "high_watermark",
+            "allow_live_claims",
+            "task_db",
+            "redis_host",
+            "redis_port",
+            "redis_db",
+            "redis_password",
+            "redis_queue_key",
+            "redis_processing_key",
+            "redis_maintenance_key",
+            "redis_pause_key",
+        )
+        seen["missing"] = [name for name in required if not hasattr(submit_args, name)]
+        seen["task_db"] = submit_args.task_db
+        seen["redis_queue_key"] = submit_args.redis_queue_key
+        return {"ok": True}
+
+    monkeypatch.setattr(runner.batches, "submit_batch", fake_submit_batch)
+    conn = object()
+
+    report = runner.submit(conn, args, "oa-g001-b00001")
+
+    assert report == {"ok": True}
+    assert seen["conn"] is conn
+    assert seen["inventory"] == args.inventory
+    assert seen["legacy"] == args.legacy_progress
+    assert seen["source_root"] == args.source_root
+    assert seen["missing"] == []
+    assert seen["task_db"] == args.task_db
+    assert seen["redis_queue_key"] == args.redis_queue_key
+    assert args._last_submit_at is not None

@@ -185,6 +185,7 @@ def submit(conn: sqlite3.Connection, args: argparse.Namespace, batch_key: str) -
         priority=args.priority,
         high_watermark=args.high_watermark,
         allow_live_claims=args.allow_live_claims,
+        task_db=args.task_db,
         redis_host=args.redis_host,
         redis_port=args.redis_port,
         redis_db=args.redis_db,
