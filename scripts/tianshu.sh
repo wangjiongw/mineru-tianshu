@@ -1107,11 +1107,17 @@ handle_supervised_worker_restart_request() {
         write_supervised_worker_restart_ack "$i" "$revision" "failed" "drain-not-complete" || true
         return 0
     fi
-    stop_worker_instance "$i" || { write_supervised_worker_restart_ack "$i" "$revision" "failed" "stop-failed" || true; return 0; }
-    start_worker_instance "$i" || { write_supervised_worker_restart_ack "$i" "$revision" "failed" "start-failed" || true; return 0; }
+    stop_worker_instance "$i" || { write_supervised_worker_restart_ack "$i" "$revision" "failed" "stop-failed" || true; return 75; }
+    start_worker_instance "$i" || { write_supervised_worker_restart_ack "$i" "$revision" "failed" "start-failed" || true; return 75; }
     worker_pid="$(cat "$(worker_pid_file "$i")" 2>/dev/null)"
+    if ! wait_worker_instance_ready "$i" "$WORKER_READY_TIMEOUT"; then
+        write_supervised_worker_restart_ack "$i" "$revision" "failed" "worker-not-ready" || true
+        log_warn "Compute #${i} supervisor restarted Worker PID ${worker_pid}, but it did not become ready within ${WORKER_READY_TIMEOUT}s"
+        return 75
+    fi
+    worker_health_failures=0
     write_supervised_worker_restart_ack "$i" "$revision" "ok" "worker-pid=${worker_pid}" || true
-    log_info "Compute #${i} supervisor restarted Worker PID ${worker_pid} without replacing VLLM PID ${vllm_pid}"
+    log_info "Compute #${i} supervisor restarted ready Worker PID ${worker_pid} without replacing VLLM PID ${vllm_pid}"
 }
 
 
@@ -2258,6 +2264,12 @@ supervise_compute_instance() {
         last_heartbeat="$(date +%s)"
         while true; do
             handle_supervised_worker_restart_request "$i"
+            local restart_request_rc=$?
+            if [ "$restart_request_rc" -ne 0 ]; then
+                failed_component="Worker"
+                failure_reason="supervised restart did not reach ready"
+                break
+            fi
             write_compute_supervisor_state "$i"
 
             if ! pid_matches "$vllm_pid" "$(vllm_expected_cmd)" "$((VLLM_BASE_PORT + i))"; then

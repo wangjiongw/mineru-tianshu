@@ -884,6 +884,7 @@ class TianshuProcessStatusTests(unittest.TestCase):
                 'drain_worker_instance() { echo drain; return 2; }; '
                 'stop_worker_instance() { echo stop_worker; }; '
                 'start_worker_instance() { echo start_worker; printf "222\n" > "$(worker_pid_file 3)"; }; '
+                'wait_worker_instance_ready() { echo wait_ready; return 0; }; '
                 'stop_vllm_instance() { echo stop_vllm; }; '
                 'start_vllm_instance() { echo start_vllm; }; '
                 'handle_supervised_worker_restart_request 3; printf "worker_pid=%s\n" "$worker_pid"',
@@ -895,10 +896,55 @@ class TianshuProcessStatusTests(unittest.TestCase):
         self.assertIn("drain", result.stdout)
         self.assertIn("stop_worker", result.stdout)
         self.assertIn("start_worker", result.stdout)
+        self.assertIn("wait_ready", result.stdout)
         self.assertIn("worker_pid=222", result.stdout)
         self.assertNotIn("stop_vllm", result.stdout)
         self.assertNotIn("start_vllm", result.stdout)
         self.assertEqual(ack[:2], ["rev1", "ok"])
+
+
+    def test_supervised_worker_restart_handler_fails_until_worker_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            runtime_dir = tmp_path / "runtime"
+            worker_dir = tmp_path / "worker"
+            worker_dir.mkdir()
+            runtime_dir.mkdir()
+            (runtime_dir / "worker_3.restart.request").write_text("rev2\n--force\n123\n")
+            result = run_bash(
+                f'WORKER_RUNTIME_DIR="{runtime_dir}" WORKER_LOG_DIR="{worker_dir}" WORKER_READY_TIMEOUT=9; '
+                'vllm_pid=777; worker_pid=111; worker_health_failures=2; '
+                'drain_worker_instance() { echo drain; return 0; }; '
+                'stop_worker_instance() { echo stop_worker; }; '
+                'start_worker_instance() { echo start_worker; printf "222\n" > "$(worker_pid_file 3)"; }; '
+                'wait_worker_instance_ready() { echo wait_ready:$2; return 1; }; '
+                'handle_supervised_worker_restart_request 3; rc=$?; printf "rc=%s worker_pid=%s failures=%s\n" "$rc" "$worker_pid" "$worker_health_failures"; exit "$rc"',
+                tmp_path,
+            )
+            ack = (runtime_dir / "worker_3.restart.ack").read_text().splitlines()
+
+        self.assertEqual(result.returncode, 75)
+        self.assertIn("wait_ready:9", result.stdout)
+        self.assertIn("rc=75 worker_pid=222 failures=2", result.stdout)
+        self.assertEqual(ack[:2], ["rev2", "failed"])
+        self.assertEqual(ack[3], "worker-not-ready")
+
+    def test_compute_supervisor_pair_recovers_when_supervised_restart_not_ready(self) -> None:
+        text = SCRIPT.read_text()
+        start = text.index("supervise_compute_instance()")
+        end = text.index("cmd_supervise()", start)
+        implementation = text[start:end]
+
+        self.assertIn('restart_request_rc=$?', implementation)
+        self.assertIn('failure_reason="supervised restart did not reach ready"', implementation)
+        self.assertLess(
+            implementation.index('handle_supervised_worker_restart_request "$i"'),
+            implementation.index('if ! pid_matches "$worker_pid"'),
+        )
+        self.assertLess(
+            implementation.index('failure_reason="supervised restart did not reach ready"'),
+            implementation.index('if ! pid_matches "$worker_pid"'),
+        )
 
     def test_reconciler_hook_is_valid_and_limited_to_control_supervise(self) -> None:
         text = SCRIPT.read_text()
