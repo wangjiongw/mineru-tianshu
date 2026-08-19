@@ -202,10 +202,12 @@ def test_merging_parent_stays_parked_across_recovery_cycles(tmp_path, monkeypatc
     first_dry = scheduler._recover_orphans_safely()
     second_dry = scheduler._recover_orphans_safely()
 
-    assert first_dry["planned_parent_merging"] == 1
+    assert first_dry["planned_parent_merging"] == 0
+    assert first_dry["planned_parent_already_merging"] == 1
     assert first_dry["planned_sqlite_reset"] == 0
     assert first_dry["planned_sqlite_failed"] == 0
-    assert second_dry["planned_parent_merging"] == 1
+    assert second_dry["planned_parent_merging"] == 0
+    assert second_dry["planned_parent_already_merging"] == 1
     assert second_dry["planned_sqlite_reset"] == 0
     assert second_dry["planned_sqlite_failed"] == 0
     assert task_status(db, parent_id) == "merging"
@@ -214,12 +216,14 @@ def test_merging_parent_stays_parked_across_recovery_cycles(tmp_path, monkeypatc
     first_apply = scheduler._recover_orphans_safely()
     second_apply = scheduler._recover_orphans_safely()
 
-    assert first_apply["planned_parent_merging"] == 1
-    assert first_apply["applied_parent_merging"] == 1
+    assert first_apply["planned_parent_merging"] == 0
+    assert first_apply["planned_parent_already_merging"] == 1
+    assert first_apply["applied_parent_merging"] == 0
     assert first_apply["applied_sqlite_reset"] == 0
     assert first_apply["applied_sqlite_failed"] == 0
-    assert second_apply["planned_parent_merging"] == 1
-    assert second_apply["applied_parent_merging"] == 1
+    assert second_apply["planned_parent_merging"] == 0
+    assert second_apply["planned_parent_already_merging"] == 1
+    assert second_apply["applied_parent_merging"] == 0
     assert second_apply["applied_sqlite_reset"] == 0
     assert second_apply["applied_sqlite_failed"] == 0
     assert task_status(db, parent_id) == "merging"
@@ -235,3 +239,123 @@ def test_processing_scan_does_not_hgetall_large_hash_without_scan_api(tmp_path, 
 
     assert stats["applied_sqlite_reset"] == 1
     assert stats["planned_ghosts_purged"] == 0
+
+
+def create_parent_with_children(db, name, *, status, child_statuses, minutes_old=70, merge_owner=None, merge_attempts=0):
+    parent_id = db.create_task(f"{name}.pdf", f"/tmp/{name}.pdf")["task_id"]
+    child_ids = [
+        db.create_task(f"{name}-{index}.pdf", f"/tmp/{name}-{index}.pdf")["task_id"]
+        for index, _child_status in enumerate(child_statuses)
+    ]
+    with db.get_cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE tasks
+            SET status = ?, worker_id = 'worker-a', is_parent = 1,
+                child_count = ?, child_completed = ?,
+                merge_owner = ?, merge_claimed_at = CASE WHEN ? IS NULL THEN NULL ELSE datetime('now', '-' || ? || ' minutes') END,
+                merge_attempts = ?, started_at = datetime('now', '-' || ? || ' minutes')
+            WHERE task_id = ?
+            """,
+            (
+                status,
+                len(child_statuses),
+                sum(1 for child_status in child_statuses if child_status == "completed"),
+                merge_owner,
+                merge_owner,
+                minutes_old,
+                merge_attempts,
+                minutes_old,
+                parent_id,
+            ),
+        )
+        for child_id, child_status in zip(child_ids, child_statuses):
+            cursor.execute(
+                """
+                UPDATE tasks
+                SET parent_task_id = ?, status = ?, completed_at = CASE WHEN ? = 'completed' THEN datetime('now') ELSE NULL END
+                WHERE task_id = ?
+                """,
+                (parent_id, child_status, child_status, child_id),
+            )
+    return parent_id
+
+
+def test_processing_parent_transitions_to_merging_once(tmp_path, monkeypatch):
+    scheduler, db = make_scheduler(tmp_path, monkeypatch, apply=True, redis=None)
+    parent_id = create_parent_with_children(
+        db, "ready-processing-parent", status="processing", child_statuses=["completed", "completed"]
+    )
+
+    first = scheduler._recover_orphans_safely()
+    second = scheduler._recover_orphans_safely()
+
+    assert first["planned_parent_merging"] == 1
+    assert first["planned_parent_already_merging"] == 0
+    assert first["applied_parent_merging"] == 1
+    assert task_status(db, parent_id) == "merging"
+    assert second["planned_parent_merging"] == 0
+    assert second["planned_parent_already_merging"] == 1
+    assert second["applied_parent_merging"] == 0
+
+
+def test_parent_merge_backlog_stats_are_read_only_and_classified(tmp_path, monkeypatch):
+    scheduler, db = make_scheduler(tmp_path, monkeypatch, apply=True, redis=None, batch_size=50)
+    create_parent_with_children(db, "ready", status="processing", child_statuses=["completed", "completed"])
+    create_parent_with_children(db, "recoverable", status="merging", child_statuses=["completed"], merge_owner=None)
+    create_parent_with_children(
+        db, "leased", status="merging", child_statuses=["completed"], merge_owner="worker-a", minutes_old=5
+    )
+    create_parent_with_children(
+        db, "stale-leased", status="merging", child_statuses=["completed"], merge_owner="worker-b", minutes_old=70
+    )
+    create_parent_with_children(
+        db, "blocked", status="merging", child_statuses=["completed"], merge_owner=None, merge_attempts=3
+    )
+
+    before = db.get_queue_stats()
+    stats = scheduler._get_parent_merge_backlog_stats(stale_seconds=30 * 60, max_attempts=3)
+    after = db.get_queue_stats()
+
+    assert before == after
+    assert stats["total"] == 5
+    assert stats["ready"] == 1
+    assert stats["recoverable"] == 2
+    assert stats["active_leased"] == 1
+    assert stats["stale_leased"] == 1
+    assert stats["blocked"] == 1
+    assert stats["oldest_merging_age_seconds"] >= 60 * 60
+
+
+def test_parent_merge_backlog_total_is_not_batch_limited(tmp_path, monkeypatch):
+    scheduler, db = make_scheduler(tmp_path, monkeypatch, apply=True, redis=None, batch_size=2)
+    for index in range(5):
+        create_parent_with_children(db, f"ready-{index}", status="processing", child_statuses=["completed"])
+
+    stats = scheduler._get_parent_merge_backlog_stats(stale_seconds=30 * 60, max_attempts=3)
+
+    assert stats["total"] == 5
+    assert stats["ready"] == 5
+
+
+def test_parent_merge_age_uses_fresh_claim_before_old_started_at(tmp_path, monkeypatch):
+    scheduler, db = make_scheduler(tmp_path, monkeypatch, apply=True, redis=None, batch_size=50)
+    create_parent_with_children(
+        db, "fresh-lease-old-parent", status="merging", child_statuses=["completed"],
+        merge_owner="worker-a", minutes_old=5
+    )
+    with db.get_cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE tasks
+            SET started_at = datetime('now', '-70 minutes'),
+                created_at = datetime('now', '-80 minutes')
+            WHERE file_name = 'fresh-lease-old-parent.pdf'
+            """
+        )
+
+    stats = scheduler._get_parent_merge_backlog_stats(stale_seconds=30 * 60, max_attempts=3)
+
+    assert stats["active_leased"] == 1
+    assert stats["stale_leased"] == 0
+    assert 0 <= stats["oldest_merging_age_seconds"] < 10 * 60

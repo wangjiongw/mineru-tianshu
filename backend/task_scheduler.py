@@ -25,6 +25,7 @@ import signal
 import sys
 import os
 import time
+import sqlite3
 from pathlib import Path
 from loguru import logger
 
@@ -199,6 +200,136 @@ class TaskScheduler:
             for item in client.hgetall(processing_key).items():
                 yield item
 
+    @staticmethod
+    def _task_columns(cursor):
+        cursor.execute("PRAGMA table_info(tasks)")
+        return {row["name"] for row in cursor.fetchall()}
+
+    @staticmethod
+    def _sqlite_time_age_seconds(timestamp_expr):
+        return f"MAX(0, CAST((julianday('now') - julianday({timestamp_expr})) * 86400 AS INTEGER))"
+
+    def _get_parent_merge_backlog_stats(self, stale_seconds=None, max_attempts=3):
+        """Read a bounded parent-merge backlog snapshot without claiming or merging work."""
+        stale_seconds = int(stale_seconds if stale_seconds is not None else self.stale_task_timeout * 60)
+        max_attempts = int(max_attempts or 3)
+        with self.db.get_cursor() as cursor:
+            try:
+                columns = self._task_columns(cursor)
+            except sqlite3.OperationalError:
+                return {}
+
+            required = {"task_id", "status", "is_parent", "child_count", "created_at"}
+            if not required.issubset(columns):
+                return {}
+
+            merge_owner = "p.merge_owner" if "merge_owner" in columns else "NULL"
+            merge_claimed_at = "p.merge_claimed_at" if "merge_claimed_at" in columns else "NULL"
+            merge_attempts = "COALESCE(p.merge_attempts, 0)" if "merge_attempts" in columns else "0"
+            child_completed = "p.child_completed" if "child_completed" in columns else "0"
+            child_failed = (
+                "SUM(CASE WHEN c.status = 'failed' THEN 1 ELSE 0 END)"
+                if "parent_task_id" in columns
+                else "0"
+            )
+            real_child_completed = (
+                "SUM(CASE WHEN c.status = 'completed' THEN 1 ELSE 0 END)"
+                if "parent_task_id" in columns
+                else child_completed
+            )
+            join_clause = "LEFT JOIN tasks c ON c.parent_task_id = p.task_id" if "parent_task_id" in columns else ""
+            if "merge_claimed_at" in columns and "started_at" in columns:
+                age_source = "COALESCE(p.merge_claimed_at, p.started_at, p.created_at)"
+            elif "started_at" in columns:
+                age_source = "COALESCE(p.started_at, p.created_at)"
+            else:
+                age_source = "p.created_at"
+            age_expr = self._sqlite_time_age_seconds(age_source)
+
+            cursor.execute(
+                f"""
+                WITH parent_merge_backlog AS (
+                    SELECT
+                        p.task_id,
+                        p.status,
+                        p.child_count,
+                        {merge_owner} AS merge_owner,
+                        {merge_claimed_at} AS merge_claimed_at,
+                        {merge_attempts} AS merge_attempts,
+                        {child_failed} AS child_failed,
+                        {real_child_completed} AS real_child_completed,
+                        CASE
+                            WHEN p.status = 'merging' THEN {age_expr}
+                            ELSE NULL
+                        END AS merging_age_seconds
+                    FROM tasks p
+                    {join_clause}
+                    WHERE p.is_parent = 1
+                      AND p.child_count > 0
+                      AND p.status IN ('pending', 'processing', 'merging')
+                    GROUP BY p.task_id
+                )
+                SELECT
+                    COUNT(*) AS total,
+                    SUM(CASE
+                        WHEN status IN ('pending', 'processing')
+                         AND real_child_completed >= child_count
+                        THEN 1 ELSE 0 END) AS ready,
+                    SUM(CASE
+                        WHEN status = 'merging'
+                         AND real_child_completed >= child_count
+                         AND child_failed = 0
+                         AND merge_attempts < ?
+                         AND (
+                            merge_owner IS NULL
+                            OR merge_claimed_at IS NULL
+                            OR merge_claimed_at <= datetime('now', '-' || ? || ' seconds')
+                         )
+                        THEN 1 ELSE 0 END) AS recoverable,
+                    SUM(CASE
+                        WHEN status = 'merging'
+                         AND real_child_completed >= child_count
+                         AND child_failed = 0
+                         AND merge_attempts < ?
+                         AND merge_owner IS NOT NULL
+                         AND merge_claimed_at IS NOT NULL
+                         AND merge_claimed_at > datetime('now', '-' || ? || ' seconds')
+                        THEN 1 ELSE 0 END) AS active_leased,
+                    SUM(CASE
+                        WHEN status = 'merging'
+                         AND real_child_completed >= child_count
+                         AND child_failed = 0
+                         AND merge_attempts < ?
+                         AND merge_owner IS NOT NULL
+                         AND merge_claimed_at IS NOT NULL
+                         AND merge_claimed_at <= datetime('now', '-' || ? || ' seconds')
+                        THEN 1 ELSE 0 END) AS stale_leased,
+                    SUM(CASE
+                        WHEN status = 'merging'
+                         AND (
+                            real_child_completed < child_count
+                            OR child_failed > 0
+                            OR merge_attempts >= ?
+                         )
+                        THEN 1 ELSE 0 END) AS blocked,
+                    MAX(merging_age_seconds) AS oldest_merging_age_seconds
+                FROM parent_merge_backlog
+                """,
+                (max_attempts, stale_seconds, max_attempts, stale_seconds, max_attempts, stale_seconds, max_attempts),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return {}
+            return {
+                "total": int(row["total"] or 0),
+                "ready": int(row["ready"] or 0),
+                "recoverable": int(row["recoverable"] or 0),
+                "active_leased": int(row["active_leased"] or 0),
+                "stale_leased": int(row["stale_leased"] or 0),
+                "blocked": int(row["blocked"] or 0),
+                "oldest_merging_age_seconds": int(row["oldest_merging_age_seconds"] or 0),
+            }
+
     def _recover_orphans_safely(self):
         """Plan or apply bounded orphan recovery without destructive defaults."""
         stats = {
@@ -209,6 +340,7 @@ class TaskScheduler:
             "planned_sqlite_reset": 0,
             "planned_sqlite_failed": 0,
             "planned_parent_merging": 0,
+            "planned_parent_already_merging": 0,
             "planned_redis_requeued": 0,
             "planned_ghosts_purged": 0,
             "applied_sqlite_reset": 0,
@@ -231,6 +363,7 @@ class TaskScheduler:
         stale_task_ids = set()
         fail_task_ids = set()
         parent_merging_ids = set()
+        parent_already_merging_ids = set()
         fresh_protected_ids = set()
         parent_waiting_ids = set()
         now = time.time()
@@ -274,7 +407,10 @@ class TaskScheduler:
                     and (row["status"] == "merging" or row["child_completed"] >= row["child_count"])
                 )
                 if is_parent_ready:
-                    parent_merging_ids.add(task_id)
+                    if row["status"] == "merging":
+                        parent_already_merging_ids.add(task_id)
+                    else:
+                        parent_merging_ids.add(task_id)
                 elif row["retry_count"] >= 3:
                     fail_task_ids.add(task_id)
                 else:
@@ -283,13 +419,19 @@ class TaskScheduler:
             stats["planned_sqlite_reset"] = len(stale_task_ids)
             stats["planned_sqlite_failed"] = len(fail_task_ids)
             stats["planned_parent_merging"] = len(parent_merging_ids)
+            stats["planned_parent_already_merging"] = len(parent_already_merging_ids)
             stats["planned_redis_requeued"] = len(stale_task_ids)
 
             if self.orphan_recovery_apply:
                 if parent_merging_ids:
                     placeholders = ",".join("?" * len(parent_merging_ids))
                     cursor.execute(
-                        f"UPDATE tasks SET status = 'merging' WHERE task_id IN ({placeholders})",
+                        f"""
+                        UPDATE tasks
+                        SET status = 'merging'
+                        WHERE task_id IN ({placeholders})
+                          AND status = 'processing'
+                        """,
                         tuple(parent_merging_ids),
                     )
                     stats["applied_parent_merging"] = cursor.rowcount
@@ -340,6 +482,7 @@ class TaskScheduler:
                     task_id in stale_task_ids
                     or task_id in fail_task_ids
                     or task_id in parent_merging_ids
+                    or task_id in parent_already_merging_ids
                     or task_id in fresh_protected_ids
                     or task_id in parent_waiting_ids
                 ):
@@ -463,10 +606,12 @@ class TaskScheduler:
                         stale_task_counter = 0
                         try:
                             stats = self._recover_orphans_safely()
+                            merge_stats = self._get_parent_merge_backlog_stats()
                             planned = (
                                 stats["planned_sqlite_reset"]
                                 + stats["planned_sqlite_failed"]
                                 + stats["planned_parent_merging"]
+                                + stats["planned_parent_already_merging"]
                                 + stats["planned_ghosts_purged"]
                             )
                             applied = (
@@ -481,6 +626,7 @@ class TaskScheduler:
                                 or applied
                                 or stats["fresh_heartbeat_protected"]
                                 or stats["parent_waiting_protected"]
+                                or merge_stats.get("total", 0)
                             ):
                                 logger.warning(
                                     f"⚠️  Orphan recovery {'dry-run' if stats['dry_run'] else 'apply'} "
@@ -488,13 +634,21 @@ class TaskScheduler:
                                     f"planned_reset={stats['planned_sqlite_reset']} "
                                     f"planned_failed={stats['planned_sqlite_failed']} "
                                     f"planned_parent_merging={stats['planned_parent_merging']} "
+                                    f"planned_parent_already_merging={stats['planned_parent_already_merging']} "
                                     f"planned_ghosts={stats['planned_ghosts_purged']} "
                                     f"applied_reset={stats['applied_sqlite_reset']} "
                                     f"applied_failed={stats['applied_sqlite_failed']} "
                                     f"applied_requeued={stats['applied_redis_requeued']} "
                                     f"applied_ghosts={stats['applied_ghosts_purged']} "
                                     f"fresh_heartbeat_protected={stats['fresh_heartbeat_protected']} "
-                                    f"parent_waiting_protected={stats['parent_waiting_protected']}"
+                                    f"parent_waiting_protected={stats['parent_waiting_protected']} "
+                                    f"parent_merge_total={merge_stats.get('total', 0)} "
+                                    f"parent_merge_ready={merge_stats.get('ready', 0)} "
+                                    f"parent_merge_recoverable={merge_stats.get('recoverable', 0)} "
+                                    f"parent_merge_active_leased={merge_stats.get('active_leased', 0)} "
+                                    f"parent_merge_stale_leased={merge_stats.get('stale_leased', 0)} "
+                                    f"parent_merge_blocked={merge_stats.get('blocked', 0)} "
+                                    f"parent_merge_oldest_age_s={merge_stats.get('oldest_merging_age_seconds', 0)}"
                                 )
                         except Exception as e:
                             logger.error(f"Failed to recover orphan tasks: {e}")
