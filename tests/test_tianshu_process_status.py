@@ -191,6 +191,78 @@ class TianshuProcessStatusTests(unittest.TestCase):
         self.assertIn("pgrep -f '[l]itserve_worker.py'", implementation)
         self.assertNotIn("ps -eo pid=", implementation)
 
+
+    def test_wait_vllm_instance_ready_fails_fast_when_pid_exits_even_if_http_would_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            vllm_dir = tmp_path / "vllm"
+            calls = tmp_path / "curl-calls"
+            vllm_dir.mkdir()
+            (vllm_dir / "vllm_npu2.pid").write_text("701")
+            result = run_bash(
+                f'VLLM_LOG_DIR="{vllm_dir}" VLLM_BASE_PORT=30025 VLLM_NUM_INSTANCES=8; '
+                f'curl() {{ printf "%s\n" "$*" >> "{calls}"; return 0; }}; '
+                'sleep() { :; }; '
+                'wait_vllm_instance_ready 2 900',
+                tmp_path,
+            )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertFalse(calls.exists())
+
+    def test_stop_vllm_process_tree_stops_captured_descendants_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            vllm_dir = tmp_path / "vllm"
+            vllm_dir.mkdir()
+            fake_proc(tmp_path, 701, "S", ["/usr/bin/vllm", "serve", "/share/wangjiong/model_zoo/modelscope/models/OpenDataLab/MinerU2___5-Pro-2605-1___2B", "--port", "30027"])
+            fake_proc(tmp_path, 702, "S", ["python", "-c", "VLLM::EngineCore"])
+            fake_proc(tmp_path, 703, "S", ["python", "-c", "resource_tracker"])
+            fake_proc(tmp_path, 704, "S", ["python", "unrelated.py"])
+            pid_file = vllm_dir / "vllm_npu2.pid"
+            pid_file.write_text("701")
+
+            result = run_bash(
+                'ps() { '
+                'if [ "$1" = "-eo" ] && [ "$2" = "pid=,ppid=" ]; then '
+                'printf "701 1\n702 701\n703 702\n704 1\n"; fi; }; '
+                'kill() { echo "kill:$*"; '
+                'case "$1" in 701|702|703) rm -rf "$TIANSHU_PROC_ROOT/$1";; '
+                '-9) rm -rf "$TIANSHU_PROC_ROOT/$2";; esac; }; '
+                f'stop_vllm_process_tree "{pid_file}" 30027',
+                tmp_path,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("kill:701", result.stdout)
+        self.assertIn("kill:702", result.stdout)
+        self.assertIn("kill:703", result.stdout)
+        self.assertNotIn("kill:704", result.stdout)
+        self.assertFalse(pid_file.exists())
+
+    def test_stop_vllm_process_tree_reports_captured_descendant_survivor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            vllm_dir = tmp_path / "vllm"
+            vllm_dir.mkdir()
+            fake_proc(tmp_path, 711, "S", ["/usr/bin/vllm", "serve", "/share/wangjiong/model_zoo/modelscope/models/OpenDataLab/MinerU2___5-Pro-2605-1___2B", "--port", "30027"])
+            fake_proc(tmp_path, 712, "S", ["python", "-c", "VLLM::EngineCore"])
+            pid_file = vllm_dir / "vllm_npu2.pid"
+            pid_file.write_text("711")
+
+            result = run_bash(
+                'ps() { '
+                'if [ "$1" = "-eo" ] && [ "$2" = "pid=,ppid=" ]; then '
+                'printf "711 1\n712 711\n"; fi; }; '
+                'kill() { echo "kill:$*"; case "$1" in 711) rm -rf "$TIANSHU_PROC_ROOT/711";; esac; }; '
+                f'stop_vllm_process_tree "{pid_file}" 30027',
+                tmp_path,
+            )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("kill:712", result.stdout)
+        self.assertFalse(pid_file.exists())
+
     def test_worker_vllm_api_list_defaults_to_local_endpoint(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

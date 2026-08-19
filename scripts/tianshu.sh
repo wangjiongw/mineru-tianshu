@@ -534,6 +534,7 @@ wait_vllm_instance_ready() {
     local elapsed=0
 
     while [ "$elapsed" -lt "$timeout" ]; do
+        vllm_is_running "$index" || return 1
         if vllm_http_ready "$index"; then
             return 0
         fi
@@ -628,6 +629,73 @@ start_vllm_instance() {
     return 1
 }
 
+stop_vllm_process_tree() {
+    local pid_file="$1"
+    local port="$2"
+    local timeout="${3:-5}"
+    local parent_pid=""
+    local descendant_pids=""
+    local descendant_identities=""
+    local identity start_time pid survivors
+
+    if [ -f "$pid_file" ]; then
+        parent_pid="$(cat "$pid_file" 2>/dev/null)"
+    fi
+
+    if pid_matches "$parent_pid" "$(vllm_expected_cmd)" "$port"; then
+        descendant_pids="$(worker_descendant_pids "$parent_pid")"
+        for pid in $descendant_pids; do
+            start_time="$(pid_start_time "$pid")"
+            [ -n "$start_time" ] || continue
+            descendant_identities="$descendant_identities $pid:$start_time"
+        done
+        kill "$parent_pid" 2>/dev/null || true
+
+        for _ in $(seq 1 "$timeout"); do
+            pid_matches "$parent_pid" "$(vllm_expected_cmd)" "$port" || break
+            sleep 1
+        done
+        if pid_matches "$parent_pid" "$(vllm_expected_cmd)" "$port"; then
+            kill -9 "$parent_pid" 2>/dev/null || true
+        fi
+
+        for identity in $descendant_identities; do
+            pid="${identity%%:*}"
+            start_time="${identity#*:}"
+            pid_identity_matches "$pid" "$start_time" && kill "$pid" 2>/dev/null || true
+        done
+        for _ in $(seq 1 "$timeout"); do
+            survivors=""
+            for identity in $descendant_identities; do
+                pid="${identity%%:*}"
+                start_time="${identity#*:}"
+                pid_identity_matches "$pid" "$start_time" && survivors="$survivors $pid"
+            done
+            [ -z "$survivors" ] && break
+            sleep 1
+        done
+        for identity in $descendant_identities; do
+            pid="${identity%%:*}"
+            start_time="${identity#*:}"
+            pid_identity_matches "$pid" "$start_time" && kill -9 "$pid" 2>/dev/null || true
+        done
+        survivors=""
+        for identity in $descendant_identities; do
+            pid="${identity%%:*}"
+            start_time="${identity#*:}"
+            pid_identity_matches "$pid" "$start_time" && survivors="$survivors $pid"
+        done
+        if [ -n "$survivors" ]; then
+            log_error "VLLM Port ${port} 停止后仍存在已捕获子孙进程: ${survivors}"
+            rm -f "$pid_file"
+            return 1
+        fi
+    fi
+
+    rm -f "$pid_file"
+    return 0
+}
+
 stop_vllm_instance() {
     local i="$1"
     vllm_index_valid "$i" || { log_error "无效 VLLM 编号: $i"; return 1; }
@@ -635,7 +703,10 @@ stop_vllm_instance() {
     local pid_file
     pid_file="$(vllm_pid_file "$i")"
     mkdir -p "$VLLM_LOG_DIR"
-    terminate_pid_file "$pid_file" "$(vllm_expected_cmd)" "$port"
+    if ! stop_vllm_process_tree "$pid_file" "$port"; then
+        log_error "VLLM #${i} (Port ${port}) 停止失败；仍有已捕获子孙进程存活"
+        return 1
+    fi
     log_info "VLLM #${i} (Port ${port}) 已停止"
 }
 
