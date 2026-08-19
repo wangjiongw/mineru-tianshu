@@ -459,41 +459,49 @@ class TaskDB:
 
             status = existing.get("status")
             requeued = False
+            retry_info = None
             if status in ("failed", "timeout"):
-                if self.retry_task(existing["task_id"]):
-                    status = "pending"
-                    requeued = True
-                    self._enqueue_to_redis(
-                        existing["task_id"],
-                        existing.get("priority", 0),
-                        {
-                            "file_name": existing.get("file_name"),
-                            "backend": existing.get("backend"),
-                        },
-                    )
+                retry_info = self.retry_failed_logical_task(existing["task_id"])
+                status = retry_info["status"]
+                requeued = bool(retry_info["requeued_task_ids"])
 
-            return {
+            result = {
                 "task_id": existing["task_id"],
                 "status": status,
                 "deduped": True,
                 "requeued": requeued,
             }
+            if retry_info is not None:
+                result["retry_info"] = retry_info
+            return result
 
         # 入队到 Redis（如果可用）
-        self._enqueue_to_redis(
-            task_id,
-            priority,
-            {
-                "file_name": file_name,
-                "backend": backend,
-            },
-        )
+        enqueue_payload = {
+            "file_name": file_name,
+            "backend": backend,
+        }
+        enqueued = self._enqueue_to_redis(task_id, priority, enqueue_payload)
+        enqueue_failed = REDIS_QUEUE_AVAILABLE and not enqueued and not _sqlite_queue_fallback_enabled()
+        if enqueue_failed:
+            with self.get_cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'failed',
+                        error_message = ?,
+                        completed_at = CURRENT_TIMESTAMP
+                    WHERE task_id = ? AND status = 'pending'
+                    """,
+                    ("Initial enqueue failed: Redis queue did not accept task", task_id),
+                )
 
         return {
             "task_id": task_id,
-            "status": "pending",
+            "status": "failed" if enqueue_failed else "pending",
             "deduped": False,
             "requeued": False,
+            "enqueue_failed": enqueue_failed,
+            "enqueue_failed_task_ids": [task_id] if enqueue_failed else [],
         }
 
     def _enqueue_to_redis(self, task_id: str, priority: int, task_data: dict = None) -> bool:
@@ -1541,23 +1549,197 @@ class TaskDB:
 
     def retry_task(self, task_id: str) -> bool:
         """
-        重试任务：将任务状态重置为 pending，清空错误和时间，重试次数 +1
+        重试任务：兼容旧 bool 契约，同时避免拆分父任务被错误入队。
         """
+        result = self.retry_failed_logical_task(task_id)
+        if result["mode"] == "missing" or result.get("enqueue_failed_task_ids"):
+            return False
+        return bool(result.get("requeued_task_ids")) or result["mode"] in {
+            "split_ready_to_merge",
+            "split_awaiting_children",
+        }
+
+    def _mark_retry_enqueue_failed(self, failed_task_ids: List[str], parent_task_id: str = None) -> None:
+        if not failed_task_ids:
+            return
+        placeholders = ",".join("?" for _ in failed_task_ids)
+        message = "Retry enqueue failed: Redis queue did not accept task"
         with self.get_cursor() as cursor:
+            cursor.execute("BEGIN IMMEDIATE")
             cursor.execute(
-                """
-                UPDATE tasks 
-                SET status = 'pending', 
-                    error_message = NULL, 
-                    started_at = NULL, 
-                    completed_at = NULL, 
-                    worker_id = NULL,
-                    retry_count = retry_count + 1
-                WHERE task_id = ?
+                f"""
+                UPDATE tasks
+                SET status = 'failed',
+                    error_message = ?,
+                    completed_at = CURRENT_TIMESTAMP,
+                    worker_id = NULL
+                WHERE task_id IN ({placeholders})
+                  AND status = 'pending'
                 """,
-                (task_id,)
+                [message, *failed_task_ids],
             )
-            return cursor.rowcount > 0
+            if parent_task_id:
+                completed_children = self._count_completed_children(cursor, parent_task_id)
+                cursor.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'failed',
+                        error_message = ?,
+                        completed_at = CURRENT_TIMESTAMP,
+                        worker_id = NULL,
+                        child_completed = ?,
+                        merge_owner = NULL,
+                        merge_claimed_at = NULL,
+                        merge_error = NULL
+                    WHERE task_id = ?
+                    """,
+                    (f"Retry enqueue failed for {len(failed_task_ids)} child task(s)", completed_children, parent_task_id),
+                )
+
+    def retry_failed_logical_task(self, task_id: str) -> Dict:
+        """Retry a failed logical task without enqueueing an existing split parent.
+
+        Split parents are orchestration rows: when one child failed, retrying the
+        parent itself would be claimed by workers and then skipped because the
+        child rows already exist. Instead, only failed/timeout children are made
+        pending again and enqueued after the transaction commits.
+        """
+        requeued_tasks = []
+        parent_task_id = None
+        with self.get_cursor() as cursor:
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,))
+            task = cursor.fetchone()
+            if not task:
+                return {
+                    "task_id": task_id,
+                    "mode": "missing",
+                    "status": None,
+                    "requeued_task_ids": [],
+                    "requeued_child_count": 0,
+                    "enqueue_failed_task_ids": [],
+                }
+
+            is_split_parent = bool(task["is_parent"] and task["child_count"] > 0)
+            if not is_split_parent:
+                cursor.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'pending',
+                        error_message = NULL,
+                        started_at = NULL,
+                        completed_at = NULL,
+                        worker_id = NULL,
+                        retry_count = retry_count + CASE
+                            WHEN error_message LIKE 'Retry enqueue failed:%' THEN 0
+                            ELSE 1
+                        END
+                    WHERE task_id = ?
+                      AND status IN ('failed', 'timeout')
+                    """,
+                    (task_id,),
+                )
+                if cursor.rowcount > 0:
+                    requeued_tasks.append(
+                        {
+                            "task_id": task_id,
+                            "priority": task["priority"],
+                            "file_name": task["file_name"],
+                            "backend": task["backend"],
+                            "parent_task_id": task["parent_task_id"],
+                        }
+                    )
+                    status = "pending"
+                else:
+                    status = task["status"]
+                mode = "leaf"
+            else:
+                parent_task_id = task_id
+                completed_children = self._count_completed_children(cursor, task_id)
+                cursor.execute(
+                    """
+                    SELECT task_id, priority, file_name, backend, parent_task_id
+                    FROM tasks
+                    WHERE parent_task_id = ?
+                      AND status IN ('failed', 'timeout')
+                    ORDER BY created_at, task_id
+                    """,
+                    (task_id,),
+                )
+                failed_children = [dict(row) for row in cursor.fetchall()]
+                failed_child_ids = [child["task_id"] for child in failed_children]
+
+                if failed_child_ids:
+                    placeholders = ",".join("?" for _ in failed_child_ids)
+                    cursor.execute(
+                        f"""
+                        UPDATE tasks
+                        SET status = 'pending',
+                            error_message = NULL,
+                            started_at = NULL,
+                            completed_at = NULL,
+                            worker_id = NULL,
+                            result_path = NULL,
+                            retry_count = retry_count + CASE
+                                WHEN error_message LIKE 'Retry enqueue failed:%' THEN 0
+                                ELSE 1
+                            END
+                        WHERE task_id IN ({placeholders})
+                          AND status IN ('failed', 'timeout')
+                        """,
+                        failed_child_ids,
+                    )
+                    requeued_tasks.extend(failed_children)
+                    mode = "split_children_requeued"
+                elif completed_children >= int(task["child_count"] or 0):
+                    mode = "split_ready_to_merge"
+                else:
+                    mode = "split_awaiting_children"
+
+                cursor.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'processing',
+                        child_completed = ?,
+                        error_message = NULL,
+                        completed_at = NULL,
+                        merge_owner = NULL,
+                        merge_claimed_at = NULL,
+                        merge_error = NULL,
+                        worker_id = NULL
+                    WHERE task_id = ?
+                    """,
+                    (completed_children, task_id),
+                )
+                status = "processing"
+
+        enqueue_failed_task_ids = []
+        successful_requeued_tasks = []
+        for item in requeued_tasks:
+            payload = {
+                "file_name": item.get("file_name"),
+                "backend": item.get("backend"),
+            }
+            if item.get("parent_task_id"):
+                payload["parent_task_id"] = item.get("parent_task_id")
+            enqueued = self._enqueue_to_redis(item["task_id"], item.get("priority", 0), payload)
+            if REDIS_QUEUE_AVAILABLE and not enqueued:
+                enqueue_failed_task_ids.append(item["task_id"])
+            else:
+                successful_requeued_tasks.append(item)
+
+        if enqueue_failed_task_ids:
+            self._mark_retry_enqueue_failed(enqueue_failed_task_ids, parent_task_id=parent_task_id)
+            status = "failed"
+
+        return {
+            "task_id": task_id,
+            "mode": mode,
+            "status": status,
+            "requeued_task_ids": [item["task_id"] for item in successful_requeued_tasks],
+            "requeued_child_count": sum(1 for item in successful_requeued_tasks if item.get("parent_task_id") == task_id),
+            "enqueue_failed_task_ids": enqueue_failed_task_ids,
+        }
 
     def pause_task(self, task_id: str) -> bool:
         """

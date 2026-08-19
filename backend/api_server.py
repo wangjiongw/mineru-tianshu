@@ -358,6 +358,20 @@ def submit_task(
             method=method,
         )
 
+        enqueue_failed_task_ids = task_result.get("enqueue_failed_task_ids") or task_result.get("retry_info", {}).get("enqueue_failed_task_ids") or []
+        if enqueue_failed_task_ids:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "message": "Task submit state was recorded but Redis enqueue failed",
+                    "task_id": task_result.get("task_id"),
+                    "status": task_result.get("status"),
+                    "deduped": task_result.get("deduped", False),
+                    "enqueue_failed_task_ids": enqueue_failed_task_ids,
+                    "retry_info": task_result.get("retry_info"),
+                },
+            )
+
         logger.info(f"✅ Task submitted: {task_result['task_id']} - {file.filename}")
         message = "Task submitted successfully"
         if task_result.get("deduped"):
@@ -376,6 +390,8 @@ def submit_task(
             "created_at": datetime.now().isoformat(),
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"❌ Failed to submit task: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -640,17 +656,42 @@ def retry_task(task_id: str, current_user: User = Depends(get_current_active_use
          if task.get("user_id") != current_user.user_id:
             raise HTTPException(status_code=403, detail="Permission denied")
 
-    if db.retry_task(task_id):
-        output_dir = OUTPUT_DIR / task_id
-        if output_dir.exists():
-            try:
-                shutil.rmtree(output_dir)
-            except Exception as e:
-                logger.warning(f"Warning: Failed to clean up output directory for retried task {task_id}: {e}")
-        
-        return {"success": True, "message": "Task submitted for retry"}
-    
-    raise HTTPException(status_code=404, detail="Task not found")
+    retry_info = db.retry_failed_logical_task(task_id)
+    if retry_info["mode"] == "missing":
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    if retry_info.get("enqueue_failed_task_ids"):
+        return JSONResponse(
+            status_code=503,
+            content={
+                "success": False,
+                "message": "Retry state restored but Redis enqueue failed",
+                "retry_info": retry_info,
+            },
+        )
+
+    retried = bool(retry_info.get("requeued_task_ids")) or retry_info.get("mode") in {
+        "split_ready_to_merge",
+        "split_awaiting_children",
+    }
+    if not retried:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "success": False,
+                "message": "Task is not retryable in its current state",
+                "retry_info": retry_info,
+            },
+        )
+
+    output_dir = OUTPUT_DIR / task_id
+    if retry_info.get("requeued_task_ids") and output_dir.exists():
+        try:
+            shutil.rmtree(output_dir)
+        except Exception as e:
+            logger.warning(f"Warning: Failed to clean up output directory for retried task {task_id}: {e}")
+
+    return {"success": True, "message": "Task submitted for retry", "retry_info": retry_info}
 
 
 @router.post("/tasks/{task_id}/pause", tags=["任务管理"])

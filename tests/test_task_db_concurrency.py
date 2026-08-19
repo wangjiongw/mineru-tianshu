@@ -298,3 +298,67 @@ def test_redis_claim_requeues_when_pending_update_is_ignored_by_legacy_trigger(t
     assert redis_queue.failed == [(claimed_id, "worker-a", True)]
     assert db.get_task(claimed_id)["status"] == "pending"
     assert db.get_task(other_id)["status"] == "pending"
+
+
+def test_create_task_redis_only_enqueue_failure_marks_failed_and_dedup_recovers(tmp_path, monkeypatch):
+    class FlakyRedis:
+        def __init__(self):
+            self.calls = []
+
+        def enqueue(self, task_id, priority=0, task_data=None):
+            self.calls.append(task_id)
+            return len(self.calls) > 1
+
+    redis_queue = FlakyRedis()
+    monkeypatch.setattr(task_db_module, "REDIS_QUEUE_AVAILABLE", True)
+    monkeypatch.setattr(task_db_module, "get_redis_queue", lambda: redis_queue)
+    monkeypatch.setenv("SQLITE_QUEUE_FALLBACK", "false")
+    db = TaskDB(tmp_path / "tasks.db")
+
+    first = db.create_task("redis-only.pdf", "/tmp/redis-only.pdf", file_hash="redis-only", lang="en", method="auto")
+    assert first["status"] == "failed"
+    assert first["enqueue_failed"] is True
+    assert first["enqueue_failed_task_ids"] == [first["task_id"]]
+    task = db.get_task(first["task_id"])
+    assert task["status"] == "failed"
+    assert "Initial enqueue failed" in task["error_message"]
+
+    second = db.create_task("redis-only.pdf", "/tmp/redis-only.pdf", file_hash="redis-only", lang="en", method="auto")
+    assert second["task_id"] == first["task_id"]
+    assert second["deduped"] is True
+    assert second["status"] == "pending"
+    assert second["requeued"] is True
+    assert second["retry_info"]["enqueue_failed_task_ids"] == []
+    assert db.get_task(first["task_id"])["retry_count"] == 1
+    assert redis_queue.calls == [first["task_id"], first["task_id"]]
+
+
+def test_create_task_enqueue_failure_uses_sqlite_fallback_when_enabled(tmp_path, monkeypatch):
+    class FailingRedis:
+        def enqueue(self, task_id, priority=0, task_data=None):
+            return False
+
+    monkeypatch.setattr(task_db_module, "REDIS_QUEUE_AVAILABLE", True)
+    monkeypatch.setattr(task_db_module, "get_redis_queue", lambda: FailingRedis())
+    monkeypatch.setenv("SQLITE_QUEUE_FALLBACK", "true")
+    db = TaskDB(tmp_path / "tasks.db")
+
+    result = db.create_task("fallback.pdf", "/tmp/fallback.pdf")
+
+    assert result["status"] == "pending"
+    assert result["enqueue_failed"] is False
+    assert result["enqueue_failed_task_ids"] == []
+    assert db.get_task(result["task_id"])["status"] == "pending"
+
+
+def test_create_task_no_redis_module_keeps_sqlite_fallback_semantics(tmp_path, monkeypatch):
+    monkeypatch.setattr(task_db_module, "REDIS_QUEUE_AVAILABLE", False)
+    monkeypatch.setenv("SQLITE_QUEUE_FALLBACK", "false")
+    db = TaskDB(tmp_path / "tasks.db")
+
+    result = db.create_task("sqlite-only.pdf", "/tmp/sqlite-only.pdf")
+
+    assert result["status"] == "pending"
+    assert result["enqueue_failed"] is False
+    assert result["enqueue_failed_task_ids"] == []
+    assert db.get_task(result["task_id"])["status"] == "pending"
