@@ -222,7 +222,14 @@ class EvaluateLocalEfficiencyTests(unittest.TestCase):
             ]
         )
 
-        with mock.patch.object(evaluator, "sqlite_counts", side_effect=lambda *_args: next(task_snapshots)), \
+        with mock.patch.object(evaluator, "sqlite_task_cohort_floor", return_value={
+            "status": "known",
+            "reason": None,
+            "rowid_floor": 99,
+            "scope": "rowid_gt_floor",
+            "semantics": "duration task counts and typed metrics include only tasks inserted after evaluator start; start the evaluator before submitting the batch for accurate run throughput",
+        }), \
+            mock.patch.object(evaluator, "sqlite_counts", side_effect=lambda *_args, **_kwargs: next(task_snapshots)), \
             mock.patch.object(evaluator, "read_cpu_times", side_effect=lambda: next(cpu_snapshots)), \
             mock.patch.object(evaluator, "collect_worker_health", side_effect=lambda host, ports: [{"port": port, "status": "healthy"} for port in ports]), \
             mock.patch.object(
@@ -268,6 +275,9 @@ class EvaluateLocalEfficiencyTests(unittest.TestCase):
             result = evaluator.run_evaluation(args)
 
         self.assertEqual(result["schema_version"], 2)
+        self.assertEqual(result["task_cohort"]["rowid_floor"], 99)
+        self.assertEqual(result["task_cohort"]["scope"], "rowid_gt_floor")
+        self.assertIn("start the evaluator before submitting the batch", result["task_cohort"]["semantics"])
         self.assertEqual(result["throughput"]["successful_per_minute"], 480.0)
         self.assertEqual(result["throughput"]["logical_pdf_per_minute"], 480.0)
         self.assertEqual(result["throughput"]["pages_per_minute"], 2400.0)
@@ -582,10 +592,106 @@ class EvaluateLocalEfficiencyTests(unittest.TestCase):
         self.assertEqual(baseline["throughput"]["windows"], [{"successful_per_minute": 42.5}])
         self.assertEqual(baseline["source_duration_seconds"], 60.0)
 
+    def test_successful_per_minute_uses_logical_rate_when_raw_completed_delta_differs(self):
+        start = {
+            "status": "known",
+            "counts": {"completed": 100},
+            "metrics": {
+                "status": "known",
+                "logical_pdf_completed": 10,
+                "completed_pages": 100,
+                "processing_seconds": 0.0,
+                "worker_groups": {},
+            },
+        }
+        end = {
+            "status": "known",
+            "counts": {"completed": 120},
+            "metrics": {
+                "status": "known",
+                "logical_pdf_completed": 12,
+                "completed_pages": 120,
+                "processing_seconds": 0.0,
+                "worker_groups": {},
+            },
+        }
+        snapshots = [
+            {"elapsed_seconds": 0.0, "snapshot": start},
+            {"elapsed_seconds": 60.0, "snapshot": end},
+        ]
+
+        throughput = evaluator.compute_throughput(start, end, 60.0, snapshots)
+
+        self.assertEqual(throughput["raw_successful_per_minute"], 20.0)
+        self.assertEqual(throughput["logical_pdf_per_minute"], 2.0)
+        self.assertEqual(throughput["successful_per_minute"], 2.0)
+        self.assertEqual(throughput["windows"][0]["raw_successful_per_minute"], 20.0)
+        self.assertEqual(throughput["windows"][0]["logical_pdf_per_minute"], 2.0)
+        self.assertEqual(throughput["windows"][0]["successful_per_minute"], 2.0)
+
+    def test_throughput_keeps_logical_unknown_when_task_metrics_unknown(self):
+        start = {
+            "status": "known",
+            "counts": {"completed": 10},
+            "metrics": evaluator.empty_task_metrics("unknown", "task metrics skipped for sample mode"),
+        }
+        end = {
+            "status": "known",
+            "counts": {"completed": 25},
+            "metrics": evaluator.empty_task_metrics("unknown", "task metrics skipped for sample mode"),
+        }
+        snapshots = [
+            {"elapsed_seconds": 0.0, "snapshot": start},
+            {"elapsed_seconds": 60.0, "snapshot": end},
+        ]
+
+        throughput = evaluator.compute_throughput(start, end, 60.0, snapshots)
+
+        self.assertIsNone(throughput["successful_per_minute"])
+        self.assertEqual(throughput["raw_successful_per_minute"], 15.0)
+        self.assertIsNone(throughput["logical_pdf_per_minute"])
+        self.assertIsNone(throughput["pages_per_minute"])
+        self.assertIsNone(throughput["windows"][0]["logical_pdf_per_minute"])
+        self.assertIsNone(throughput["windows"][0]["pages_per_minute"])
+        self.assertEqual(throughput["windows"][0]["metrics_status"], "unknown")
+
+    def test_baseline_from_result_does_not_record_raw_status_throughput_as_logical(self):
+        result = {
+            "ended_at": "2026-08-18T00:00:00Z",
+            "duration_seconds": 60.0,
+            "throughput": {
+                "successful_per_minute": None,
+                "raw_successful_per_minute": 15.0,
+                "logical_pdf_per_minute": None,
+                "pages_per_minute": None,
+                "method": "aggregate_short_run",
+                "windows": [],
+            },
+            "efficiency": {"fleet_energy_wh_per_completed_page": None, "fleet_energy_wh_per_logical_pdf": None},
+        }
+
+        baseline = evaluator.baseline_from_result(result)
+
+        self.assertEqual(baseline["status"], "unknown")
+        self.assertIn("baseline metrics unknown", baseline["reason"])
+
     def test_throughput_uses_median_of_six_5_minute_windows_and_ignores_outlier(self):
         counts = [0, 50, 100, 150, 200, 250, 1250]
         snapshots = [
-            {"elapsed_seconds": index * 300.0, "snapshot": {"status": "known", "counts": {"completed": count}}}
+            {
+                "elapsed_seconds": index * 300.0,
+                "snapshot": {
+                    "status": "known",
+                    "counts": {"completed": count},
+                    "metrics": {
+                        "status": "known",
+                        "logical_pdf_completed": count,
+                        "completed_pages": count * 10,
+                        "processing_seconds": 0.0,
+                        "worker_groups": {},
+                    },
+                },
+            }
             for index, count in enumerate(counts)
         ]
         start = snapshots[0]["snapshot"]
@@ -598,8 +704,16 @@ class EvaluateLocalEfficiencyTests(unittest.TestCase):
         self.assertEqual([window["successful_per_minute"] for window in throughput["windows"]], [10.0, 10.0, 10.0, 10.0, 10.0, 200.0])
 
     def test_throughput_short_run_retains_aggregate_with_explicit_method(self):
-        start = {"status": "known", "counts": {"completed": 10}}
-        end = {"status": "known", "counts": {"completed": 40}}
+        start = {
+            "status": "known",
+            "counts": {"completed": 10},
+            "metrics": {"status": "known", "logical_pdf_completed": 10, "completed_pages": 100, "processing_seconds": 0.0, "worker_groups": {}},
+        }
+        end = {
+            "status": "known",
+            "counts": {"completed": 40},
+            "metrics": {"status": "known", "logical_pdf_completed": 40, "completed_pages": 400, "processing_seconds": 0.0, "worker_groups": {}},
+        }
         snapshots = [
             {"elapsed_seconds": 0.0, "snapshot": start},
             {"elapsed_seconds": 60.0, "snapshot": end},
@@ -709,6 +823,53 @@ class EvaluateLocalEfficiencyTests(unittest.TestCase):
         self.assertNotIn("SELECT * FROM tasks", source)
         self.assertNotIn("SELECT task_id, options, data", source)
         self.assertNotIn("SELECT options, data", source)
+
+    def test_sqlite_counts_can_skip_completed_leaf_metrics_for_sample_mode(self):
+        tmp_path = Path(self.create_temp_dir())
+        db_path = tmp_path / "tasks.db"
+        real_connect = sqlite3.connect
+        captured_sql = []
+
+        class SpyConnection(sqlite3.Connection):
+            def execute(self, sql, parameters=(), /):
+                captured_sql.append(" ".join(str(sql).split()))
+                return super().execute(sql, parameters)
+
+        conn = real_connect(db_path)
+        conn.execute(
+            """
+            CREATE TABLE tasks (
+                task_id TEXT PRIMARY KEY,
+                status TEXT,
+                parent_task_id TEXT,
+                options TEXT,
+                data TEXT,
+                started_at TEXT,
+                completed_at TEXT,
+                worker_id TEXT
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("task-1", "completed", None, "{}", json.dumps({"markdown": "x" * (1024 * 1024)}), None, None, None),
+        )
+        conn.commit()
+        conn.close()
+
+        def connect_spy(*args, **kwargs):
+            kwargs["factory"] = SpyConnection
+            return real_connect(*args, **kwargs)
+
+        with mock.patch.object(evaluator.sqlite3, "connect", side_effect=connect_spy):
+            result = evaluator.sqlite_counts(db_path, collect_task_metrics=False)
+
+        self.assertEqual(result["status"], "known")
+        self.assertEqual(result["counts"]["completed"], 1)
+        self.assertEqual(result["metrics"]["status"], "unknown")
+        self.assertIn("sample mode", result["metrics"]["reason"])
+        self.assertFalse(any("FROM tasks AS task" in sql for sql in captured_sql))
+        self.assertFalse(any(" data" in sql.lower() for sql in captured_sql))
 
     def test_sqlite_counts_streams_completed_leaf_rows_without_fetchall_or_data(self):
         tmp_path = Path(self.create_temp_dir())
@@ -830,6 +991,87 @@ class EvaluateLocalEfficiencyTests(unittest.TestCase):
         self.assertEqual(result["metrics"]["worker_groups"]["0"]["pages_completed"], 10.0)
         self.assertEqual(result["metrics"]["worker_groups"]["1"]["pages_completed"], 15.0)
         self.assertEqual(result["metrics"]["worker_groups"]["1"]["processing_seconds"], 9.0)
+
+    def test_sqlite_counts_cohort_floor_ignores_old_rows_and_keeps_backlog_global(self):
+        tmp_path = Path(self.create_temp_dir())
+        db_path = tmp_path / "tasks.db"
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            """
+            CREATE TABLE tasks (
+                task_id TEXT PRIMARY KEY,
+                status TEXT,
+                parent_task_id TEXT,
+                options TEXT,
+                data TEXT,
+                page_count INTEGER,
+                processing_seconds REAL,
+                worker_group_index INTEGER,
+                started_at TEXT,
+                completed_at TEXT,
+                worker_id TEXT,
+                merge_claimed_at TEXT,
+                merge_owner TEXT,
+                merge_attempts INTEGER
+            )
+            """
+        )
+        old_rows = [
+            ("old-root", "completed", None, "{}", "{}", 999, 99.0, 7, "2026-08-19 00:00:00", "2026-08-19 00:01:39", "worker_group_7", None, None, 0),
+            ("old-merging", "merging", None, "{}", "{}", None, None, None, "2026-08-19 00:00:00", None, None, None, None, 0),
+        ]
+        conn.executemany("INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", old_rows)
+        conn.commit()
+        conn.close()
+
+        cohort = evaluator.sqlite_task_cohort_floor(db_path)
+        self.assertEqual(cohort["status"], "known")
+        start = evaluator.sqlite_counts(
+            db_path,
+            now=evaluator.parse_timestamp("2026-08-19 00:11:00"),
+            cohort_floor=cohort["rowid_floor"],
+        )
+
+        conn = sqlite3.connect(db_path)
+        new_rows = [
+            ("new-parent", "completed", None, "{}", "{}", 100, 20.0, 9, "2026-08-19 00:10:00", "2026-08-19 00:10:20", "worker_group_9", None, None, 0),
+            ("new-child-1", "completed", "new-parent", "{}", "{}", 10, 4.0, 0, "2026-08-19 00:10:00", "2026-08-19 00:10:04", "worker_group_0", None, None, 0),
+            ("new-child-2", "completed", "new-parent", json.dumps({"chunk_info": {"page_count": 15}}), "{}", None, 6.0, 1, "2026-08-19 00:10:00", "2026-08-19 00:10:06", "worker_group_1", None, None, 0),
+        ]
+        conn.executemany("INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", new_rows)
+        conn.commit()
+        conn.close()
+
+        end = evaluator.sqlite_counts(
+            db_path,
+            now=evaluator.parse_timestamp("2026-08-19 00:11:00"),
+            cohort_floor=cohort["rowid_floor"],
+        )
+        delta = evaluator.task_delta(start, end)
+        throughput = evaluator.compute_throughput(
+            start,
+            end,
+            60.0,
+            [{"elapsed_seconds": 0.0, "snapshot": start}, {"elapsed_seconds": 60.0, "snapshot": end}],
+        )
+
+        self.assertEqual(start["counts"], {})
+        self.assertEqual(start["metrics"]["logical_pdf_completed"], 0)
+        self.assertEqual(end["counts"]["completed"], 3)
+        self.assertNotIn("merging", end["counts"])
+        self.assertEqual(end["metrics"]["logical_pdf_completed"], 1)
+        self.assertEqual(end["metrics"]["leaf_completed"], 2)
+        self.assertEqual(end["metrics"]["completed_pages"], 25.0)
+        self.assertEqual(end["metrics"]["worker_groups"]["0"]["pages_completed"], 10.0)
+        self.assertEqual(end["metrics"]["worker_groups"]["1"]["pages_completed"], 15.0)
+        self.assertEqual(end["parent_merge_backlog"]["total_merging_parents"], 1)
+        self.assertEqual(delta["completed_delta"], 3)
+        self.assertEqual(delta["logical_pdf_completed_delta"], 1)
+        self.assertEqual(delta["completed_pages_delta"], 25.0)
+        self.assertEqual(throughput["raw_successful_per_minute"], 3.0)
+        self.assertEqual(throughput["logical_pdf_per_minute"], 1.0)
+        self.assertEqual(throughput["successful_per_minute"], 1.0)
+        self.assertEqual(throughput["pages_per_minute"], 25.0)
 
     def test_sqlite_counts_does_not_scan_completion_data_metrics_page_count(self):
         tmp_path = Path(self.create_temp_dir())
@@ -963,6 +1205,74 @@ class EvaluateLocalEfficiencyTests(unittest.TestCase):
         result["efficiency"]["fleet_energy_wh_per_completed_page"] = 1.81
         outcome = evaluator.evaluate(result)
         self.assertFalse(outcome["checks"]["energy_per_completed_page_lte_90_percent_baseline"]["passed"])
+
+    def test_run_evaluation_sample_skips_task_metrics_collection(self):
+        tmp_path = Path(self.create_temp_dir())
+        log_path = tmp_path / "service.log"
+        log_path.write_text("", encoding="utf-8")
+        task_snapshots = iter(
+            [
+                {"status": "known", "reason": None, "counts": {"completed": 100}, "metrics": evaluator.empty_task_metrics("unknown", "task metrics skipped for sample mode"), "parent_merge_backlog": {"status": "known", "recoverable_stale_merging_parents": 0}},
+                {"status": "known", "reason": None, "counts": {"completed": 100}, "metrics": evaluator.empty_task_metrics("unknown", "task metrics skipped for sample mode"), "parent_merge_backlog": {"status": "known", "recoverable_stale_merging_parents": 0}},
+            ]
+        )
+        sqlite_mock = mock.Mock(side_effect=lambda *_args, **_kwargs: next(task_snapshots))
+        cpu_snapshots = iter(
+            [
+                {"user": 0, "nice": 0, "system": 0, "idle": 100, "iowait": 0},
+                {"user": 0, "nice": 0, "system": 0, "idle": 200, "iowait": 0},
+            ]
+        )
+
+        with mock.patch.object(evaluator, "sqlite_counts", sqlite_mock), \
+            mock.patch.object(evaluator, "read_cpu_times", side_effect=lambda: next(cpu_snapshots)), \
+            mock.patch.object(evaluator, "collect_worker_health", side_effect=lambda host, ports: [{"port": port, "status": "healthy"} for port in ports]), \
+            mock.patch.object(
+                evaluator,
+                "collect_vllm",
+                side_effect=lambda host, ports: [
+                    {
+                        "port": port,
+                        "status": "healthy",
+                        "metrics_status": "known",
+                        "metrics_summary": {"kv_cache_usage_percent": 50.0, "num_preemptions_total": 0.0},
+                    }
+                    for port in ports
+                ],
+            ), \
+            mock.patch.object(
+                evaluator,
+                "collect_npu_smi",
+                side_effect=lambda: {
+                    "status": "known",
+                    "reason": None,
+                    "cards": [{"card_id": float(card_id), "hbm_percent": 70.0, "util_percent": 20.0, "power_w": 100.0} for card_id in range(8)],
+                },
+            ), \
+            mock.patch.object(evaluator, "time", FakeTime):
+            args = argparse.Namespace(
+                duration=60.0,
+                interval=5.0,
+                baseline=None,
+                record_baseline=None,
+                sample=True,
+                host="localhost",
+                database=tmp_path / "tasks.db",
+                log_path=[log_path],
+                worker_ports=list(range(8101, 8109)),
+                vllm_ports=list(range(30025, 30033)),
+                stale_parent_threshold_seconds=600.0,
+            )
+
+            result = evaluator.run_evaluation(args)
+
+        self.assertEqual(result["mode"], "sample")
+        self.assertEqual(result["task_cohort"]["rowid_floor"], None)
+        self.assertEqual(result["task_cohort"]["scope"], "global_status_only_sample")
+        self.assertEqual(sqlite_mock.call_count, 2)
+        for call in sqlite_mock.call_args_list:
+            self.assertIs(call.kwargs["collect_task_metrics"], False)
+        self.assertEqual(result["tasks"]["start"]["metrics"]["status"], "unknown")
 
     def create_temp_dir(self):
         import tempfile

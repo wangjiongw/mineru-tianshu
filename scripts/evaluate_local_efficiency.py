@@ -759,6 +759,8 @@ def sqlite_counts(
     db_path: Path,
     stale_parent_threshold_seconds: float = DEFAULT_STALE_PARENT_MERGE_THRESHOLD_SECONDS,
     now: datetime | None = None,
+    collect_task_metrics: bool = True,
+    cohort_floor: int | None = None,
 ) -> dict[str, Any]:
     if not db_path.exists():
         result = {"status": "unknown", "reason": f"database not found: {db_path}", "counts": {}}
@@ -781,17 +783,30 @@ def sqlite_counts(
                     "parent_merge_backlog": empty_parent_merge_backlog("unknown", reason, stale_parent_threshold_seconds),
                 }
 
-            count_rows = conn.execute("SELECT status, COUNT(*) AS count FROM tasks GROUP BY status").fetchall()
+            cohort_where = "WHERE rowid > ?" if cohort_floor is not None else ""
+            cohort_params = (cohort_floor,) if cohort_floor is not None else ()
+
+            count_rows = conn.execute(
+                f"SELECT status, COUNT(*) AS count FROM tasks {cohort_where} GROUP BY status",
+                cohort_params,
+            ).fetchall()
             counts = {row["status"]: int(row["count"]) for row in count_rows}
 
             metric_required = {"task_id", "parent_task_id"}
-            if metric_required.issubset(columns):
+            if not collect_task_metrics:
+                metrics = empty_task_metrics("unknown", "task metrics skipped for sample mode")
+                metrics["page_count_coverage"] = None
+                metrics["page_count_source"] = None
+            elif metric_required.issubset(columns):
                 logical_pdf_completed = int(
                     conn.execute(
-                        """
+                        f"""
                         SELECT COUNT(*) AS count FROM tasks
-                        WHERE status = 'completed' AND (parent_task_id IS NULL OR parent_task_id = '')
-                        """
+                        WHERE status = 'completed'
+                          AND (parent_task_id IS NULL OR parent_task_id = '')
+                          {"AND rowid > ?" if cohort_floor is not None else ""}
+                        """,
+                        cohort_params,
                     ).fetchone()["count"]
                 )
                 leaf_columns = []
@@ -813,10 +828,12 @@ def sqlite_counts(
                     SELECT {selected_leaf_columns}
                     FROM tasks AS task
                     WHERE status = 'completed'
+                      {"AND task.rowid > ?" if cohort_floor is not None else ""}
                       AND NOT EXISTS (
                           SELECT 1 FROM tasks AS child WHERE child.parent_task_id = task.task_id
                       )
-                    """
+                    """,
+                    cohort_params,
                 )
                 metrics = compute_task_metrics_from_leaf_rows(logical_pdf_completed, leaf_rows, columns)
             else:
@@ -865,6 +882,54 @@ def sqlite_counts(
         "counts": counts,
         "metrics": metrics,
         "parent_merge_backlog": parent_merge_backlog,
+        "cohort_floor": cohort_floor,
+    }
+
+
+def sqlite_task_cohort_floor(db_path: Path) -> dict[str, Any]:
+    semantics = (
+        "duration task counts and typed metrics include only tasks inserted after evaluator start; "
+        "start the evaluator before submitting the batch for accurate run throughput"
+    )
+    if not db_path.exists():
+        return {
+            "status": "unknown",
+            "reason": f"database not found: {db_path}",
+            "rowid_floor": None,
+            "scope": "unknown",
+            "semantics": semantics,
+        }
+    try:
+        uri = f"file:{db_path}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=2.0)
+        try:
+            rowid_floor = conn.execute("SELECT MAX(rowid) AS max_rowid FROM tasks").fetchone()[0]
+        finally:
+            conn.close()
+    except Exception as exc:
+        return {
+            "status": "unknown",
+            "reason": str(exc),
+            "rowid_floor": None,
+            "scope": "unknown",
+            "semantics": semantics,
+        }
+    return {
+        "status": "known",
+        "reason": None,
+        "rowid_floor": 0 if rowid_floor is None else int(rowid_floor),
+        "scope": "rowid_gt_floor",
+        "semantics": semantics,
+    }
+
+
+def sample_task_cohort() -> dict[str, Any]:
+    return {
+        "status": "known",
+        "reason": None,
+        "rowid_floor": None,
+        "scope": "global_status_only_sample",
+        "semantics": "sample mode reports global task status counts and skips typed completed-task metrics",
     }
 
 
@@ -1180,13 +1245,19 @@ def build_throughput_windows(snapshots: list[dict[str, Any]]) -> list[dict[str, 
                     "logical_pdf_completed_delta": None,
                     "completed_pages_delta": None,
                     "successful_per_minute": None,
+                    "raw_successful_per_minute": None,
                     "logical_pdf_per_minute": None,
                     "pages_per_minute": None,
                 }
             )
             continue
-        logical_delta = delta.get("logical_pdf_completed_delta", delta.get("completed_delta"))
-        page_delta = delta.get("completed_pages_delta")
+        raw_completed_delta = delta.get("completed_delta")
+        raw_rate = None if raw_completed_delta is None else round(raw_completed_delta / duration * 60.0, 6)
+        metrics_known = delta.get("metrics", {}).get("status") == "known"
+        logical_delta = delta.get("logical_pdf_completed_delta") if metrics_known else None
+        page_delta = delta.get("completed_pages_delta") if metrics_known else None
+        logical_rate = None if logical_delta is None else round(logical_delta / duration * 60.0, 6)
+        page_rate = None if page_delta is None else round(page_delta / duration * 60.0, 6)
         windows.append(
             {
                 "index": index,
@@ -1194,12 +1265,14 @@ def build_throughput_windows(snapshots: list[dict[str, Any]]) -> list[dict[str, 
                 "start_elapsed_seconds": round(start["elapsed_seconds"], 3),
                 "end_elapsed_seconds": round(end["elapsed_seconds"], 3),
                 "duration_seconds": round(duration, 3),
-                "completed_delta": delta.get("completed_delta"),
+                "completed_delta": raw_completed_delta,
                 "logical_pdf_completed_delta": logical_delta,
                 "completed_pages_delta": page_delta,
-                "successful_per_minute": round(logical_delta / duration * 60.0, 6),
-                "logical_pdf_per_minute": round(logical_delta / duration * 60.0, 6),
-                "pages_per_minute": None if page_delta is None else round(page_delta / duration * 60.0, 6),
+                "successful_per_minute": logical_rate,
+                "raw_successful_per_minute": raw_rate,
+                "logical_pdf_per_minute": logical_rate,
+                "pages_per_minute": page_rate,
+                "metrics_status": "known" if metrics_known else "unknown",
             }
         )
     return windows
@@ -1212,13 +1285,14 @@ def compute_throughput(
     window_snapshots: list[dict[str, Any]],
 ) -> dict[str, Any]:
     windows = build_throughput_windows(window_snapshots)
-    known_logical_rates = [window["logical_pdf_per_minute"] for window in windows if window["status"] == "known"]
+    known_logical_rates = [window["logical_pdf_per_minute"] for window in windows if window["status"] == "known" and window["logical_pdf_per_minute"] is not None]
     known_page_rates = [window["pages_per_minute"] for window in windows if window["status"] == "known" and window["pages_per_minute"] is not None]
     if elapsed_seconds >= 1800 and len(known_logical_rates) >= 6:
         logical_value = median(known_logical_rates[:6])
         page_value = median(known_page_rates[:6]) if len(known_page_rates) >= 6 else None
         return {
             "successful_per_minute": None if logical_value is None else round(logical_value, 6),
+            "raw_successful_per_minute": None,
             "logical_pdf_per_minute": None if logical_value is None else round(logical_value, 6),
             "pages_per_minute": None if page_value is None else round(page_value, 6),
             "method": "median_6x5m_windows",
@@ -1229,15 +1303,20 @@ def compute_throughput(
 
     delta = task_delta(task_start, task_end)
     if delta["status"] != "known":
+        raw_completed_delta = None
         logical_delta = None
         page_delta = None
     else:
-        logical_delta = delta.get("logical_pdf_completed_delta", delta.get("completed_delta"))
-        page_delta = delta.get("completed_pages_delta")
+        raw_completed_delta = delta.get("completed_delta")
+        metrics_known = delta.get("metrics", {}).get("status") == "known"
+        logical_delta = delta.get("logical_pdf_completed_delta") if metrics_known else None
+        page_delta = delta.get("completed_pages_delta") if metrics_known else None
+    raw_value = None if raw_completed_delta is None else raw_completed_delta / elapsed_seconds * 60.0
     logical_value = None if logical_delta is None else logical_delta / elapsed_seconds * 60.0
     page_value = None if page_delta is None else page_delta / elapsed_seconds * 60.0
     return {
         "successful_per_minute": None if logical_value is None else round(logical_value, 6),
+        "raw_successful_per_minute": None if raw_value is None else round(raw_value, 6),
         "logical_pdf_per_minute": None if logical_value is None else round(logical_value, 6),
         "pages_per_minute": None if page_value is None else round(page_value, 6),
         "method": "aggregate_short_run",
@@ -1383,7 +1462,7 @@ def load_baseline(path: Path | None) -> dict[str, Any]:
 
 
 def baseline_from_result(result: dict[str, Any]) -> dict[str, Any]:
-    logical = result["throughput"].get("logical_pdf_per_minute", result["throughput"].get("successful_per_minute"))
+    logical = result["throughput"].get("logical_pdf_per_minute")
     pages = result["throughput"].get("pages_per_minute")
     efficiency = result.get("efficiency", {})
     energy_per_page = efficiency.get("fleet_energy_wh_per_completed_page")
@@ -1442,13 +1521,13 @@ def evaluate(result: dict[str, Any]) -> dict[str, Any]:
 
     baseline = result["baseline"]
     throughput = result["throughput"]
-    logical_rate = throughput.get("logical_pdf_per_minute", throughput.get("successful_per_minute"))
+    logical_rate = throughput.get("logical_pdf_per_minute")
     pages_rate = throughput.get("pages_per_minute")
     if baseline["status"] != "known":
         checks["logical_pdf_per_minute_gte_90_percent_baseline"] = {"passed": False, "reason": baseline["reason"]}
         checks["pages_per_minute_gte_90_percent_baseline"] = {"passed": False, "reason": baseline["reason"]}
     else:
-        baseline_logical = baseline.get("logical_pdf_per_minute", baseline.get("successful_per_minute"))
+        baseline_logical = baseline.get("logical_pdf_per_minute")
         if baseline_logical is None:
             checks["logical_pdf_per_minute_gte_90_percent_baseline"] = {"passed": False, "reason": "baseline logical PDF throughput unknown"}
         elif logical_rate is None:
@@ -1658,7 +1737,15 @@ def run_evaluation(args: argparse.Namespace) -> dict[str, Any]:
     started_at = utc_now()
     start_monotonic = time.monotonic()
     start_cpu = read_cpu_times()
-    task_start = sqlite_counts(args.database, args.stale_parent_threshold_seconds)
+    task_cohort = sample_task_cohort() if args.sample else sqlite_task_cohort_floor(args.database)
+    cohort_floor = task_cohort["rowid_floor"] if task_cohort["status"] == "known" else None
+    collect_task_metrics = not args.sample and task_cohort["status"] == "known"
+    task_start = sqlite_counts(
+        args.database,
+        args.stale_parent_threshold_seconds,
+        collect_task_metrics=collect_task_metrics,
+        cohort_floor=cohort_floor,
+    )
     log_start = snapshot_log_files(args.log_path)
     throughput_snapshots = [{"elapsed_seconds": 0.0, "snapshot": task_start}]
     next_task_sample_at = 300.0
@@ -1676,7 +1763,15 @@ def run_evaluation(args: argparse.Namespace) -> dict[str, Any]:
         npu_samples.append(npu_sample)
         npu_sample_records.append({"elapsed_seconds": elapsed_now, "sample": npu_sample})
         while not args.sample and elapsed_now >= next_task_sample_at and next_task_sample_at <= args.duration:
-            throughput_snapshots.append({"elapsed_seconds": next_task_sample_at, "snapshot": sqlite_counts(args.database, args.stale_parent_threshold_seconds)})
+            throughput_snapshots.append({
+                "elapsed_seconds": next_task_sample_at,
+                "snapshot": sqlite_counts(
+                    args.database,
+                    args.stale_parent_threshold_seconds,
+                    collect_task_metrics=collect_task_metrics,
+                    cohort_floor=cohort_floor,
+                ),
+            })
             next_task_sample_at += 300.0
         if index + 1 < sample_count:
             sleep_for = min(args.interval, max(0.0, args.duration - elapsed_now))
@@ -1684,7 +1779,12 @@ def run_evaluation(args: argparse.Namespace) -> dict[str, Any]:
                 time.sleep(sleep_for)
 
     end_cpu = read_cpu_times()
-    task_end = sqlite_counts(args.database, args.stale_parent_threshold_seconds)
+    task_end = sqlite_counts(
+        args.database,
+        args.stale_parent_threshold_seconds,
+        collect_task_metrics=collect_task_metrics,
+        cohort_floor=cohort_floor,
+    )
     db_lock_log_delta = count_log_delta(args.log_path, log_start, DB_LOCK_TERMINAL_RE)
     oom_preemption = count_log_delta(args.log_path, log_start, OOM_PREEMPTION_RE)
     api_500_delta = count_log_delta(args.log_path, log_start, API_HTTP_500_RE)
@@ -1729,6 +1829,7 @@ def run_evaluation(args: argparse.Namespace) -> dict[str, Any]:
         "efficiency": efficiency,
         "vllm_metrics": summarize_vllm_metrics(vllm_samples),
         "cpu": cpu_delta(start_cpu, end_cpu),
+        "task_cohort": task_cohort,
         "tasks": {
             "start": task_start,
             "end": task_end,
