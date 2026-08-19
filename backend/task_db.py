@@ -166,7 +166,7 @@ class _LazyLockingCursor:
 class TaskDB:
     """任务数据库管理类"""
 
-    def __init__(self, db_path=None):
+    def __init__(self, db_path=None, initialize: bool = True, read_only: bool = False):
         # 导入所需模块
         import os
         from pathlib import Path
@@ -187,7 +187,9 @@ class TaskDB:
 
         # 确保 db_path 是绝对路径字符串
         self.db_path = str(Path(db_path).resolve())
-        self._init_db()
+        self.read_only = read_only
+        if initialize:
+            self._init_db()
 
     def _get_conn(self):
         """获取数据库连接（每次创建新连接，避免 pickle 问题）
@@ -199,7 +201,11 @@ class TaskDB:
               3. 不使用连接池，避免线程间共享同一连接
             - timeout=30.0 防止死锁，如果锁等待超过30秒会抛出异常
         """
-        conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30.0)
+        if self.read_only:
+            db_uri = Path(self.db_path).as_uri() + "?mode=ro"
+            conn = sqlite3.connect(db_uri, uri=True, check_same_thread=False, timeout=30.0)
+        else:
+            conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=30000")  # 锁等待 30s，避免高并发下立刻报 database is locked
         return conn
@@ -327,6 +333,22 @@ class TaskDB:
                 cursor.execute("ALTER TABLE tasks ADD COLUMN data TEXT")
                 logger.info("✅ data field added")
 
+            for column_name, definition in (
+                ("merge_owner", "TEXT"),
+                ("merge_claimed_at", "TIMESTAMP"),
+                ("merge_attempts", "INTEGER DEFAULT 0"),
+                ("merge_error", "TEXT"),
+                ("page_count", "INTEGER"),
+                ("processing_seconds", "REAL"),
+                ("worker_group_index", "INTEGER"),
+                ("worker_child_index", "INTEGER"),
+            ):
+                try:
+                    cursor.execute(f"SELECT {column_name} FROM tasks LIMIT 1")
+                except sqlite3.OperationalError:
+                    logger.info(f"📊 Migrating database schema: adding {column_name} field")
+                    cursor.execute(f"ALTER TABLE tasks ADD COLUMN {column_name} {definition}")
+
             cursor.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_task_dedup ON tasks(file_hash, backend, lang, method)"
             )
@@ -357,6 +379,11 @@ class TaskDB:
             CREATE INDEX IF NOT EXISTS idx_tasks_terminal_completed_at
             ON tasks(completed_at, status)
             WHERE completed_at IS NOT NULL
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_tasks_parent_merge_recovery
+            ON tasks(merge_claimed_at, merge_attempts, task_id)
+            WHERE is_parent = 1 AND child_count > 0 AND status = 'merging'
             """,
         ]
         if cursor is not None:
@@ -511,6 +538,7 @@ class TaskDB:
                     cursor.execute("""
                         SELECT * FROM tasks
                         WHERE status = 'pending'
+                          AND NOT (is_parent = 1 AND child_count > 0)
                         ORDER BY priority DESC, created_at ASC, task_id
                         LIMIT 1
                     """)
@@ -526,6 +554,7 @@ class TaskDB:
                                 started_at = CURRENT_TIMESTAMP,
                                 worker_id = ?
                             WHERE task_id = ? AND status = 'pending'
+                              AND NOT (is_parent = 1 AND child_count > 0)
                         """,
                             (worker_id, task_id),
                         )
@@ -617,13 +646,15 @@ class TaskDB:
                         started_at = CURRENT_TIMESTAMP,
                         worker_id = ?
                     WHERE task_id = ? AND status = 'pending'
+                      AND NOT (is_parent = 1 AND child_count > 0)
                     """,
                     (worker_id, task_id),
                 )
 
                 if cursor.rowcount == 0:
-                    logger.warning(f"⚠️  Task {task_id} status changed, skipping")
-                    redis_queue.fail(task_id, worker_id, requeue=(task["status"] == "pending"))
+                    logger.warning(f"⚠️  Task {task_id} status changed or is protected, skipping")
+                    is_split_parent = bool(task["is_parent"] and task["child_count"] > 0)
+                    redis_queue.fail(task_id, worker_id, requeue=(task["status"] == "pending" and not is_split_parent))
                     return _REDIS_COORDINATION_FAILURE_SENTINEL
 
                 logger.info(f"📤 [Redis] Task {task_id} claimed by worker {worker_id}")
@@ -643,6 +674,10 @@ class TaskDB:
         error_message: str = None,
         worker_id: str = None,
         data: str = None,  # 新增：接收扩展数据（JSON字符串）
+        page_count: int = None,
+        processing_seconds: float = None,
+        worker_group_index: int = None,
+        worker_child_index: int = None,
     ):
         """
         更新任务状态
@@ -659,23 +694,56 @@ class TaskDB:
                         SET status = ?,
                             completed_at = CURRENT_TIMESTAMP,
                             result_path = ?,
-                            data = ?
+                            data = ?,
+                            page_count = ?,
+                            processing_seconds = ?,
+                            worker_group_index = ?,
+                            worker_child_index = ?
                         WHERE task_id = ?
                         AND status IN ('processing', 'merging')
                         AND worker_id = ?
                     """
-                    cursor.execute(sql, (status, result_path, data, task_id, worker_id))
+                    cursor.execute(
+                        sql,
+                        (
+                            status,
+                            result_path,
+                            data,
+                            page_count,
+                            processing_seconds,
+                            worker_group_index,
+                            worker_child_index,
+                            task_id,
+                            worker_id,
+                        ),
+                    )
                 else:
                     sql = """
                         UPDATE tasks
                         SET status = ?,
                             completed_at = CURRENT_TIMESTAMP,
                             result_path = ?,
-                            data = ?
+                            data = ?,
+                            page_count = ?,
+                            processing_seconds = ?,
+                            worker_group_index = ?,
+                            worker_child_index = ?
                         WHERE task_id = ?
                         AND status IN ('processing', 'merging')
                     """
-                    cursor.execute(sql, (status, result_path, data, task_id))
+                    cursor.execute(
+                        sql,
+                        (
+                            status,
+                            result_path,
+                            data,
+                            page_count,
+                            processing_seconds,
+                            worker_group_index,
+                            worker_child_index,
+                            task_id,
+                        ),
+                    )
 
                 success = cursor.rowcount > 0
 
@@ -899,7 +967,7 @@ class TaskDB:
         fail_task_ids: set = set()
 
         # 1. SQLite 维度：先查再改，拿到 task_id + worker_id + retry_count 供后续决策
-        #    注意:status 包含 'merging' —— 合并过程中 worker 崩溃的父任务也需要恢复
+        #    merging parent tasks are owned exclusively by the merge reconciler.
         #    排除：is_parent=1 且 children 未全部完成的 processing 任务
         #    —— 这些父任务在正常等待 chunk 完成，不是孤儿，reset 会破坏合并流程
         with self.get_cursor() as cursor:
@@ -907,42 +975,16 @@ class TaskDB:
                 """
                 SELECT task_id, worker_id, retry_count, is_parent, child_count, child_completed
                 FROM tasks
-                WHERE status IN ('processing', 'merging')
+                WHERE status = 'processing'
                 AND started_at < datetime('now', '-' || ? || ' minutes')
                 AND NOT (
                     is_parent = 1
-                    AND status = 'processing'
                     AND child_count > 0
-                    AND child_completed < child_count
                 )
                 """,
                 (stale_minutes,),
             )
             stale_rows = cursor.fetchall()
-
-            # 单独处理：父任务 children 全部完成但仍卡在 processing（合并竞态遗漏）
-            # → 设为 merging 而非 pending（park 住，防止 get_next_task 抢走重新拆分）
-            stuck_parents = [
-                r for r in stale_rows
-                if r["is_parent"] == 1
-                and r["child_count"] > 0
-                and r["child_completed"] >= r["child_count"]
-            ]
-            if stuck_parents:
-                stuck_ids = [r["task_id"] for r in stuck_parents]
-                placeholders = ",".join("?" * len(stuck_ids))
-                cursor.execute(
-                    f"UPDATE tasks SET status = 'merging' WHERE task_id IN ({placeholders})",
-                    stuck_ids,
-                )
-                logger.warning(
-                    f"🔧 recover_orphans: {len(stuck_ids)} parent task(s) had all children "
-                    f"completed but merge never fired (race condition). Set to 'merging' "
-                    f"(parked safely). Run scripts/fix_orphan_merges.py to merge them."
-                )
-                # 从 stale_rows 中移除，不走下面的 reset/failed 逻辑
-                stuck_set = set(stuck_ids)
-                stale_rows = [r for r in stale_rows if r["task_id"] not in stuck_set]
 
             if stale_rows:
                 for row in stale_rows:
@@ -1097,7 +1139,14 @@ class TaskDB:
                 cursor.execute(
                     """
                     UPDATE tasks
-                    SET is_parent = 1, child_count = 0, child_completed = 0, status = 'processing'
+                    SET is_parent = 1,
+                        child_count = 0,
+                        child_completed = 0,
+                        status = 'processing',
+                        merge_owner = NULL,
+                        merge_claimed_at = NULL,
+                        merge_attempts = 0,
+                        merge_error = NULL
                     WHERE task_id = ?
                     """,
                     (task_id,),
@@ -1108,7 +1157,13 @@ class TaskDB:
                 cursor.execute(
                     """
                     UPDATE tasks
-                    SET is_parent = 1, child_count = ?, status = 'processing'
+                    SET is_parent = 1,
+                        child_count = ?,
+                        status = 'processing',
+                        merge_owner = NULL,
+                        merge_claimed_at = NULL,
+                        merge_attempts = 0,
+                        merge_error = NULL
                     WHERE task_id = ?
                     """,
                     (child_count, task_id),
@@ -1168,74 +1223,241 @@ class TaskDB:
         logger.debug(f"📄 Created child task: {task_id} (parent: {parent_task_id})")
         return task_id
 
-    def on_child_task_completed(self, child_task_id: str) -> Optional[str]:
-        """子任务完成回调。返回 parent_task_id 表示当前 worker 赢得合并权。"""
+    def _count_completed_children(self, cursor, parent_task_id: str) -> int:
+        cursor.execute(
+            """
+            SELECT COUNT(*) AS completed_count
+            FROM tasks
+            WHERE parent_task_id = ? AND status = 'completed'
+            """,
+            (parent_task_id,),
+        )
+        row = cursor.fetchone()
+        return int(row["completed_count"] if row else 0)
+
+    def claim_parent_merge(
+        self,
+        parent_task_id: str,
+        merge_owner: str,
+        stale_seconds: int = None,
+        max_attempts: int = None,
+        force: bool = False,
+    ) -> bool:
+        """Atomically claim a finalizable parent merge for one owner."""
         with self.get_cursor() as cursor:
             cursor.execute("BEGIN IMMEDIATE")
-
-            # 获取父任务ID
-            cursor.execute(
-                """
-                SELECT parent_task_id FROM tasks WHERE task_id = ?
-            """,
-                (child_task_id,),
-            )
-            row = cursor.fetchone()
-
-            if not row or not row["parent_task_id"]:
-                return None  # 不是子任务
-
-            parent_task_id = row["parent_task_id"]
-
-            # 更新父任务的完成计数
+            completed_children = self._count_completed_children(cursor, parent_task_id)
             cursor.execute(
                 """
                 UPDATE tasks
-                SET child_completed = child_completed + 1
+                SET child_completed = ?,
+                    status = 'merging',
+                    merge_owner = ?,
+                    merge_claimed_at = CURRENT_TIMESTAMP,
+                    merge_attempts = COALESCE(merge_attempts, 0) + 1,
+                    merge_error = NULL
                 WHERE task_id = ?
-            """,
-                (parent_task_id,),
+                  AND is_parent = 1
+                  AND child_count > 0
+                  AND child_count <= ?
+                  AND status != 'completed'
+                  AND (
+                        ? = 1
+                     OR status IN ('processing', 'pending')
+                     OR (
+                        status = 'merging'
+                        AND (
+                            merge_owner IS NULL
+                            OR merge_claimed_at IS NULL
+                            OR (? IS NOT NULL AND merge_claimed_at <= datetime('now', '-' || ? || ' seconds'))
+                        )
+                     )
+                  )
+                  AND (? IS NULL OR COALESCE(merge_attempts, 0) < ?)
+                """,
+                (
+                    completed_children,
+                    merge_owner,
+                    parent_task_id,
+                    completed_children,
+                    1 if force else 0,
+                    stale_seconds,
+                    stale_seconds,
+                    max_attempts,
+                    max_attempts,
+                ),
             )
+            return cursor.rowcount > 0
 
-            # 检查是否所有子任务都完成了
+    def complete_parent_merge(self, parent_task_id: str, result_path: str, merge_owner: str, data: str = None) -> bool:
+        """Complete a merge only for the owner that claimed it."""
+        with self.get_cursor() as cursor:
             cursor.execute(
                 """
-                SELECT child_count, child_completed, file_name, status
+                UPDATE tasks
+                SET status = 'completed',
+                    completed_at = CURRENT_TIMESTAMP,
+                    result_path = ?,
+                    data = COALESCE(?, data),
+                    merge_owner = NULL,
+                    merge_claimed_at = NULL,
+                    merge_error = NULL
+                WHERE task_id = ?
+                  AND status = 'merging'
+                  AND merge_owner = ?
+                """,
+                (result_path, data, parent_task_id, merge_owner),
+            )
+            return cursor.rowcount > 0
+
+    def release_parent_merge(self, parent_task_id: str, merge_owner: str, error_message: str = None) -> bool:
+        """Release a claimed merge lease without making it claimable as a normal task."""
+        with self.get_cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE tasks
+                SET merge_owner = NULL,
+                    merge_claimed_at = NULL,
+                    merge_error = ?
+                WHERE task_id = ?
+                  AND status = 'merging'
+                  AND merge_owner = ?
+                """,
+                (error_message, parent_task_id, merge_owner),
+            )
+            return cursor.rowcount > 0
+
+    def block_parent_merge(
+        self, parent_task_id: str, merge_owner: str, error_message: str = None, max_attempts: int = 3
+    ) -> bool:
+        """Pin a repeatedly failing merge as reconciler-blocked while keeping status='merging'."""
+        with self.get_cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE tasks
+                SET error_message = ?,
+                    merge_error = ?,
+                    merge_attempts = MAX(COALESCE(merge_attempts, 0), ?),
+                    merge_owner = NULL,
+                    merge_claimed_at = NULL
+                WHERE task_id = ?
+                  AND status = 'merging'
+                  AND merge_owner = ?
+                """,
+                (error_message, error_message, max_attempts, parent_task_id, merge_owner),
+            )
+            return cursor.rowcount > 0
+
+    def list_parent_merge_candidates(
+        self,
+        stale_seconds: int = 300,
+        max_attempts: int = 3,
+        limit: int = 100,
+        task_id: str = None,
+        force: bool = False,
+    ) -> List[Dict]:
+        """Return parent merge recovery candidates classified by current DB evidence."""
+        with self.get_cursor() as cursor:
+            cursor.execute("PRAGMA table_info(tasks)")
+            columns = {row["name"] for row in cursor.fetchall()}
+            merge_attempts_expr = "COALESCE(p.merge_attempts, 0)" if "merge_attempts" in columns else "0"
+            where = "WHERE p.is_parent = 1 AND p.child_count > 0 AND p.status IN ('processing', 'pending', 'merging')"
+            params = []
+            if task_id:
+                where += " AND p.task_id = ?"
+                params.append(task_id)
+            cursor.execute(
+                f"""
+                SELECT p.*,
+                       SUM(CASE WHEN c.status = 'completed' THEN 1 ELSE 0 END) AS real_child_completed,
+                       SUM(CASE WHEN c.status = 'failed' THEN 1 ELSE 0 END) AS child_failed
+                FROM tasks p
+                LEFT JOIN tasks c ON c.parent_task_id = p.task_id
+                {where}
+                GROUP BY p.task_id
+                ORDER BY
+                    CASE WHEN {merge_attempts_expr} >= ? THEN 1 ELSE 0 END,
+                    p.created_at
+                LIMIT ?
+                """,
+                (*params, max_attempts, limit),
+            )
+            rows = []
+            for row in cursor.fetchall():
+                item = dict(row)
+                completed = int(item.get("real_child_completed") or 0)
+                child_count = int(item.get("child_count") or 0)
+                attempts = int(item.get("merge_attempts") or 0)
+                status = item.get("status")
+                is_stale = False
+                if item.get("merge_claimed_at"):
+                    cursor.execute(
+                        "SELECT ? <= datetime('now', '-' || ? || ' seconds') AS stale",
+                        (item["merge_claimed_at"], stale_seconds),
+                    )
+                    is_stale = bool(cursor.fetchone()["stale"])
+                has_open_merge_lease = bool(item.get("merge_owner")) and bool(item.get("merge_claimed_at"))
+                if attempts >= max_attempts or item.get("child_failed"):
+                    classification = "blocked"
+                elif completed >= child_count and status in ("processing", "pending"):
+                    classification = "finalizable"
+                elif completed >= child_count and status == "merging" and (force or not has_open_merge_lease or is_stale):
+                    classification = "remergeable"
+                else:
+                    classification = "blocked"
+                item["classification"] = classification
+                item["real_child_completed"] = completed
+                item["child_failed"] = int(item.get("child_failed") or 0)
+                rows.append(item)
+            return rows
+
+    def on_child_task_completed(self, child_task_id: str, merge_owner: str = None) -> Optional[str]:
+        """子任务完成回调。返回 parent_task_id 表示当前 owner 赢得合并权。"""
+        merge_owner = merge_owner or "unknown-merge-owner"
+        with self.get_cursor() as cursor:
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute(
+                """
+                SELECT parent_task_id, status FROM tasks WHERE task_id = ?
+                """,
+                (child_task_id,),
+            )
+            row = cursor.fetchone()
+            if not row or not row["parent_task_id"]:
+                return None
+            if row["status"] != "completed":
+                logger.info(f"⏭️ Child {child_task_id} status={row['status']}, skip merge callback")
+                return None
+
+            parent_task_id = row["parent_task_id"]
+            completed_children = self._count_completed_children(cursor, parent_task_id)
+            cursor.execute(
+                """
+                UPDATE tasks
+                SET child_completed = ?
+                WHERE task_id = ?
+                """,
+                (completed_children, parent_task_id),
+            )
+            cursor.execute(
+                """
+                SELECT child_count, file_name, status
                 FROM tasks WHERE task_id = ?
-            """,
+                """,
                 (parent_task_id,),
             )
             parent = cursor.fetchone()
 
-            if parent and parent["child_completed"] >= parent["child_count"]:
-                # 原子 CAS：processing/pending → merging。
-                # processing = 正常流程；pending = orphan recovery 曾重置父任务，
-                #   但 children 已全部完成，仍需合并。两种状态都允许 CAS。
-                # merging/completed = 另一个 worker 已认领合并，跳过。
-                if parent["status"] in ("processing", "pending"):
-                    cursor.execute(
-                        "UPDATE tasks SET status = 'merging' "
-                        "WHERE task_id = ? AND status IN ('processing', 'pending')",
-                        (parent_task_id,),
-                    )
-                    if cursor.rowcount > 0:
-                        logger.info(
-                            f"🎉 All subtasks completed for parent task {parent_task_id} "
-                            f"({parent['child_completed']}/{parent['child_count']}, "
-                            f"was {parent['status']}) - {parent['file_name']}"
-                        )
-                        return parent_task_id
-                    else:
-                        logger.info(f"↩️ Merge already claimed by another worker for {parent_task_id}")
-                else:
-                    logger.info(f"⏭️ Parent {parent_task_id} status={parent['status']}, skip merge claim")
-
-            if parent:
+        if parent and completed_children >= parent["child_count"] and parent["child_count"] > 0:
+            if self.claim_parent_merge(parent_task_id, merge_owner):
                 logger.info(
-                    f"⏳ Subtask progress: {parent['child_completed']}/{parent['child_count']} "
-                    f"for parent task {parent_task_id}"
+                    f"🎉 All subtasks completed for parent task {parent_task_id} "
+                    f"({completed_children}/{parent['child_count']}, was {parent['status']}) - {parent['file_name']}"
                 )
-
+                return parent_task_id
+            logger.info(f"↩️ Merge already claimed by another owner for {parent_task_id}")
+        elif parent:
+            logger.info(f"⏳ Subtask progress: {completed_children}/{parent['child_count']} for parent task {parent_task_id}")
         return None
 
     def on_child_task_failed(self, child_task_id: str, error_message: str):

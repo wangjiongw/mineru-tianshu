@@ -76,6 +76,61 @@ def test_readonly_context_does_not_take_fcntl_write_lock(tmp_path):
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+def test_completion_metric_columns_are_migrated(tmp_path):
+    db = TaskDB(tmp_path / "tasks.db")
+    with db.get_cursor() as cursor:
+        cursor.execute("PRAGMA table_info(tasks)")
+        columns = {row["name"] for row in cursor.fetchall()}
+
+    assert {
+        "page_count",
+        "processing_seconds",
+        "worker_group_index",
+        "worker_child_index",
+    }.issubset(columns)
+
+
+def test_completed_status_persists_typed_metrics(tmp_path):
+    db = TaskDB(tmp_path / "tasks.db")
+    task_id = db.create_task("metrics.pdf", "/tmp/metrics.pdf")["task_id"]
+    task = db.get_next_task("worker-a")
+    assert task["task_id"] == task_id
+
+    assert db.update_task_status(
+        task_id,
+        "completed",
+        worker_id="worker-a",
+        result_path="/tmp/out",
+        page_count=12,
+        processing_seconds=3.5,
+        worker_group_index=4,
+        worker_child_index=2,
+    ) is True
+
+    completed = db.get_task(task_id)
+    assert completed["status"] == "completed"
+    assert completed["page_count"] == 12
+    assert completed["processing_seconds"] == 3.5
+    assert completed["worker_group_index"] == 4
+    assert completed["worker_child_index"] == 2
+
+
+def test_completed_status_old_call_leaves_metrics_null(tmp_path):
+    db = TaskDB(tmp_path / "tasks.db")
+    task_id = db.create_task("old.pdf", "/tmp/old.pdf")["task_id"]
+    task = db.get_next_task("worker-a")
+    assert task["task_id"] == task_id
+
+    assert db.update_task_status(task_id, "completed", worker_id="worker-a", result_path="/tmp/out") is True
+
+    completed = db.get_task(task_id)
+    assert completed["status"] == "completed"
+    assert completed["page_count"] is None
+    assert completed["processing_seconds"] is None
+    assert completed["worker_group_index"] is None
+    assert completed["worker_child_index"] is None
+
+
 def test_completed_status_survives_transient_sqlite_busy(tmp_path, monkeypatch):
     db = TaskDB(tmp_path / "tasks.db")
     task_id = db.create_task("done.pdf", "/tmp/done.pdf")["task_id"]

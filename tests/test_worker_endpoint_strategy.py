@@ -5,6 +5,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -42,6 +43,9 @@ def _install_import_stubs():
 
     utils = types.ModuleType("utils")
     utils.parse_list_arg = lambda value: value
+
+    redis_queue = types.ModuleType("redis_queue")
+    redis_queue.get_redis_queue = lambda: None
 
     requests = types.ModuleType("requests")
 
@@ -89,6 +93,7 @@ def _install_import_stubs():
     sys.modules.setdefault("litserve.connector", connector)
     sys.modules.setdefault("output_normalizer", output_normalizer)
     sys.modules.setdefault("utils", utils)
+    sys.modules.setdefault("redis_queue", redis_queue)
     sys.modules.setdefault("requests", requests)
     sys.modules.setdefault("markitdown", markitdown)
     sys.modules.setdefault("loguru", loguru)
@@ -319,6 +324,38 @@ class WorkerEndpointStrategyTest(unittest.TestCase):
         self.assertEqual(api.task_db.status, "completed")
         self.assertEqual(api.task_db.calls[-1]["worker_id"], "worker-b")
 
+    def test_completion_payload_includes_backward_compatible_metrics(self):
+        api = worker.MinerUWorkerAPI(enable_worker_loop=False, worker_group_index=4)
+        api.worker_id = "worker-b"
+        api.worker_child_index = 2
+        api.task_db = OwnershipTaskDB(owner_worker_id="worker-b")
+
+        completed = api._complete_task_after_compute(
+            "task-metrics",
+            {
+                "result_path": "/tmp/out",
+                "content": "ok",
+                "pdf_path": "/tmp/out/source.pdf",
+                "json_content": {"pages": [{"page_idx": 0}, {"page_idx": 1}]},
+            },
+            options={"chunk_info": {"page_count": 9}},
+            started_at=time.monotonic() - 1.0,
+        )
+
+        self.assertTrue(completed)
+        payload = json.loads(api.task_db.calls[-1]["data"])
+        self.assertEqual(payload["markdown"], "ok")
+        self.assertEqual(payload["pdf_path"], "/tmp/out/source.pdf")
+        self.assertEqual(payload["metrics"]["page_count"], 2)
+        self.assertEqual(payload["metrics"]["worker_group_index"], 4)
+        self.assertEqual(payload["metrics"]["worker_child_index"], 2)
+        self.assertGreaterEqual(payload["metrics"]["processing_seconds"], 1.0)
+        call = api.task_db.calls[-1]
+        self.assertEqual(call["page_count"], 2)
+        self.assertEqual(call["worker_group_index"], 4)
+        self.assertEqual(call["worker_child_index"], 2)
+        self.assertGreaterEqual(call["processing_seconds"], 1.0)
+
     def test_stale_worker_cannot_fail_task_owned_by_another_worker(self):
         api = worker.MinerUWorkerAPI(enable_worker_loop=False)
         api.worker_id = "worker-a"
@@ -341,6 +378,29 @@ class WorkerEndpointStrategyTest(unittest.TestCase):
 
         self.assertEqual(api.task_db.status, "failed")
         self.assertEqual(api.task_db.calls[-1]["worker_id"], "worker-b")
+
+    def test_should_split_pdf_refuses_existing_parent_with_children(self):
+        class NoResplitTaskDB:
+            def get_task(self, task_id):
+                raise AssertionError("task row already proves this is an existing split parent")
+
+            def convert_to_parent_task(self, *args, **kwargs):
+                raise AssertionError("existing split parent must not be converted again")
+
+            def create_child_task(self, *args, **kwargs):
+                raise AssertionError("existing split parent must not create replacement children")
+
+        api = worker.MinerUWorkerAPI(enable_worker_loop=False)
+        api.task_db = NoResplitTaskDB()
+
+        self.assertTrue(
+            api._should_split_pdf(
+                "parent-task",
+                "/tmp/parent.pdf",
+                {"task_id": "parent-task", "is_parent": 1, "child_count": 2},
+                {},
+            )
+        )
 
 
 
