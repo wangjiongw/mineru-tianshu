@@ -460,6 +460,66 @@ class TianshuProcessStatusTests(unittest.TestCase):
         self.assertIn('COMPUTE_SUPERVISOR_HEALTH_FAILURE_THRESHOLD', implementation)
         self.assertIn('consecutive health probe failures', implementation)
 
+
+    def test_wait_worker_instance_ready_waits_for_health_while_process_survives(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            worker_dir = tmp_path / "worker"
+            calls = tmp_path / "curl-calls"
+            counter = tmp_path / "curl-count"
+            worker_dir.mkdir()
+            fake_proc(tmp_path, 601, "S", ["/env/bin/python", "litserve_worker.py", "--port", "8103"])
+            (worker_dir / "worker_2.pid").write_text("601")
+            result = run_bash(
+                f'WORKER_LOG_DIR="{worker_dir}" WORKER_BASE_PORT=8101 WORKER_NUM_INSTANCES=8 WORKER_READY_POLL_SECONDS=1; '
+                f'curl() {{ n=$(cat "{counter}" 2>/dev/null || echo 0); n=$((n + 1)); printf "%s" "$n" > "{counter}"; printf "%s\n" "$*" >> "{calls}"; [ "$n" -ge 3 ]; }}; '
+                'sleep() { :; }; '
+                'wait_worker_instance_ready 2 5',
+                tmp_path,
+            )
+            recorded = calls.read_text().splitlines()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(recorded), 3)
+        self.assertTrue(all('http://localhost:8103/health' in call for call in recorded))
+
+    def test_wait_worker_instance_ready_fails_if_worker_process_exits_before_health(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            worker_dir = tmp_path / "worker"
+            calls = tmp_path / "curl-calls"
+            worker_dir.mkdir()
+            fake_proc(tmp_path, 602, "S", ["/env/bin/python", "litserve_worker.py", "--port", "8103"])
+            (worker_dir / "worker_2.pid").write_text("602")
+            result = run_bash(
+                f'WORKER_LOG_DIR="{worker_dir}" WORKER_BASE_PORT=8101 WORKER_NUM_INSTANCES=8 WORKER_READY_POLL_SECONDS=1; '
+                f'curl() {{ printf "%s\n" "$*" >> "{calls}"; rm -rf "$TIANSHU_PROC_ROOT/602"; return 1; }}; '
+                'sleep() { :; }; '
+                'wait_worker_instance_ready 2 5',
+                tmp_path,
+            )
+            recorded = calls.read_text().splitlines()
+
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(len(recorded), 1)
+
+    def test_compute_supervisor_waits_for_worker_ready_before_health_failure_loop(self) -> None:
+        text = SCRIPT.read_text()
+        start = text.index("supervise_compute_instance()")
+        end = text.index("cmd_supervise()", start)
+        implementation = text[start:end]
+
+        self.assertIn('WORKER_READY_TIMEOUT', implementation)
+        self.assertIn('wait_worker_instance_ready "$i" "$WORKER_READY_TIMEOUT"', implementation)
+        self.assertLess(
+            implementation.index('wait_worker_instance_ready "$i" "$WORKER_READY_TIMEOUT"'),
+            implementation.index('local vllm_health_failures=0'),
+        )
+        self.assertLess(
+            implementation.index('wait_worker_instance_ready "$i" "$WORKER_READY_TIMEOUT"'),
+            implementation.index('worker_http_healthy "$i" "$health_probe_timeout"'),
+        )
+
     def test_compute_supervisor_emits_periodic_heartbeat(self) -> None:
         text = SCRIPT.read_text()
         start = text.index("supervise_compute_instance()")

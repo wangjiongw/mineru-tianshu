@@ -34,6 +34,7 @@ VLLM_PERFORMANCE_MODE="${VLLM_PERFORMANCE_MODE:-throughput}" # 吞吐模式实�
 VLLM_MAX_NUM_BATCHED_TOKENS="${VLLM_MAX_NUM_BATCHED_TOKENS:-4096}" # 8192 实测降低 PDF 吞吐，保留 4096
 #                                                                # hybrid/VLM 推理走本卡 vLLM；0.60 + c8 在 10 分钟压力下 0 OOM/0 preemption
 VLLM_READY_TIMEOUT="${VLLM_READY_TIMEOUT:-900}"   # vllm 健康检查总超时(秒);首次含 NPU kernel 编译,默认 15min,可调大
+WORKER_READY_TIMEOUT="${WORKER_READY_TIMEOUT:-180}" # worker cold-start /health 等待超时(秒)
 SUPERVISOR_HEALTH_PROBE_TIMEOUT_SECONDS="${SUPERVISOR_HEALTH_PROBE_TIMEOUT_SECONDS:-5}"
 COMPUTE_SUPERVISOR_POLL_SECONDS="${COMPUTE_SUPERVISOR_POLL_SECONDS:-5}"
 COMPUTE_SUPERVISOR_HEALTH_INTERVAL_SECONDS="${COMPUTE_SUPERVISOR_HEALTH_INTERVAL_SECONDS:-15}"
@@ -1192,6 +1193,25 @@ worker_http_healthy() {
     curl -fsS --max-time "$timeout" "http://localhost:${port}/health" > /dev/null 2>&1
 }
 
+wait_worker_instance_ready() {
+    local index="$1"
+    local timeout="${2:-$WORKER_READY_TIMEOUT}"
+    local elapsed=0
+    local interval="${WORKER_READY_POLL_SECONDS:-5}"
+    case "$timeout" in ""|*[!0-9]*) timeout=180 ;; esac
+    case "$interval" in ""|*[!0-9]*|0) interval=5 ;; esac
+
+    while [ "$elapsed" -le "$timeout" ]; do
+        worker_is_running "$index" || return 1
+        if worker_http_healthy "$index" "$SUPERVISOR_HEALTH_PROBE_TIMEOUT_SECONDS"; then
+            return 0
+        fi
+        sleep "$interval"
+        elapsed=$((elapsed + interval))
+    done
+    return 1
+}
+
 check_worker_dependencies() {
     local index="$1"
     local vllm_port=$((VLLM_BASE_PORT + index))
@@ -2150,6 +2170,12 @@ supervise_compute_instance() {
         worker_pid="$(cat "$(worker_pid_file "$i")" 2>/dev/null)"
         log_info "Compute #${i} supervisor watching VLLM PID ${vllm_pid}, Worker PID ${worker_pid}"
         write_compute_supervisor_state "$i"
+        if ! wait_worker_instance_ready "$i" "$WORKER_READY_TIMEOUT"; then
+            log_warn "Compute #${i} Worker did not become ready within ${WORKER_READY_TIMEOUT}s; restarting pair after ${backoff}s"
+            stop_owned_compute
+            wait_compute_backoff
+            continue
+        fi
 
         local failed_component=""
         local failure_reason=""
