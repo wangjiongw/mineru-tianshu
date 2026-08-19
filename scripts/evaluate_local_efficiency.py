@@ -61,7 +61,10 @@ OOM_PREEMPTION_RE = re.compile(
     re.IGNORECASE,
 )
 API_HTTP_500_RE = re.compile(
-    r"(?:\b(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\b.{0,240}\b500\b)|(?:\bstatus(?:_code)?[=: ]+500\b)|(?:\bHTTP/\d(?:\.\d)?[\"]?\s+500\b)|(?:\b500\s+(?:Internal Server Error|ERROR)\b)",
+    r"(?:\b(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+\S+\s+HTTP/\d(?:\.\d)?[\"]?\s+500\b)"
+    r"|(?:\bHTTP/\d(?:\.\d)?[\"]?\s+500\b)"
+    r"|(?:\bstatus(?:_code)?\s*[=:]\s*500\b)"
+    r"|(?:\b500\s+(?:Internal Server Error|ERROR)\b)",
     re.IGNORECASE,
 )
 PAGE_COUNT_KEYS = ("page_count", "total_pages", "pages")
@@ -1778,8 +1781,7 @@ def run_evaluation(args: argparse.Namespace) -> dict[str, Any]:
     worker_samples: list[list[dict[str, Any]]] = []
     vllm_samples: list[list[dict[str, Any]]] = []
 
-    sample_count = 1 if args.sample else max(1, math.floor(args.duration / args.interval) + 1)
-    for index in range(sample_count):
+    while True:
         worker_samples.append(collect_worker_health(args.host, args.worker_ports))
         vllm_samples.append(collect_vllm(args.host, args.vllm_ports))
         npu_sample = collect_npu_smi()
@@ -1797,10 +1799,12 @@ def run_evaluation(args: argparse.Namespace) -> dict[str, Any]:
                 ),
             })
             next_task_sample_at += 300.0
-        if index + 1 < sample_count:
-            sleep_for = min(args.interval, max(0.0, args.duration - elapsed_now))
-            if sleep_for > 0:
-                time.sleep(sleep_for)
+        if args.sample:
+            break
+        sleep_for = min(args.interval, max(0.0, args.duration - elapsed_now))
+        if sleep_for <= 0:
+            break
+        time.sleep(sleep_for)
 
     end_cpu = read_cpu_times()
     task_end = sqlite_counts(

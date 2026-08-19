@@ -260,7 +260,7 @@ class EvaluateLocalEfficiencyTests(unittest.TestCase):
             ), \
             mock.patch.object(evaluator, "time", FakeTime):
             args = argparse.Namespace(
-                duration=1.0,
+                duration=2.0,
                 interval=1.0,
                 baseline=baseline,
                 record_baseline=None,
@@ -386,6 +386,7 @@ class EvaluateLocalEfficiencyTests(unittest.TestCase):
             handle.write('POST /api/tasks HTTP/1.1" 500\n')
             handle.write('GET /api/tasks HTTP/1.1" 200\n')
             handle.write('status_code=500 route=/api/submit\n')
+            handle.write('get excited about a summary of approximately 500 words\n')
 
         result = evaluator.count_log_delta([log_path], snapshot, evaluator.API_HTTP_500_RE)
 
@@ -1371,12 +1372,99 @@ class EvaluateLocalEfficiencyTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, 2)
 
+    def test_duration_sampling_stops_on_wall_clock_instead_of_fixed_count(self):
+        tmp_path = Path(self.create_temp_dir())
+        log_path = tmp_path / "service.log"
+        log_path.write_text("", encoding="utf-8")
+        sqlite_mock = mock.Mock(
+            return_value={
+                "status": "known",
+                "reason": None,
+                "counts": {},
+                "metrics": {"status": "known", "logical_pdf_completed": 0, "completed_pages": 0, "processing_seconds": 0.0, "worker_groups": {}},
+                "parent_merge_backlog": {"status": "known", "recoverable_stale_merging_parents": 0},
+            }
+        )
+        npu_mock = mock.Mock(
+            return_value={
+                "status": "known",
+                "reason": None,
+                "cards": [{"card_id": float(card_id), "hbm_percent": 70.0, "util_percent": 20.0, "power_w": 100.0} for card_id in range(8)],
+            }
+        )
+        cpu_snapshots = iter(
+            [
+                {"user": 0, "nice": 0, "system": 0, "idle": 100, "iowait": 0},
+                {"user": 0, "nice": 0, "system": 0, "idle": 200, "iowait": 0},
+            ]
+        )
+
+        SlowSamplingTime.current = 0.0
+        SlowSamplingTime.calls = 0
+
+        with mock.patch.object(evaluator, "sqlite_counts", sqlite_mock), \
+            mock.patch.object(evaluator, "read_cpu_times", side_effect=lambda: next(cpu_snapshots)), \
+            mock.patch.object(evaluator, "collect_worker_health", side_effect=lambda host, ports: [{"port": port, "status": "healthy"} for port in ports]), \
+            mock.patch.object(
+                evaluator,
+                "collect_vllm",
+                side_effect=lambda host, ports: [
+                    {
+                        "port": port,
+                        "status": "healthy",
+                        "metrics_status": "known",
+                        "metrics_summary": {"kv_cache_usage_percent": 50.0, "num_preemptions_total": 0.0},
+                    }
+                    for port in ports
+                ],
+            ), \
+            mock.patch.object(evaluator, "collect_npu_smi", npu_mock), \
+            mock.patch.object(evaluator, "time", SlowSamplingTime):
+            args = argparse.Namespace(
+                duration=10.0,
+                interval=5.0,
+                baseline=None,
+                record_baseline=None,
+                sample=False,
+                cohort_floor=0,
+                host="localhost",
+                database=tmp_path / "tasks.db",
+                log_path=[log_path],
+                worker_ports=list(range(8101, 8109)),
+                vllm_ports=list(range(30025, 30033)),
+                stale_parent_threshold_seconds=600.0,
+            )
+
+            result = evaluator.run_evaluation(args)
+
+        self.assertEqual(npu_mock.call_count, 2)
+        self.assertGreaterEqual(result["duration_seconds"], 10.0)
+        self.assertLess(result["duration_seconds"], 20.0)
+
     def create_temp_dir(self):
         import tempfile
 
         temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir.cleanup)
         return temp_dir.name
+
+
+class SlowSamplingTime:
+    current = 0.0
+    calls = 0
+
+    @classmethod
+    def monotonic(cls):
+        cls.calls += 1
+        if cls.calls == 1:
+            return cls.current
+        if cls.calls <= 3:
+            cls.current += 6.0
+        return cls.current
+
+    @classmethod
+    def sleep(cls, seconds):
+        cls.current += seconds
 
 
 class FakeTime:
