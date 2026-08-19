@@ -38,6 +38,7 @@ SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 SHA_PDF_RE = re.compile(r"^([0-9a-f]{64})\.pdf$")
 ELIGIBLE_STATES = ("unsubmitted", "failed_retryable")
 READY_STATES = ("complete_valid", "legacy_result_only")
+TERMINAL_BATCH_STATES = ("completed", "completed_with_errors")
 
 
 def utc_now() -> str:
@@ -432,6 +433,133 @@ def classify_documents(conn: sqlite3.Connection, generation: int) -> Counter:
     )
 
 
+def classify_batch_documents(conn: sqlite3.Connection, batch_key: str) -> Counter:
+    now = utc_now()
+    conn.execute(
+        """
+        UPDATE documents
+        SET state = CASE
+            WHEN parsed_complete=1 AND db_status='completed' THEN 'complete_valid'
+            WHEN parsed_complete=1 THEN 'legacy_result_only'
+            WHEN db_status='completed' THEN 'completed_db_unsynced'
+            WHEN db_status='pending' THEN 'queued'
+            WHEN db_status IN ('processing','merging') THEN 'active'
+            WHEN db_status IN ('failed','timeout') AND (
+                lower(COALESCE(db_error,'')) LIKE '%invalid pdf%'
+                OR lower(COALESCE(db_error,'')) LIKE '%pdfium%'
+                OR lower(COALESCE(db_error,'')) LIKE '%password%'
+                OR lower(COALESCE(db_error,'')) LIKE '%encrypted%'
+                OR lower(COALESCE(db_error,'')) LIKE '%cannot open%'
+            ) THEN 'failed_permanent'
+            WHEN db_status IN ('failed','timeout') THEN 'failed_retryable'
+            ELSE state
+        END,
+        updated_at=?
+        WHERE current_batch_id=(SELECT batch_id FROM batches WHERE batch_key=?)
+        """,
+        (now, batch_key),
+    )
+    return Counter(
+        {
+            row["state"]: row["count"]
+            for row in conn.execute(
+                """
+                SELECT d.state,COUNT(*) AS count
+                FROM documents d JOIN batches b ON d.current_batch_id=b.batch_id
+                WHERE b.batch_key=?
+                GROUP BY d.state
+                """,
+                (batch_key,),
+            )
+        }
+    )
+
+
+
+
+def refresh_one_batch_progress(conn: sqlite3.Connection, batch_key: str) -> None:
+    now = utc_now()
+    batch = conn.execute("SELECT batch_id,item_count FROM batches WHERE batch_key=?", (batch_key,)).fetchone()
+    if not batch:
+        raise RuntimeError(f"unknown batch: {batch_key}")
+    conn.execute(
+        """
+        UPDATE batch_items
+        SET item_status = CASE
+            WHEN (SELECT state FROM documents d WHERE d.sha256=batch_items.sha256)
+                 IN ('complete_valid','legacy_result_only','completed_db_unsynced') THEN 'completed'
+            WHEN (SELECT state FROM documents d WHERE d.sha256=batch_items.sha256)
+                 IN ('queued','active') THEN 'submitted'
+            WHEN (SELECT state FROM documents d WHERE d.sha256=batch_items.sha256)
+                 IN ('failed_retryable','failed_permanent') THEN 'error'
+            ELSE item_status
+        END,
+        task_id=COALESCE(
+            (SELECT db_task_id FROM documents d WHERE d.sha256=batch_items.sha256),
+            task_id
+        ),
+        updated_at=?
+        WHERE batch_id=?
+        """,
+        (now, batch["batch_id"]),
+    )
+    item_counts = Counter(
+        {
+            item["item_status"]: item["count"]
+            for item in conn.execute(
+                "SELECT item_status,COUNT(*) AS count FROM batch_items WHERE batch_id=? GROUP BY item_status",
+                (batch["batch_id"],),
+            )
+        }
+    )
+    state_counts = Counter(
+        {
+            item["state"]: item["count"]
+            for item in conn.execute(
+                """
+                SELECT d.state,COUNT(*) AS count
+                FROM batch_items bi JOIN documents d USING(sha256)
+                WHERE bi.batch_id=?
+                GROUP BY d.state
+                """,
+                (batch["batch_id"],),
+            )
+        }
+    )
+    completed = item_counts["completed"]
+    submitted = item_counts["submitted"]
+    permanent_failed = state_counts["failed_permanent"]
+    failed = int(
+        conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM batch_items bi JOIN documents d USING(sha256)
+            WHERE bi.batch_id=?
+              AND (bi.item_status='error' OR d.state IN ('failed_retryable','failed_permanent'))
+            """,
+            (batch["batch_id"],),
+        ).fetchone()["count"]
+    )
+    if completed == batch["item_count"]:
+        status = "completed"
+    elif completed + permanent_failed == batch["item_count"] and permanent_failed:
+        status = "completed_with_errors"
+    elif submitted or completed:
+        status = "partial" if failed else "running"
+    elif failed:
+        status = "partial"
+    else:
+        status = "prepared"
+    conn.execute(
+        """
+        UPDATE batches
+        SET status=?,submitted_count=?,completed_count=?,failed_count=?,updated_at=?
+        WHERE batch_id=?
+        """,
+        (status, submitted, completed, failed, now, batch["batch_id"]),
+    )
+    conn.commit()
+
 def refresh_batch_progress(conn: sqlite3.Connection) -> None:
     now = utc_now()
     conn.execute(
@@ -439,9 +567,9 @@ def refresh_batch_progress(conn: sqlite3.Connection) -> None:
         UPDATE batch_items
         SET item_status = CASE
             WHEN (SELECT state FROM documents d WHERE d.sha256=batch_items.sha256)
-                 IN ('complete_valid','legacy_result_only') THEN 'completed'
+                 IN ('complete_valid','legacy_result_only','completed_db_unsynced') THEN 'completed'
             WHEN (SELECT state FROM documents d WHERE d.sha256=batch_items.sha256)
-                 IN ('queued','active','completed_db_unsynced') THEN 'submitted'
+                 IN ('queued','active') THEN 'submitted'
             WHEN (SELECT state FROM documents d WHERE d.sha256=batch_items.sha256)
                  IN ('failed_retryable','failed_permanent') THEN 'error'
             ELSE item_status
@@ -455,7 +583,7 @@ def refresh_batch_progress(conn: sqlite3.Connection) -> None:
         (now,),
     )
     for row in conn.execute("SELECT batch_id,item_count FROM batches ORDER BY batch_id").fetchall():
-        counts = Counter(
+        item_counts = Counter(
             {
                 item["item_status"]: item["count"]
                 for item in conn.execute(
@@ -464,11 +592,38 @@ def refresh_batch_progress(conn: sqlite3.Connection) -> None:
                 )
             }
         )
-        completed = counts["completed"]
-        submitted = counts["submitted"]
-        failed = counts["error"]
+        state_counts = Counter(
+            {
+                item["state"]: item["count"]
+                for item in conn.execute(
+                    """
+                    SELECT d.state,COUNT(*) AS count
+                    FROM batch_items bi JOIN documents d USING(sha256)
+                    WHERE bi.batch_id=?
+                    GROUP BY d.state
+                    """,
+                    (row["batch_id"],),
+                )
+            }
+        )
+        completed = item_counts["completed"]
+        submitted = item_counts["submitted"]
+        permanent_failed = state_counts["failed_permanent"]
+        failed = int(
+            conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM batch_items bi JOIN documents d USING(sha256)
+                WHERE bi.batch_id=?
+                  AND (bi.item_status='error' OR d.state IN ('failed_retryable','failed_permanent'))
+                """,
+                (row["batch_id"],),
+            ).fetchone()["count"]
+        )
         if completed == row["item_count"]:
             status = "completed"
+        elif completed + permanent_failed == row["item_count"] and permanent_failed:
+            status = "completed_with_errors"
         elif submitted or completed:
             status = "partial" if failed else "running"
         elif failed:
@@ -484,6 +639,90 @@ def refresh_batch_progress(conn: sqlite3.Connection) -> None:
             (status, submitted, completed, failed, now, row["batch_id"]),
         )
     conn.commit()
+
+
+def refresh_batch_from_task_db(
+    conn: sqlite3.Connection,
+    inventory_path: Path,
+    legacy_progress_path: Path,
+    task_db_path: Path,
+    batch_key: str,
+    write_reports: bool = True,
+) -> dict[str, object]:
+    batch = conn.execute("SELECT batch_id FROM batches WHERE batch_key=?", (batch_key,)).fetchone()
+    if not batch:
+        raise RuntimeError(f"unknown batch: {batch_key}")
+    rows = conn.execute(
+        """
+        SELECT bi.sha256,COALESCE(bi.task_id,d.db_task_id) AS task_id
+        FROM batch_items bi JOIN documents d USING(sha256)
+        WHERE bi.batch_id=? AND COALESCE(bi.task_id,d.db_task_id) IS NOT NULL
+        """,
+        (batch["batch_id"],),
+    ).fetchall()
+    task_ids = [row["task_id"] for row in rows if row["task_id"]]
+    task_to_sha = {row["task_id"]: row["sha256"] for row in rows if row["task_id"]}
+    updated = 0
+    if task_ids and task_db_path.exists():
+        task_uri = f"file:{task_db_path}?mode=ro"
+        task_conn = sqlite3.connect(task_uri, uri=True, timeout=10.0)
+        task_conn.row_factory = sqlite3.Row
+        try:
+            columns = {row["name"] for row in task_conn.execute("PRAGMA table_info(tasks)").fetchall()}
+            select_columns = ["task_id", "status"]
+            for optional in ("result_path", "error_message", "file_hash"):
+                if optional in columns:
+                    select_columns.append(optional)
+            for task_chunk in chunks(task_ids):
+                placeholders = ",".join("?" for _ in task_chunk)
+                task_rows = task_conn.execute(
+                    f"SELECT {','.join(select_columns)} FROM tasks WHERE task_id IN ({placeholders})",
+                    tuple(task_chunk),
+                ).fetchall()
+                now = utc_now()
+                updates = []
+                for task in task_rows:
+                    keys = task.keys()
+                    sha = task["file_hash"] if "file_hash" in keys and task["file_hash"] else task_to_sha.get(task["task_id"])
+                    if not sha:
+                        continue
+                    updates.append(
+                        (
+                            task["task_id"],
+                            task["status"],
+                            task["result_path"] if "result_path" in keys else None,
+                            task["error_message"] if "error_message" in keys else None,
+                            now,
+                            sha,
+                        )
+                    )
+                if updates:
+                    conn.executemany(
+                        """
+                        UPDATE documents
+                        SET db_task_id=?,db_status=?,db_result_path=?,db_error=?,updated_at=?
+                        WHERE sha256=?
+                        """,
+                        updates,
+                    )
+                    updated += len(updates)
+        finally:
+            task_conn.close()
+    states = classify_batch_documents(conn, batch_key)
+    refresh_one_batch_progress(conn, batch_key)
+    batch_row = conn.execute("SELECT * FROM batches WHERE batch_key=?", (batch_key,)).fetchone()
+    batch_payload = dict(batch_row) if batch_row else None
+    refresh_payload = {"batch_key": batch_key, "task_ids": len(task_ids), "updated": updated, "states": dict(states)}
+    if write_reports:
+        report = write_progress_reports(conn, inventory_path, legacy_progress_path)
+        report["batch_refresh"] = refresh_payload
+        return report
+    return {
+        "inventory_path": str(inventory_path),
+        "updated_at": utc_now(),
+        "batch_refresh": refresh_payload,
+        "batch": batch_payload,
+    }
 
 
 def legacy_progress_count(path: Path) -> int | None:
@@ -834,7 +1073,7 @@ def submit_batch(
         """
         SELECT bi.position,bi.sha256,bi.item_status,d.source_path,d.state
         FROM batch_items bi JOIN documents d USING(sha256)
-        WHERE bi.batch_id=? AND bi.item_status IN ('prepared','error')
+        WHERE bi.batch_id=? AND (bi.item_status='prepared' OR (bi.item_status='error' AND d.state='failed_retryable'))
         ORDER BY bi.position
         """,
         (batch["batch_id"],),
@@ -956,6 +1195,10 @@ def build_parser() -> argparse.ArgumentParser:
     status = subparsers.add_parser("status", help="Render progress from the current inventory")
     add_common_paths(status)
 
+    refresh_batch = subparsers.add_parser("refresh-batch", help="Refresh one batch from task DB without scanning history")
+    add_common_paths(refresh_batch)
+    refresh_batch.add_argument("--batch-key", required=True)
+
     submit = subparsers.add_parser("submit", help="Stage one prepared batch through trusted local paths")
     add_common_paths(submit)
     submit.add_argument("--batch-key", required=True)
@@ -1009,6 +1252,14 @@ def main() -> int:
                 args.legacy_progress,
                 args.batch_size,
                 args.replace_prepared,
+            )
+        elif args.command == "refresh-batch":
+            report = refresh_batch_from_task_db(
+                conn,
+                args.inventory,
+                args.legacy_progress,
+                args.task_db,
+                args.batch_key,
             )
         elif args.command == "submit":
             report = submit_batch(
