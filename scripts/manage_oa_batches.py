@@ -1052,6 +1052,50 @@ def load_task_db_api(args: argparse.Namespace):
     return TaskDB(str(args.task_db)), queue
 
 
+SPLIT_PROCESSING_RETRY_MODES = {
+    "split_children_requeued",
+    "split_ready_to_merge",
+    "split_awaiting_children",
+}
+
+
+def task_present_in_live_queue(queue: object, task_id: str) -> bool:
+    return queue.client.zscore(queue.config.queue_key, task_id) is not None or queue.client.hget(
+        queue.config.processing_key,
+        task_id,
+    ) is not None
+
+
+def batch_item_status_from_create_result(result: dict[str, object], queue: object) -> str:
+    retry_info = result.get("retry_info") if isinstance(result, dict) else None
+    if isinstance(retry_info, dict) and retry_info.get("enqueue_failed_task_ids"):
+        raise RuntimeError(f"task enqueue failed: {retry_info['enqueue_failed_task_ids']}")
+    task_id = str(result["task_id"])
+    status = result["status"]
+    if status == "completed":
+        return "completed"
+    if status == "pending":
+        if not task_present_in_live_queue(queue, task_id):
+            raise RuntimeError(f"task {task_id} is pending in SQLite but absent from Redis")
+        return "submitted"
+    if status == "processing":
+        if not isinstance(retry_info, dict):
+            raise RuntimeError(f"task {task_id} returned processing without split retry_info")
+        mode = retry_info.get("mode")
+        if mode not in SPLIT_PROCESSING_RETRY_MODES:
+            raise RuntimeError(f"task {task_id} returned unsupported processing retry mode: {mode}")
+        requeued = retry_info.get("requeued_task_ids") or []
+        if not isinstance(requeued, list):
+            raise RuntimeError(f"task {task_id} returned non-list requeued split children")
+        if mode == "split_children_requeued" and not requeued:
+            raise RuntimeError(f"task {task_id} returned split_children_requeued without requeued split children")
+        missing = [str(child_id) for child_id in requeued if not task_present_in_live_queue(queue, str(child_id))]
+        if missing:
+            raise RuntimeError(f"split children absent from Redis: {missing}")
+        return "submitted"
+    raise RuntimeError(f"task {task_id} returned non-queueable status: {status}")
+
+
 def submit_batch(
     conn: sqlite3.Connection,
     inventory_path: Path,
@@ -1107,12 +1151,7 @@ def submit_batch(
             )
             task_id = result["task_id"]
             status = result["status"]
-            if status == "pending":
-                present = queue.client.zscore(queue.config.queue_key, task_id) is not None
-                present = present or queue.client.hget(queue.config.processing_key, task_id) is not None
-                if not present:
-                    raise RuntimeError(f"task {task_id} is pending in SQLite but absent from Redis")
-            item_status = "completed" if status == "completed" else "submitted"
+            item_status = batch_item_status_from_create_result(result, queue)
             conn.execute(
                 """
                 UPDATE batch_items

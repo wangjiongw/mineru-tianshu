@@ -19,6 +19,13 @@ SPEC.loader.exec_module(runner)
 import manage_oa_batches as batches
 
 
+@pytest.fixture(autouse=True)
+def reset_stop_flag():
+    runner._STOP = False
+    yield
+    runner._STOP = False
+
+
 def make_args(tmp_path: Path, *, apply: bool = False, once: bool = True) -> SimpleNamespace:
     inventory = tmp_path / "inventory" / "oa.sqlite3"
     return SimpleNamespace(
@@ -225,3 +232,81 @@ def test_health_gate_uses_sample_safe_checks_not_overall_passed(tmp_path, monkey
 
     assert ok is True
     assert details["checks"]["hbm_max_lt_98_percent"]["passed"] is True
+
+
+
+def test_dry_run_opens_inventory_read_only_without_schema_init(tmp_path, monkeypatch):
+    args = make_args(tmp_path, apply=False, once=True)
+    setup_inventory(args, [("a" * 64, "oa-g001-b00001", "prepared", 0, 0, 0)])
+    monkeypatch.setattr(runner.batches, "connect_inventory", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("write connection used")))
+    real_connect = runner.sqlite3.connect
+    calls = []
+
+    def spy_connect(database, *args_, **kwargs):
+        calls.append((database, kwargs.copy()))
+        return real_connect(database, *args_, **kwargs)
+
+    monkeypatch.setattr(runner.sqlite3, "connect", spy_connect)
+
+    rc = runner.run_loop(args, health_check=healthy)
+
+    assert rc == 0
+    assert any(str(database).startswith(f"file:{args.inventory}") and "mode=ro" in str(database) and kwargs.get("uri") is True for database, kwargs in calls)
+
+
+def test_initial_refresh_runs_under_runner_lock(tmp_path, monkeypatch):
+    args = make_args(tmp_path, apply=True, once=True)
+    args.initial_refresh = True
+    conn = batches.connect_inventory(args.inventory)
+    conn.close()
+    lock_checked = []
+
+    def locked_full_refresh(_args):
+        import fcntl
+
+        with args.lock_file.open("a+", encoding="utf-8") as handle:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_checked.append(True)
+        return {}
+
+    monkeypatch.setattr(runner, "full_refresh", locked_full_refresh)
+
+    rc = runner.run_loop(args, health_check=healthy)
+
+    assert rc == 0
+    assert lock_checked == [True]
+
+
+def test_stop_after_health_gate_prevents_submit(tmp_path, monkeypatch):
+    args = make_args(tmp_path, apply=True, once=True)
+    setup_inventory(args, [("a" * 64, "oa-g001-b00001", "prepared", 0, 0, 0)])
+    monkeypatch.setattr(runner, "submit", lambda *_args: (_ for _ in ()).throw(AssertionError("submit called after stop")))
+
+    def stop_after_health(_args):
+        runner._STOP = True
+        return True, healthy(_args)[1]
+
+    rc = runner.run_loop(args, health_check=stop_after_health)
+    checkpoint = __import__("json").loads(args.checkpoint.read_text(encoding="utf-8"))
+
+    assert rc == 130
+    assert checkpoint["stop_reason"] == "signal"
+
+
+def test_stop_after_fast_refresh_prevents_retry_submit(tmp_path, monkeypatch):
+    args = make_args(tmp_path, apply=True, once=True)
+    setup_inventory(args, [("a" * 64, "oa-g001-b00001", "partial", 0, 0, 1)])
+    monkeypatch.setattr(runner, "submit", lambda *_args: (_ for _ in ()).throw(AssertionError("submit called after stop")))
+
+    def stop_after_refresh(_conn, _args, _batch_key):
+        runner._STOP = True
+        return {}
+
+    monkeypatch.setattr(runner, "fast_refresh", stop_after_refresh)
+
+    rc = runner.run_loop(args, health_check=healthy)
+    checkpoint = __import__("json").loads(args.checkpoint.read_text(encoding="utf-8"))
+
+    assert rc == 130
+    assert checkpoint["current_batch"]["batch_key"] == "oa-g001-b00001"

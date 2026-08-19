@@ -337,3 +337,219 @@ def test_refresh_batch_from_task_db_only_updates_selected_batch(tmp_path, monkey
     assert report["batch_refresh"]["updated"] == 1
     assert first == "completed_db_unsynced"
     assert second == "queued"
+
+
+
+def test_submit_batch_keeps_item_error_when_create_task_reports_enqueue_failure(tmp_path, monkeypatch):
+    inventory = tmp_path / "inventory" / "oa.sqlite3"
+    source = tmp_path / "source"
+    legacy = tmp_path / "legacy.json"
+    conn = module.connect_inventory(inventory)
+    sha = "e" * 64
+    insert_document(conn, sha, make_source(source, sha), "failed_retryable")
+    insert_batch(conn, "oa-g001-b00001", [sha], item_status="error")
+
+    class FakeTaskDB:
+        def create_task(self, **_kwargs):
+            return {
+                "task_id": "failed-task",
+                "status": "failed",
+                "retry_info": {"enqueue_failed_task_ids": ["failed-task"]},
+            }
+
+    class FakeRedis:
+        def get(self, _key):
+            return b"paused"
+
+        def zcard(self, _key):
+            return 0
+
+    fake_queue = SimpleNamespace(
+        client=FakeRedis(),
+        config=SimpleNamespace(claim_pause_key="pause", queue_key="queue", processing_key="processing"),
+    )
+    monkeypatch.setattr(module, "load_task_db_api", lambda _args: (FakeTaskDB(), fake_queue))
+    args = SimpleNamespace(
+        batch_key="oa-g001-b00001",
+        allow_live_claims=False,
+        limit=None,
+        high_watermark=5000,
+        priority=0,
+    )
+
+    module.submit_batch(conn, inventory, legacy, source, args)
+    item = conn.execute("SELECT item_status,task_id,submit_error FROM batch_items WHERE sha256=?", (sha,)).fetchone()
+    doc = conn.execute("SELECT state,db_status,last_submit_error FROM documents WHERE sha256=?", (sha,)).fetchone()
+    conn.close()
+
+    assert item["item_status"] == "error"
+    assert item["task_id"] == f"task-{sha[-8:]}"
+    assert "enqueue failed" in item["submit_error"]
+    assert doc["state"] == "failed_retryable"
+    assert doc["db_status"] is None
+    assert "enqueue failed" in doc["last_submit_error"]
+
+
+
+def test_submit_batch_accepts_split_processing_when_requeued_children_are_live(tmp_path, monkeypatch):
+    inventory = tmp_path / "inventory" / "oa.sqlite3"
+    source = tmp_path / "source"
+    legacy = tmp_path / "legacy.json"
+    conn = module.connect_inventory(inventory)
+    sha = "f" * 64
+    insert_document(conn, sha, make_source(source, sha), "failed_retryable")
+    insert_batch(conn, "oa-g001-b00001", [sha], item_status="error")
+
+    class FakeTaskDB:
+        def create_task(self, **_kwargs):
+            return {
+                "task_id": "parent-task",
+                "status": "processing",
+                "retry_info": {
+                    "mode": "split_children_requeued",
+                    "requeued_task_ids": ["child-1", "child-2"],
+                    "enqueue_failed_task_ids": [],
+                },
+            }
+
+    class FakeRedis:
+        def get(self, _key):
+            return b"paused"
+
+        def zcard(self, _key):
+            return 0
+
+        def zscore(self, _key, task_id):
+            return 1.0 if task_id in {"child-1", "child-2"} else None
+
+        def hget(self, _key, _task_id):
+            return None
+
+    fake_queue = SimpleNamespace(
+        client=FakeRedis(),
+        config=SimpleNamespace(claim_pause_key="pause", queue_key="queue", processing_key="processing"),
+    )
+    monkeypatch.setattr(module, "load_task_db_api", lambda _args: (FakeTaskDB(), fake_queue))
+    args = SimpleNamespace(batch_key="oa-g001-b00001", allow_live_claims=False, limit=None, high_watermark=5000, priority=0)
+
+    module.submit_batch(conn, inventory, legacy, source, args)
+    item = conn.execute("SELECT item_status,task_id,submit_error FROM batch_items WHERE sha256=?", (sha,)).fetchone()
+    doc = conn.execute("SELECT state,db_status,last_submit_error FROM documents WHERE sha256=?", (sha,)).fetchone()
+    conn.close()
+
+    assert item["item_status"] == "submitted"
+    assert item["task_id"] == "parent-task"
+    assert item["submit_error"] is None
+    assert doc["state"] == "queued"
+    assert doc["db_status"] == "processing"
+    assert doc["last_submit_error"] is None
+
+
+def test_submit_batch_rejects_split_processing_when_requeued_child_is_missing(tmp_path, monkeypatch):
+    inventory = tmp_path / "inventory" / "oa.sqlite3"
+    source = tmp_path / "source"
+    legacy = tmp_path / "legacy.json"
+    conn = module.connect_inventory(inventory)
+    sha = "1" * 64
+    insert_document(conn, sha, make_source(source, sha), "failed_retryable")
+    insert_batch(conn, "oa-g001-b00001", [sha], item_status="error")
+
+    class FakeTaskDB:
+        def create_task(self, **_kwargs):
+            return {
+                "task_id": "parent-task",
+                "status": "processing",
+                "retry_info": {
+                    "mode": "split_ready_to_merge",
+                    "requeued_task_ids": ["child-1", "child-missing"],
+                    "enqueue_failed_task_ids": [],
+                },
+            }
+
+    class FakeRedis:
+        def get(self, _key):
+            return b"paused"
+
+        def zcard(self, _key):
+            return 0
+
+        def zscore(self, _key, task_id):
+            return 1.0 if task_id == "child-1" else None
+
+        def hget(self, _key, _task_id):
+            return None
+
+    fake_queue = SimpleNamespace(
+        client=FakeRedis(),
+        config=SimpleNamespace(claim_pause_key="pause", queue_key="queue", processing_key="processing"),
+    )
+    monkeypatch.setattr(module, "load_task_db_api", lambda _args: (FakeTaskDB(), fake_queue))
+    args = SimpleNamespace(batch_key="oa-g001-b00001", allow_live_claims=False, limit=None, high_watermark=5000, priority=0)
+
+    module.submit_batch(conn, inventory, legacy, source, args)
+    item = conn.execute("SELECT item_status,task_id,submit_error FROM batch_items WHERE sha256=?", (sha,)).fetchone()
+    doc = conn.execute("SELECT state,db_status,last_submit_error FROM documents WHERE sha256=?", (sha,)).fetchone()
+    conn.close()
+
+    assert item["item_status"] == "error"
+    assert item["task_id"] == f"task-{sha[-8:]}"
+    assert "child-missing" in item["submit_error"]
+    assert doc["state"] == "failed_retryable"
+    assert doc["db_status"] is None
+    assert "child-missing" in doc["last_submit_error"]
+
+
+
+@pytest.mark.parametrize("mode", ["split_ready_to_merge", "split_awaiting_children"])
+def test_submit_batch_accepts_split_processing_modes_with_empty_requeued_children(tmp_path, monkeypatch, mode):
+    inventory = tmp_path / "inventory" / "oa.sqlite3"
+    source = tmp_path / "source"
+    legacy = tmp_path / "legacy.json"
+    conn = module.connect_inventory(inventory)
+    sha = "2" * 64 if mode == "split_ready_to_merge" else "3" * 64
+    insert_document(conn, sha, make_source(source, sha), "failed_retryable")
+    insert_batch(conn, "oa-g001-b00001", [sha], item_status="error")
+
+    class FakeTaskDB:
+        def create_task(self, **_kwargs):
+            return {
+                "task_id": "parent-task",
+                "status": "processing",
+                "retry_info": {
+                    "mode": mode,
+                    "requeued_task_ids": [],
+                    "enqueue_failed_task_ids": [],
+                },
+            }
+
+    class FakeRedis:
+        def get(self, _key):
+            return b"paused"
+
+        def zcard(self, _key):
+            return 0
+
+        def zscore(self, _key, _task_id):
+            return None
+
+        def hget(self, _key, _task_id):
+            return None
+
+    fake_queue = SimpleNamespace(
+        client=FakeRedis(),
+        config=SimpleNamespace(claim_pause_key="pause", queue_key="queue", processing_key="processing"),
+    )
+    monkeypatch.setattr(module, "load_task_db_api", lambda _args: (FakeTaskDB(), fake_queue))
+    args = SimpleNamespace(batch_key="oa-g001-b00001", allow_live_claims=False, limit=None, high_watermark=5000, priority=0)
+
+    module.submit_batch(conn, inventory, legacy, source, args)
+    item = conn.execute("SELECT item_status,task_id,submit_error FROM batch_items WHERE sha256=?", (sha,)).fetchone()
+    doc = conn.execute("SELECT state,db_status,last_submit_error FROM documents WHERE sha256=?", (sha,)).fetchone()
+    conn.close()
+
+    assert item["item_status"] == "submitted"
+    assert item["task_id"] == "parent-task"
+    assert item["submit_error"] is None
+    assert doc["state"] == "queued"
+    assert doc["db_status"] == "processing"
+    assert doc["last_submit_error"] is None

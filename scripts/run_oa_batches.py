@@ -9,7 +9,6 @@ import json
 import os
 import signal
 import sqlite3
-import sys
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -72,6 +71,19 @@ def emit(event: str, **fields: Any) -> None:
     print(json.dumps({"time": utc_now(), "event": event, **fields}, ensure_ascii=False, sort_keys=True), flush=True)
 
 
+
+def connect_inventory_read_only(path: Path) -> sqlite3.Connection:
+    uri = f"file:{path}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def open_inventory_for_run(args: argparse.Namespace) -> sqlite3.Connection:
+    if args.apply:
+        return batches.connect_inventory(args.inventory)
+    return connect_inventory_read_only(args.inventory)
+
 def get_batch(conn: sqlite3.Connection, batch_key: str) -> dict[str, Any] | None:
     row = conn.execute("SELECT * FROM batches WHERE batch_key=?", (batch_key,)).fetchone()
     return dict(row) if row else None
@@ -103,6 +115,14 @@ def checkpoint_payload(args: argparse.Namespace, *, action: str, stop_reason: st
 def write_checkpoint(args: argparse.Namespace, *, action: str, stop_reason: str | None = None, batch: dict[str, Any] | None = None, errors: int = 0) -> None:
     atomic_write_json(args.checkpoint, checkpoint_payload(args, action=action, stop_reason=stop_reason, batch=batch, errors=errors))
 
+
+
+def stop_requested(args: argparse.Namespace, *, batch: dict[str, Any] | None = None, errors: int = 0) -> bool:
+    if not _STOP:
+        return False
+    write_checkpoint(args, action="stopped", stop_reason="signal", batch=batch, errors=errors)
+    emit("stop", reason="signal")
+    return True
 
 def health_gate(args: argparse.Namespace) -> tuple[bool, dict[str, Any]]:
     report = efficiency.run_evaluation(
@@ -182,18 +202,18 @@ def submit(conn: sqlite3.Connection, args: argparse.Namespace, batch_key: str) -
 def run_loop(args: argparse.Namespace, health_check: Callable[[argparse.Namespace], tuple[bool, dict[str, Any]]] = health_gate) -> int:
     install_signal_handlers()
     health_failures = 0
-    if args.initial_refresh and args.apply:
-        emit("full_refresh_start")
-        full_refresh(args)
-        emit("full_refresh_done")
     with runner_lock(args.lock_file):
         write_checkpoint(args, action="started")
-        conn = batches.connect_inventory(args.inventory)
+        if args.initial_refresh and args.apply:
+            emit("full_refresh_start")
+            full_refresh(args)
+            if stop_requested(args, errors=health_failures):
+                return 130
+            emit("full_refresh_done")
+        conn = open_inventory_for_run(args)
         try:
             while True:
-                if _STOP:
-                    write_checkpoint(args, action="stopped", stop_reason="signal", errors=health_failures)
-                    emit("stop", reason="signal")
+                if stop_requested(args, errors=health_failures):
                     return 130
 
                 batch = first_batch(conn, ACTIVE_BATCH_STATES)
@@ -201,6 +221,8 @@ def run_loop(args: argparse.Namespace, health_check: Callable[[argparse.Namespac
                     if args.apply:
                         fast_refresh(conn, args, batch["batch_key"])
                         batch = get_batch(conn, batch["batch_key"])
+                        if stop_requested(args, batch=batch, errors=health_failures):
+                            return 130
                     if batch and batch["status"] in TERMINAL_BATCH_STATES:
                         emit("batch_terminal", batch_key=batch["batch_key"], status=batch["status"], failed_count=batch["failed_count"])
                         write_checkpoint(args, action="batch_terminal", batch=batch, errors=health_failures)
@@ -226,6 +248,9 @@ def run_loop(args: argparse.Namespace, health_check: Callable[[argparse.Namespac
                         emit("complete", reason="no_remaining_batches")
                         return 0
 
+                if stop_requested(args, batch=target, errors=health_failures):
+                    return 130
+
                 if target["failed_count"] > args.max_batch_errors:
                     write_checkpoint(args, action="stopped", stop_reason="batch_error_threshold", batch=target, errors=health_failures)
                     emit("stop", reason="batch_error_threshold", batch_key=target["batch_key"], failed_count=target["failed_count"])
@@ -243,6 +268,8 @@ def run_loop(args: argparse.Namespace, health_check: Callable[[argparse.Namespac
                         return 3
                     time.sleep(args.poll_seconds)
                     continue
+                if stop_requested(args, batch=target, errors=health_failures):
+                    return 130
                 health_failures = 0
 
                 if not args.apply:
@@ -250,6 +277,8 @@ def run_loop(args: argparse.Namespace, health_check: Callable[[argparse.Namespac
                     emit("dry_run_submit", batch_key=target["batch_key"], status=target["status"], item_count=target["item_count"])
                     return 0
 
+                if stop_requested(args, batch=target, errors=health_failures):
+                    return 130
                 emit("submit_start", batch_key=target["batch_key"], status=target["status"])
                 try:
                     submit(conn, args, target["batch_key"])
