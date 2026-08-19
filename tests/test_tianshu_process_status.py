@@ -449,6 +449,66 @@ class TianshuProcessStatusTests(unittest.TestCase):
         self.assertIn('supervisor restarting owned pair after ${backoff}s', implementation)
         self.assertIn('SUPERVISOR_MAX_BACKOFF', implementation)
 
+    def test_compute_supervisor_probes_vllm_and_worker_health(self) -> None:
+        text = SCRIPT.read_text()
+        start = text.index("supervise_compute_instance()")
+        end = text.index("cmd_supervise()", start)
+        implementation = text[start:end]
+
+        self.assertIn('vllm_http_healthy "$i"', implementation)
+        self.assertIn('worker_http_healthy "$i"', implementation)
+        self.assertIn('COMPUTE_SUPERVISOR_HEALTH_FAILURE_THRESHOLD', implementation)
+        self.assertIn('consecutive health probe failures', implementation)
+
+    def test_compute_supervisor_emits_periodic_heartbeat(self) -> None:
+        text = SCRIPT.read_text()
+        start = text.index("supervise_compute_instance()")
+        end = text.index("cmd_supervise()", start)
+        implementation = text[start:end]
+
+        self.assertIn('COMPUTE_SUPERVISOR_HEARTBEAT_SECONDS', implementation)
+        self.assertIn('supervisor heartbeat: VLLM PID', implementation)
+
+    def test_compute_health_probes_are_bounded_http_requests(self) -> None:
+        text = SCRIPT.read_text()
+        ready_start = text.index("vllm_http_ready()")
+        healthy_start = text.index("vllm_http_healthy()", ready_start)
+        vllm_end = text.index("vllm_is_running()", healthy_start)
+        ready_probe = text[ready_start:healthy_start]
+        healthy_probe = text[healthy_start:vllm_end]
+        worker_start = text.index("worker_http_healthy()")
+        worker_end = text.index("check_worker_dependencies()", worker_start)
+        worker_probe = text[worker_start:worker_end]
+
+        self.assertIn('curl -fsS --max-time "$timeout"', ready_probe)
+        self.assertIn('/v1/models', ready_probe)
+        self.assertIn('curl -fsS --max-time "$timeout"', healthy_probe)
+        self.assertIn('/health', healthy_probe)
+        self.assertIn('curl -fsS --max-time "$timeout"', worker_probe)
+        self.assertIn('/health', worker_probe)
+
+    def test_compute_health_probes_target_assigned_ports(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            calls = tmp_path / "curl-calls"
+            result = run_bash(
+                f'curl() {{ printf "%s\\n" "$*" >> "{calls}"; }}; '
+                'vllm_http_ready 2 7; vllm_http_healthy 2 7; worker_http_healthy 2 7',
+                tmp_path,
+            )
+
+            recorded = calls.read_text().splitlines()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            recorded,
+            [
+                "-fsS --max-time 7 http://localhost:30027/v1/models",
+                "-fsS --max-time 7 http://localhost:30027/health",
+                "-fsS --max-time 7 http://localhost:8103/health",
+            ],
+        )
+
     def test_compute_supervisor_requires_explicit_safe_replacement(self) -> None:
         text = SCRIPT.read_text()
         start = text.index("supervise_compute_instance()")
@@ -466,11 +526,27 @@ class TianshuProcessStatusTests(unittest.TestCase):
             implementation.index('stop_vllm_instance "$i"'),
         )
 
+    def test_node_supervisor_owns_control_and_all_compute_supervisors(self) -> None:
+        text = SCRIPT.read_text()
+        start = text.index("supervise_node()")
+        end = text.index("supervise_compute_instance()", start)
+        implementation = text[start:end]
+
+        self.assertIn('start_redis', implementation)
+        self.assertIn('start_api', implementation)
+        self.assertIn('cmd_supervise control &', implementation)
+        self.assertIn('supervise_compute_instance "$i" &', implementation)
+        self.assertIn('while [ "$i" -lt "$VLLM_NUM_INSTANCES" ]', implementation)
+        self.assertIn('wait -n', implementation)
+        self.assertIn('cleanup_node_supervisor', implementation)
+
     def test_supervise_cli_routes_compute_instance(self) -> None:
         text = SCRIPT.read_text()
 
         self.assertIn('supervise) cmd_supervise "$2" "$3"', text)
         self.assertIn('supervise_compute_instance "$instance_index"', text)
+        self.assertIn('supervise_node', text)
+        self.assertIn('control|compute|node', text)
 
     def test_rustfs_upload_is_disabled_by_default_but_overridable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -533,6 +609,185 @@ class TianshuProcessStatusTests(unittest.TestCase):
         self.assertIn('bash "$TIANSHU_SCRIPT" start worker "$idx"', text)
         self.assertNotIn('bash "$TIANSHU_SCRIPT" start worker >>', text)
         self.assertNotIn('pkill -f "litserve_worker.py', text)
+
+
+    def test_worker_runtime_config_is_persisted_and_read_without_sourcing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config_dir = tmp_path / "runtime_config"
+            result = run_bash(
+                f'RUNTIME_CONFIG_DIR="{config_dir}"; '
+                'configure_worker_instance 2 --hybrid-batch-ratio 8 --max-concurrent-tasks 12; '
+                'worker_hybrid_batch_ratio_for 2; '
+                'worker_max_concurrent_tasks_for 2',
+                tmp_path,
+            )
+            config_text = (config_dir / "worker_2.env").read_text().splitlines()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(config_text, ["MINERU_HYBRID_BATCH_RATIO=8", "MAX_CONCURRENT_TASKS=12"])
+        self.assertEqual(result.stdout.splitlines()[-2:], ["8", "12"])
+
+    def test_worker_runtime_config_rejects_invalid_values_and_unknown_cli_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config_dir = tmp_path / "runtime_config"
+            bad_ratio = run_bash(
+                f'RUNTIME_CONFIG_DIR="{config_dir}" configure_worker_instance 2 --hybrid-batch-ratio 3 --max-concurrent-tasks 12',
+                tmp_path,
+            )
+            bad_tasks = run_bash(
+                f'RUNTIME_CONFIG_DIR="{config_dir}" configure_worker_instance 2 --hybrid-batch-ratio 4 --max-concurrent-tasks 17',
+                tmp_path,
+            )
+            bad_flag = run_bash(
+                f'RUNTIME_CONFIG_DIR="{config_dir}" configure_worker_instance 2 --hybrid-batch-ratio 4 --source /tmp/x --max-concurrent-tasks 8',
+                tmp_path,
+            )
+
+        self.assertNotEqual(bad_ratio.returncode, 0)
+        self.assertNotEqual(bad_tasks.returncode, 0)
+        self.assertNotEqual(bad_flag.returncode, 0)
+        self.assertFalse((config_dir / "worker_2.env").exists())
+
+    def test_worker_runtime_config_parser_whitelists_keys_without_source_or_eval(self) -> None:
+        text = SCRIPT.read_text()
+        start = text.index("worker_runtime_config_value()")
+        end = text.index("worker_hybrid_batch_ratio_for()", start)
+        implementation = text[start:end]
+
+        self.assertIn('MINERU_HYBRID_BATCH_RATIO|MAX_CONCURRENT_TASKS', implementation)
+        self.assertNotIn('source "$', implementation)
+        self.assertNotIn('eval ', implementation)
+
+    def test_worker_start_exports_runtime_tuning_and_logs_revision(self) -> None:
+        text = SCRIPT.read_text()
+        start = text.index("start_worker_instance()")
+        end = text.index("start_workers()", start)
+        implementation = text[start:end]
+
+        self.assertIn('worker_hybrid_display="auto"', implementation)
+        self.assertIn('worker_hybrid_env=(env -u MINERU_HYBRID_BATCH_RATIO)', implementation)
+        self.assertIn('worker_hybrid_env=(env "MINERU_HYBRID_BATCH_RATIO=$worker_hybrid_ratio")', implementation)
+        self.assertIn('worker_config_revision="$(worker_config_revision_for "$i")"', implementation)
+        self.assertIn('MAX_CONCURRENT_TASKS="$worker_max_tasks"', implementation)
+        self.assertIn('"${worker_hybrid_env[@]}" nohup', implementation)
+        self.assertIn('config_revision=${worker_config_revision}', implementation)
+
+
+    def test_worker_start_unsets_hybrid_ratio_when_auto(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            runtime_dir = tmp_path / "runtime"
+            worker_dir = tmp_path / "worker"
+            env_capture = tmp_path / "env-capture"
+            worker_dir.mkdir()
+            result = run_bash(
+                f'WORKER_RUNTIME_DIR="{runtime_dir}" WORKER_LOG_DIR="{worker_dir}"; '
+                f'RUNTIME_CONFIG_DIR="{tmp_path / "runtime_config"}"; '
+                f'env() {{ printf "%s\\n" "$*" > "{env_capture}"; }}; '
+                'check_worker_dependencies() { return 0; }; '
+                'worker_is_running() { [ -f "$(worker_pid_file 2)" ]; }; '
+                'sleep() { :; }; '
+                'start_worker_instance 2; '
+                f'for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "{env_capture}" ] && break; /bin/sleep 0.05; done',
+                tmp_path,
+            )
+            captured_env = env_capture.read_text()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('hybrid_batch_ratio=auto', result.stdout)
+        self.assertIn('-u MINERU_HYBRID_BATCH_RATIO nohup', captured_env)
+
+    def test_compute_supervisor_running_requires_matching_supervise_compute_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            runtime_dir = tmp_path / "runtime"
+            runtime_dir.mkdir()
+            fake_proc(tmp_path, 501, "S", ["bash", "scripts/tianshu.sh", "supervise", "compute", "3"])
+            fake_proc(tmp_path, 502, "S", ["bash", "scripts/tianshu.sh", "supervise", "compute", "4"])
+            ok = run_bash(
+                f'WORKER_RUNTIME_DIR="{runtime_dir}"; printf "501\n" > "$(compute_supervisor_pid_file 3)"; compute_supervisor_is_running 3',
+                tmp_path,
+            )
+            wrong_index = run_bash(
+                f'WORKER_RUNTIME_DIR="{runtime_dir}"; printf "502\n" > "$(compute_supervisor_pid_file 3)"; compute_supervisor_is_running 3',
+                tmp_path,
+            )
+
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(wrong_index.returncode, 1)
+
+    def test_restart_worker_uses_supervisor_request_when_compute_supervisor_is_running(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            result = run_bash(
+                'compute_supervisor_is_running() { return 0; }; '
+                'request_supervised_worker_restart() { echo "request:$1:$2"; }; '
+                'drain_worker_instance() { echo drain; }; '
+                'stop_worker_instance() { echo stop; }; '
+                'start_worker_instance() { echo start; }; '
+                'restart_worker_instance 3 --force',
+                tmp_path,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("request:3:--force", result.stdout)
+        self.assertNotIn("drain", result.stdout)
+        self.assertNotIn("stop", result.stdout)
+        self.assertNotIn("start", result.stdout)
+
+    def test_supervised_worker_restart_handler_restarts_worker_without_stopping_vllm(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            runtime_dir = tmp_path / "runtime"
+            worker_dir = tmp_path / "worker"
+            worker_dir.mkdir()
+            request = runtime_dir / "worker_3.restart.request"
+            runtime_dir.mkdir()
+            request.write_text("rev1\n--force\n123\n")
+            result = run_bash(
+                f'WORKER_RUNTIME_DIR="{runtime_dir}" WORKER_LOG_DIR="{worker_dir}"; '
+                'vllm_pid=777; worker_pid=111; '
+                'drain_worker_instance() { echo drain; return 2; }; '
+                'stop_worker_instance() { echo stop_worker; }; '
+                'start_worker_instance() { echo start_worker; printf "222\n" > "$(worker_pid_file 3)"; }; '
+                'stop_vllm_instance() { echo stop_vllm; }; '
+                'start_vllm_instance() { echo start_vllm; }; '
+                'handle_supervised_worker_restart_request 3; printf "worker_pid=%s\n" "$worker_pid"',
+                tmp_path,
+            )
+            ack = (runtime_dir / "worker_3.restart.ack").read_text().splitlines()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("drain", result.stdout)
+        self.assertIn("stop_worker", result.stdout)
+        self.assertIn("start_worker", result.stdout)
+        self.assertIn("worker_pid=222", result.stdout)
+        self.assertNotIn("stop_vllm", result.stdout)
+        self.assertNotIn("start_vllm", result.stdout)
+        self.assertEqual(ack[:2], ["rev1", "ok"])
+
+    def test_reconciler_hook_is_valid_and_limited_to_control_supervise(self) -> None:
+        text = SCRIPT.read_text()
+        start = text.index("run_parent_merge_reconciler()")
+        end = text.index("cmd_configure()", start)
+        implementation = text[start:end]
+        cmd_start = text[text.index("cmd_start()"):text.index("cmd_stop()")]
+        cmd_stop = text[text.index("cmd_stop()"):text.index("cmd_restart()")]
+        cmd_status = text[text.index("cmd_status()"):text.index("cmd_logs()")]
+        cmd_supervise = text[text.index("cmd_supervise()"):text.index("cmd_status()")]
+
+        self.assertIn('reconcile_parent_merges.py', implementation)
+        self.assertIn('args=(--report-json)', implementation)
+        self.assertIn('args+=(--apply)', implementation)
+        self.assertIn('PARENT_MERGE_RECONCILE_APPLY:-false', implementation)
+        self.assertNotIn('--lifecycle', implementation)
+        self.assertNotIn('--apply "$apply"', implementation)
+        self.assertNotIn('run_parent_merge_reconciler', cmd_start)
+        self.assertNotIn('run_parent_merge_reconciler', cmd_stop)
+        self.assertNotIn('run_parent_merge_reconciler', cmd_status)
+        self.assertIn('run_parent_merge_reconciler', cmd_supervise)
 
 
 if __name__ == "__main__":

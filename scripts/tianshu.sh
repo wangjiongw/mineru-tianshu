@@ -34,6 +34,11 @@ VLLM_PERFORMANCE_MODE="${VLLM_PERFORMANCE_MODE:-throughput}" # 吞吐模式实�
 VLLM_MAX_NUM_BATCHED_TOKENS="${VLLM_MAX_NUM_BATCHED_TOKENS:-4096}" # 8192 实测降低 PDF 吞吐，保留 4096
 #                                                                # hybrid/VLM 推理走本卡 vLLM；0.60 + c8 在 10 分钟压力下 0 OOM/0 preemption
 VLLM_READY_TIMEOUT="${VLLM_READY_TIMEOUT:-900}"   # vllm 健康检查总超时(秒);首次含 NPU kernel 编译,默认 15min,可调大
+SUPERVISOR_HEALTH_PROBE_TIMEOUT_SECONDS="${SUPERVISOR_HEALTH_PROBE_TIMEOUT_SECONDS:-5}"
+COMPUTE_SUPERVISOR_POLL_SECONDS="${COMPUTE_SUPERVISOR_POLL_SECONDS:-5}"
+COMPUTE_SUPERVISOR_HEALTH_INTERVAL_SECONDS="${COMPUTE_SUPERVISOR_HEALTH_INTERVAL_SECONDS:-15}"
+COMPUTE_SUPERVISOR_HEALTH_FAILURE_THRESHOLD="${COMPUTE_SUPERVISOR_HEALTH_FAILURE_THRESHOLD:-3}"
+COMPUTE_SUPERVISOR_HEARTBEAT_SECONDS="${COMPUTE_SUPERVISOR_HEARTBEAT_SECONDS:-300}"
 # 锁定 vllm 可执行文件到绝对路径:其 shebang 指向 /usr/local/python3.11.15/bin/python3,
 # 独立于当前 shell 的 PATH 与默认 python(默认 python 仍保持 conda mineru 环境)。
 # 避免 PATH 漂移导致不同实例加载不同版本的 vllm_ascend —— 例如 conda mineru 环境里的
@@ -73,6 +78,7 @@ DATABASE_PATH="${INSTANCE_DATA_DIR}/mineru_tianshu.db"
 OUTPUT_PATH="${INSTANCE_DATA_DIR}/mineru_outputs"
 UPLOAD_PATH="${INSTANCE_DATA_DIR}/mineru_uploads"
 LOG_DIR="${INSTANCE_DATA_DIR}/mineru_logs"
+RUNTIME_CONFIG_DIR="${RUNTIME_CONFIG_DIR:-${INSTANCE_DATA_DIR}/runtime_config}"
 # Triton kernel JIT 编译缓存根目录(按实例隔离)。
 # 每个 vLLM 实例分配独立子目录(npu0, npu1, ...)，避免多实例并发编译同一 kernel 时
 # 在共享缓存目录产生临时目录清理竞态(MLIRCompilationError: [Errno 39] Directory not empty)。
@@ -100,6 +106,7 @@ WORKER_LOG_DIR="${LOG_DIR}/worker"
 API_LOG_DIR="${LOG_DIR}/api"
 SCHEDULER_LOG_DIR="${LOG_DIR}/scheduler"
 WORKER_RUNTIME_DIR="${WORKER_RUNTIME_DIR:-/tmp/mineru_tianshu/${INSTANCE_ID}}"
+SUPERVISED_WORKER_RESTART_TIMEOUT_SECONDS="${SUPERVISED_WORKER_RESTART_TIMEOUT_SECONDS:-600}"
 
 # Redis 队列配置
 REDIS_QUEUE_ENABLED="true"
@@ -252,7 +259,7 @@ terminate_pid_file() {
 
 init_dirs() {
     mkdir -p "$VLLM_LOG_DIR" "$WORKER_LOG_DIR" "$API_LOG_DIR" "$SCHEDULER_LOG_DIR" \
-             "$OUTPUT_PATH" "$UPLOAD_PATH" \
+             "$RUNTIME_CONFIG_DIR" "$OUTPUT_PATH" "$UPLOAD_PATH" \
              "${PROJECT_ROOT}/data/db" "${PROJECT_ROOT}/models"
 }
 
@@ -401,8 +408,90 @@ vllm_max_num_batched_tokens_for() {
     indexed_env_value "VLLM_MAX_NUM_BATCHED_TOKENS_NPU" "$1" "$VLLM_MAX_NUM_BATCHED_TOKENS"
 }
 
+worker_runtime_config_file() { echo "${RUNTIME_CONFIG_DIR}/worker_${1}.env"; }
+
+worker_config_revision_for() {
+    local config_file
+    config_file="$(worker_runtime_config_file "$1")"
+    [ -f "$config_file" ] || { echo "none"; return 0; }
+    cksum "$config_file" 2>/dev/null | awk '{print $1}'
+}
+
+worker_runtime_config_value() {
+    local index="$1"
+    local wanted="$2"
+    local config_file name value
+    config_file="$(worker_runtime_config_file "$index")"
+    [ -f "$config_file" ] || return 1
+    while IFS="=" read -r name value; do
+        case "$name" in
+            MINERU_HYBRID_BATCH_RATIO|MAX_CONCURRENT_TASKS) ;;
+            *) continue ;;
+        esac
+        [ "$name" = "$wanted" ] || continue
+        case "$name:$value" in
+            MINERU_HYBRID_BATCH_RATIO:1|MINERU_HYBRID_BATCH_RATIO:2|MINERU_HYBRID_BATCH_RATIO:4|MINERU_HYBRID_BATCH_RATIO:8) echo "$value"; return 0 ;;
+            MAX_CONCURRENT_TASKS:*)
+                case "$value" in ""|*[!0-9]*) return 1 ;; esac
+                [ "$value" -ge 1 ] && [ "$value" -le 16 ] || return 1
+                echo "$value"
+                return 0
+                ;;
+        esac
+    done < "$config_file"
+    return 1
+}
+
+worker_hybrid_batch_ratio_valid() {
+    case "$1" in 1|2|4|8) return 0 ;; *) return 1 ;; esac
+}
+
+worker_hybrid_batch_ratio_for() {
+    local index="$1"
+    local value
+    if value="$(worker_runtime_config_value "$index" "MINERU_HYBRID_BATCH_RATIO")"; then
+        worker_hybrid_batch_ratio_valid "$value" || return 1
+        echo "$value"
+        return 0
+    fi
+    value="$(indexed_env_value "MINERU_HYBRID_BATCH_RATIO_WORKER" "$index" "${MINERU_HYBRID_BATCH_RATIO:-}")"
+    [ -n "$value" ] || return 1
+    worker_hybrid_batch_ratio_valid "$value" || return 1
+    echo "$value"
+}
+
 worker_max_concurrent_tasks_for() {
-    indexed_env_value "MAX_CONCURRENT_TASKS_WORKER" "$1" "${MAX_CONCURRENT_TASKS:-8}"
+    worker_runtime_config_value "$1" "MAX_CONCURRENT_TASKS" || indexed_env_value "MAX_CONCURRENT_TASKS_WORKER" "$1" "${MAX_CONCURRENT_TASKS:-8}"
+}
+
+configure_worker_instance() {
+    local i="$1"
+    shift || true
+    local ratio=""
+    local max_tasks=""
+    worker_index_valid "$i" || { log_error "无效 Worker 编号: $i"; return 1; }
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --hybrid-batch-ratio) ratio="$2"; shift 2 ;;
+            --max-concurrent-tasks) max_tasks="$2"; shift 2 ;;
+            *) log_error "未知 configure worker 参数: $1"; return 1 ;;
+        esac
+    done
+    case "$ratio" in 1|2|4|8) ;; *) log_error "--hybrid-batch-ratio 仅允许 1|2|4|8"; return 1 ;; esac
+    case "$max_tasks" in ""|*[!0-9]*) log_error "--max-concurrent-tasks 需要 1..16"; return 1 ;; esac
+    [ "$max_tasks" -ge 1 ] && [ "$max_tasks" -le 16 ] || { log_error "--max-concurrent-tasks 需要 1..16"; return 1; }
+
+    mkdir -p "$RUNTIME_CONFIG_DIR"
+    local config_file tmp_file
+    config_file="$(worker_runtime_config_file "$i")"
+    tmp_file="${config_file}.tmp.$$"
+    {
+        printf "MINERU_HYBRID_BATCH_RATIO=%s\n" "$ratio"
+        printf "MAX_CONCURRENT_TASKS=%s\n" "$max_tasks"
+    } > "$tmp_file" || return 1
+    chmod 600 "$tmp_file" 2>/dev/null || true
+    mv "$tmp_file" "$config_file"
+    log_info "Worker #${i} runtime config saved: $config_file (revision $(worker_config_revision_for "$i"))"
 }
 
 vllm_index_valid() {
@@ -416,6 +505,21 @@ vllm_index_valid() {
 vllm_pid_file() { echo "${VLLM_LOG_DIR}/vllm_npu${1}.pid"; }
 vllm_expected_cmd() { echo "vllm.*serve.*${VLLM_MODEL_PATH}"; }
 
+vllm_http_ready() {
+    local index="$1"
+    local timeout="${2:-$SUPERVISOR_HEALTH_PROBE_TIMEOUT_SECONDS}"
+    vllm_index_valid "$index" || return 1
+    local port=$((VLLM_BASE_PORT + index))
+    curl -fsS --max-time "$timeout" "http://localhost:${port}/v1/models" > /dev/null 2>&1
+}
+
+vllm_http_healthy() {
+    local index="$1"
+    local timeout="${2:-$SUPERVISOR_HEALTH_PROBE_TIMEOUT_SECONDS}"
+    vllm_index_valid "$index" || return 1
+    local port=$((VLLM_BASE_PORT + index))
+    curl -fsS --max-time "$timeout" "http://localhost:${port}/health" > /dev/null 2>&1
+}
 
 vllm_is_running() {
     local index="$1"
@@ -426,11 +530,10 @@ vllm_is_running() {
 wait_vllm_instance_ready() {
     local index="$1"
     local timeout="${2:-$VLLM_READY_TIMEOUT}"
-    local port=$((VLLM_BASE_PORT + index))
     local elapsed=0
 
     while [ "$elapsed" -lt "$timeout" ]; do
-        if curl -s "http://localhost:${port}/v1/models" > /dev/null 2>&1; then
+        if vllm_http_ready "$index"; then
             return 0
         fi
         sleep 10
@@ -455,7 +558,7 @@ start_vllm_instance() {
     max_num_batched_tokens="$(vllm_max_num_batched_tokens_for "$i")"
 
     mkdir -p "$VLLM_LOG_DIR"
-    if curl -s "http://localhost:${port}/v1/models" > /dev/null 2>&1; then
+    if vllm_http_ready "$i"; then
         log_info "VLLM #${i} (NPU=${i}, Port=${port}) 已在运行"
         return 0
     fi
@@ -835,6 +938,110 @@ worker_drain_file() { echo "${WORKER_RUNTIME_DIR}/worker_${1}.drain"; }
 worker_activity_dir() { echo "${WORKER_RUNTIME_DIR}/worker_${1}_activity"; }
 worker_disabled_file() { echo "${WORKER_RUNTIME_DIR}/worker_${1}.disabled"; }
 worker_expected_cmd() { echo "python.*litserve_worker.py"; }
+compute_supervisor_expected_cmd() { echo "tianshu.sh[[:space:]]+supervise[[:space:]]+compute[[:space:]]+${1}"; }
+compute_supervisor_pid_file() { echo "${WORKER_RUNTIME_DIR}/compute_${1}.supervisor.pid"; }
+compute_supervisor_heartbeat_file() { echo "${WORKER_RUNTIME_DIR}/compute_${1}.supervisor.heartbeat"; }
+worker_restart_request_file() { echo "${WORKER_RUNTIME_DIR}/worker_${1}.restart.request"; }
+worker_restart_ack_file() { echo "${WORKER_RUNTIME_DIR}/worker_${1}.restart.ack"; }
+
+compute_supervisor_is_running() {
+    local i="$1"
+    local pid_file pid
+    pid_file="$(compute_supervisor_pid_file "$i")"
+    [ -f "$pid_file" ] || return 1
+    pid="$(cat "$pid_file" 2>/dev/null)"
+    pid_matches "$pid" "$(compute_supervisor_expected_cmd "$i")"
+}
+
+write_compute_supervisor_state() {
+    local i="$1"
+    mkdir -p "$WORKER_RUNTIME_DIR"
+    printf "%s\n" "$$" > "$(compute_supervisor_pid_file "$i")"
+    date +%s > "$(compute_supervisor_heartbeat_file "$i")"
+}
+
+write_supervised_worker_restart_ack() {
+    local i="$1"
+    local revision="$2"
+    local status="$3"
+    local message="$4"
+    local ack_file tmp_file
+    ack_file="$(worker_restart_ack_file "$i")"
+    tmp_file="${ack_file}.tmp.$$"
+    {
+        printf "%s\n" "$revision"
+        printf "%s\n" "$status"
+        printf "%s\n" "$(date +%s)"
+        printf "%s\n" "$message"
+    } > "$tmp_file" || return 1
+    mv "$tmp_file" "$ack_file"
+}
+
+request_supervised_worker_restart() {
+    local i="$1"
+    local force="$2"
+    local timeout="${SUPERVISED_WORKER_RESTART_TIMEOUT_SECONDS:-600}"
+    local revision="$(date +%s)-$$"
+    local request_file ack_file tmp_file elapsed ack_revision ack_status
+    request_file="$(worker_restart_request_file "$i")"
+    ack_file="$(worker_restart_ack_file "$i")"
+    mkdir -p "$WORKER_RUNTIME_DIR"
+    rm -f "$ack_file"
+    tmp_file="${request_file}.tmp.$$"
+    {
+        printf "%s\n" "$revision"
+        printf "%s\n" "$force"
+        printf "%s\n" "$(date +%s)"
+    } > "$tmp_file" || return 1
+    mv "$tmp_file" "$request_file"
+    log_info "Worker #${i} restart requested via compute supervisor (revision ${revision})"
+    elapsed=0
+    while [ "$elapsed" -lt "$timeout" ]; do
+        if [ -f "$ack_file" ]; then
+            ack_revision="$(sed -n "1p" "$ack_file" 2>/dev/null)"
+            ack_status="$(sed -n "2p" "$ack_file" 2>/dev/null)"
+            if [ "$ack_revision" = "$revision" ]; then
+                if [ "$ack_status" = "ok" ]; then
+                    log_info "Worker #${i} supervised restart acknowledged (revision ${revision})"
+                    return 0
+                fi
+                log_error "Worker #${i} supervised restart failed (revision ${revision})"
+                return 1
+            fi
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    log_error "Worker #${i} supervised restart timed out after ${timeout}s; no direct fallback attempted"
+    return 1
+}
+
+handle_supervised_worker_restart_request() {
+    local i="$1"
+    local request_file revision force ack_revision
+    request_file="$(worker_restart_request_file "$i")"
+    [ -f "$request_file" ] || return 0
+    revision="$(sed -n "1p" "$request_file" 2>/dev/null)"
+    force="$(sed -n "2p" "$request_file" 2>/dev/null)"
+    [ -n "$revision" ] || return 0
+    if [ -f "$(worker_restart_ack_file "$i")" ]; then
+        ack_revision="$(sed -n "1p" "$(worker_restart_ack_file "$i")" 2>/dev/null)"
+        [ "$ack_revision" = "$revision" ] && return 0
+    fi
+    log_info "Compute #${i} supervisor handling Worker restart request (revision ${revision})"
+    drain_worker_instance "$i" "${DRAIN_WAIT_SECONDS:-300}"
+    local drain_rc=$?
+    if [ "$drain_rc" -ne 0 ] && [ "$force" != "--force" ] && [ "${DRAIN_FORCE_STOP:-false}" != "true" ]; then
+        write_supervised_worker_restart_ack "$i" "$revision" "failed" "drain-not-complete" || true
+        return 0
+    fi
+    stop_worker_instance "$i" || { write_supervised_worker_restart_ack "$i" "$revision" "failed" "stop-failed" || true; return 0; }
+    start_worker_instance "$i" || { write_supervised_worker_restart_ack "$i" "$revision" "failed" "start-failed" || true; return 0; }
+    worker_pid="$(cat "$(worker_pid_file "$i")" 2>/dev/null)"
+    write_supervised_worker_restart_ack "$i" "$revision" "ok" "worker-pid=${worker_pid}" || true
+    log_info "Compute #${i} supervisor restarted Worker PID ${worker_pid} without replacing VLLM PID ${vllm_pid}"
+}
+
 
 worker_vllm_api_list() {
     local index="$1"
@@ -977,11 +1184,19 @@ stop_worker_process_tree() {
     return 0
 }
 
+worker_http_healthy() {
+    local index="$1"
+    local timeout="${2:-$SUPERVISOR_HEALTH_PROBE_TIMEOUT_SECONDS}"
+    worker_index_valid "$index" || return 1
+    local port=$((WORKER_BASE_PORT + index))
+    curl -fsS --max-time "$timeout" "http://localhost:${port}/health" > /dev/null 2>&1
+}
+
 check_worker_dependencies() {
     local index="$1"
     local vllm_port=$((VLLM_BASE_PORT + index))
 
-    if ! curl -s "http://localhost:${vllm_port}/v1/models" > /dev/null 2>&1; then
+    if ! vllm_http_ready "$index"; then
         log_error "VLLM #${index} 未就绪 (端口 ${vllm_port})"
         return 1
     fi
@@ -1004,8 +1219,19 @@ start_worker_instance() {
     local vllm_api="http://localhost:${vllm_port}/v1"
     local vllm_api_list
     local worker_max_tasks
+    local worker_hybrid_ratio=""
+    local worker_hybrid_display="auto"
+    local worker_config_revision
+    local -a worker_hybrid_env
     vllm_api_list="$(worker_vllm_api_list "$i")"
     worker_max_tasks="$(worker_max_concurrent_tasks_for "$i")"
+    if worker_hybrid_ratio="$(worker_hybrid_batch_ratio_for "$i")"; then
+        worker_hybrid_display="$worker_hybrid_ratio"
+        worker_hybrid_env=(env "MINERU_HYBRID_BATCH_RATIO=$worker_hybrid_ratio")
+    else
+        worker_hybrid_env=(env -u MINERU_HYBRID_BATCH_RATIO)
+    fi
+    worker_config_revision="$(worker_config_revision_for "$i")"
     local log_file="${WORKER_LOG_DIR}/worker_${i}_port${port}.log"
     local pid_file
     pid_file="$(worker_pid_file "$i")"
@@ -1019,7 +1245,7 @@ start_worker_instance() {
     find "$(worker_activity_dir "$i")" -mindepth 1 -type f -delete 2>/dev/null || true
     rm -f "$pid_file"
 
-    log_info "启动 Worker #${i}: Port=${port}, VLLM=${vllm_api}"
+    log_info "启动 Worker #${i}: Port=${port}, VLLM=${vllm_api}, hybrid_batch_ratio=${worker_hybrid_display}, max_concurrent_tasks=${worker_max_tasks}, config_revision=${worker_config_revision}"
     cd "$BACKEND_DIR"
 
     DATABASE_PATH="$DATABASE_PATH" \
@@ -1053,7 +1279,7 @@ start_worker_instance() {
     RUSTFS_ENABLED="$RUSTFS_ENABLED" \
     VLLM_DOCKER_CONTROLLER_ENABLED="$VLLM_DOCKER_CONTROLLER_ENABLED" \
     MAX_CONCURRENT_TASKS="$worker_max_tasks" \
-    nohup ${PYTHON_BIN} litserve_worker.py \
+    "${worker_hybrid_env[@]}" nohup ${PYTHON_BIN} litserve_worker.py \
         --accelerator "$WORKER_ACCELERATOR" \
         --port "$port" \
         --workers-per-device 1 \
@@ -1185,6 +1411,11 @@ drain_worker_instance() {
 restart_worker_instance() {
     local i="$1"
     local force="${2:-}"
+    worker_index_valid "$i" || { log_error "无效 Worker 编号: $i"; return 1; }
+    if [ "${SUPERVISOR_RESTART_WORKER_IN_PLACE:-false}" != "true" ] && compute_supervisor_is_running "$i"; then
+        request_supervised_worker_restart "$i" "$force"
+        return $?
+    fi
     drain_worker_instance "$i" "${DRAIN_WAIT_SECONDS:-300}"
     local drain_rc=$?
     if [ "$drain_rc" -ne 0 ]; then
@@ -1610,6 +1841,31 @@ status_redis() {
 # 组合命令
 # ============================================================================
 
+run_parent_merge_reconciler() {
+    local apply="${PARENT_MERGE_RECONCILE_APPLY:-false}"
+    local reconciler="${SCRIPT_DIR}/reconcile_parent_merges.py"
+    local args=(--report-json)
+    [ -f "$reconciler" ] || return 0
+    if [ "$apply" = "true" ]; then
+        args+=(--apply)
+    fi
+    "$PYTHON_BIN" "$reconciler" "${args[@]}" || \
+        log_warn "parent merge reconciler failed"
+}
+
+cmd_configure() {
+    local target="${1:-}"
+    local instance_index="${2:-}"
+    shift 2 || true
+    case "$target" in
+        worker)
+            [ -n "$instance_index" ] || { log_error "configure worker 需要指定实例编号"; return 1; }
+            configure_worker_instance "$instance_index" "$@"
+            ;;
+        *) log_error "未知 configure 目标: $target (可选: worker)"; return 1 ;;
+    esac
+}
+
 cmd_start() {
     local target="${1:-all}"
     local instance_index="${2:-}"
@@ -1760,6 +2016,50 @@ supervise_child() {
     done
 }
 
+supervise_node() {
+    separator
+    echo -e "${CYAN}  MinerU Tianshu - 监督完整节点${NC}"
+    separator
+    init_dirs
+    source_ascend_env
+    check_instance_conflict || return 1
+
+    start_redis || return 1
+    start_api || return 1
+    start_mcp || log_warn "Node supervisor: MCP 启动失败，将继续监督核心计算链路"
+    start_frontend || log_warn "Node supervisor: Frontend 启动失败，将继续监督核心计算链路"
+
+    local supervisor_pids=()
+    local cleanup_started=0
+    cleanup_node_supervisor() {
+        [ "$cleanup_started" -eq 0 ] || return 0
+        cleanup_started=1
+        if [ "${#supervisor_pids[@]}" -gt 0 ]; then
+            kill "${supervisor_pids[@]}" 2>/dev/null || true
+            wait "${supervisor_pids[@]}" 2>/dev/null || true
+        fi
+    }
+    trap 'cleanup_node_supervisor; exit 0' INT TERM
+    trap cleanup_node_supervisor EXIT
+
+    cmd_supervise control &
+    supervisor_pids+=("$!")
+    local i=0
+    while [ "$i" -lt "$VLLM_NUM_INSTANCES" ]; do
+        supervise_compute_instance "$i" &
+        supervisor_pids+=("$!")
+        i=$((i + 1))
+    done
+    log_info "Node supervisor watching control + ${VLLM_NUM_INSTANCES} compute supervisors"
+
+    wait -n "${supervisor_pids[@]}"
+    local rc=$?
+    [ "$rc" -ne 0 ] || rc=1
+    log_error "Node supervisor detected a child supervisor exit (rc=${rc}); terminating owned supervisors"
+    cleanup_node_supervisor
+    return "$rc"
+}
+
 supervise_compute_instance() {
     local i="$1"
     worker_index_valid "$i" || { log_error "无效 Compute 编号: $i"; return 1; }
@@ -1795,6 +2095,16 @@ supervise_compute_instance() {
     local cleanup_started=0
     local backoff="${COMPUTE_SUPERVISOR_BACKOFF_SECONDS:-1}"
     local max_backoff="${SUPERVISOR_MAX_BACKOFF:-60}"
+    local poll_seconds="$COMPUTE_SUPERVISOR_POLL_SECONDS"
+    local health_interval="$COMPUTE_SUPERVISOR_HEALTH_INTERVAL_SECONDS"
+    local health_failure_threshold="$COMPUTE_SUPERVISOR_HEALTH_FAILURE_THRESHOLD"
+    local heartbeat_seconds="$COMPUTE_SUPERVISOR_HEARTBEAT_SECONDS"
+    local health_probe_timeout="$SUPERVISOR_HEALTH_PROBE_TIMEOUT_SECONDS"
+    case "$poll_seconds" in ""|*[!0-9]*|0) poll_seconds=5 ;; esac
+    case "$health_interval" in ""|*[!0-9]*|0) health_interval=15 ;; esac
+    case "$health_failure_threshold" in ""|*[!0-9]*|0) health_failure_threshold=3 ;; esac
+    case "$heartbeat_seconds" in ""|*[!0-9]*|0) heartbeat_seconds=300 ;; esac
+    case "$health_probe_timeout" in ""|*[!0-9]*|0) health_probe_timeout=5 ;; esac
 
     stop_owned_compute() {
         stop_worker_instance "$i" || true
@@ -1807,6 +2117,7 @@ supervise_compute_instance() {
     cleanup_compute_supervisor() {
         [ "$cleanup_started" -eq 0 ] || return 0
         cleanup_started=1
+        rm -f "$(compute_supervisor_pid_file "$i")" "$(compute_supervisor_heartbeat_file "$i")"
         log_info "Compute #${i} supervisor 正在停止子进程"
         stop_owned_compute
     }
@@ -1819,6 +2130,7 @@ supervise_compute_instance() {
     }
     trap 'cleanup_compute_supervisor; exit 0' INT TERM
     trap cleanup_compute_supervisor EXIT
+    write_compute_supervisor_state "$i"
 
     while true; do
         if ! start_vllm_instance "$i"; then
@@ -1837,21 +2149,66 @@ supervise_compute_instance() {
         fi
         worker_pid="$(cat "$(worker_pid_file "$i")" 2>/dev/null)"
         log_info "Compute #${i} supervisor watching VLLM PID ${vllm_pid}, Worker PID ${worker_pid}"
+        write_compute_supervisor_state "$i"
 
         local failed_component=""
+        local failure_reason=""
+        local vllm_health_failures=0
+        local worker_health_failures=0
+        local now
+        local last_health_check=0
+        local last_heartbeat
+        last_heartbeat="$(date +%s)"
         while true; do
+            handle_supervised_worker_restart_request "$i"
+            write_compute_supervisor_state "$i"
+
             if ! pid_matches "$vllm_pid" "$(vllm_expected_cmd)" "$((VLLM_BASE_PORT + i))"; then
                 failed_component="VLLM"
+                failure_reason="process exited"
                 break
             fi
             if ! pid_matches "$worker_pid" "$(worker_expected_cmd)" "$((WORKER_BASE_PORT + i))"; then
                 failed_component="Worker"
+                failure_reason="process exited"
                 break
             fi
-            sleep 5
+
+            now="$(date +%s)"
+            if [ $((now - last_health_check)) -ge "$health_interval" ]; then
+                if vllm_http_healthy "$i" "$health_probe_timeout"; then
+                    vllm_health_failures=0
+                else
+                    vllm_health_failures=$((vllm_health_failures + 1))
+                    log_warn "Compute #${i} VLLM health probe failed (${vllm_health_failures}/${health_failure_threshold})"
+                fi
+                if worker_http_healthy "$i" "$health_probe_timeout"; then
+                    worker_health_failures=0
+                else
+                    worker_health_failures=$((worker_health_failures + 1))
+                    log_warn "Compute #${i} Worker health probe failed (${worker_health_failures}/${health_failure_threshold})"
+                fi
+                last_health_check="$now"
+                if [ "$vllm_health_failures" -ge "$health_failure_threshold" ]; then
+                    failed_component="VLLM"
+                    failure_reason="${vllm_health_failures} consecutive health probe failures"
+                    break
+                fi
+                if [ "$worker_health_failures" -ge "$health_failure_threshold" ]; then
+                    failed_component="Worker"
+                    failure_reason="${worker_health_failures} consecutive health probe failures"
+                    break
+                fi
+            fi
+
+            if [ $((now - last_heartbeat)) -ge "$heartbeat_seconds" ]; then
+                log_info "Compute #${i} supervisor heartbeat: VLLM PID ${vllm_pid}, Worker PID ${worker_pid}, health=ok"
+                last_heartbeat="$now"
+            fi
+            sleep "$poll_seconds"
         done
 
-        log_error "Compute #${i} supervisor detected ${failed_component} exit"
+        log_error "Compute #${i} supervisor detected ${failed_component} failure: ${failure_reason}"
         stop_owned_compute
         log_warn "Compute #${i} supervisor restarting owned pair after ${backoff}s"
         wait_compute_backoff
@@ -1865,11 +2222,16 @@ cmd_supervise() {
         supervise_compute_instance "$instance_index"
         return $?
     fi
+    if [ "$target" = "node" ]; then
+        supervise_node
+        return $?
+    fi
     if [ "$target" != "control" ]; then
-        log_error "未知 supervise 目标: $target (可选: control|compute)"
+        log_error "未知 supervise 目标: $target (可选: control|compute|node)"
         return 1
     fi
 
+    run_parent_merge_reconciler
     separator
     echo -e "${CYAN}  MinerU Tianshu - 监督 Watchdog/Scheduler${NC}"
     separator
@@ -2037,7 +2399,7 @@ MinerU Tianshu - 统一启动脚本
   status         查看所有服务状态
   logs [服务]    实时查看日志 (默认: all)
   drain worker N 将指定 Worker 置为 drain 模式
-  supervise      前台监督 control 或指定 compute，适配 PID1=sleep infinity
+  supervise      前台监督 control、指定 compute 或完整 node，适配容器 PID1
   test           端到端验证测试
   help           显示帮助
 
@@ -2062,6 +2424,7 @@ MinerU Tianshu - 统一启动脚本
   bash scripts/tianshu.sh drain worker 3  # 将 Worker #3 置为 drain
   bash scripts/tianshu.sh supervise       # 前台监督 watchdog/scheduler
   bash scripts/tianshu.sh supervise compute 0 # 前台拥有并回收 Compute #0 子进程
+  bash scripts/tianshu.sh supervise node  # Kubernetes PID1:监督 control + 8 组 compute
   bash scripts/tianshu.sh restart         # 重启所有
   bash scripts/tianshu.sh status          # 查看状态
   bash scripts/tianshu.sh logs worker     # 查看 Worker 日志
@@ -2096,6 +2459,7 @@ case "${1:-help}" in
     stop)     cmd_stop "$2" "$3" ;;
     restart)  cmd_restart "$2" "$3" "$4" ;;
     drain)    cmd_drain "$2" "$3" ;;
+    configure) cmd_configure "$2" "$3" "$4" "$5" "$6" "$7" ;;
     supervise) cmd_supervise "$2" "$3" ;;
     status)   cmd_status ;;
     logs)     cmd_logs "$2" ;;
