@@ -87,6 +87,45 @@ from output_normalizer import normalize_output
 from utils import parse_list_arg
 import importlib.util
 
+
+def configure_onnxruntime_thread_defaults(ort_module=None) -> bool:
+    """Bound per-session ORT pools unless the caller configured them."""
+    if ort_module is None:
+        try:
+            import onnxruntime as ort_module
+        except ImportError:
+            return False
+
+    session_class = ort_module.InferenceSession
+    if getattr(session_class, "_mineru_thread_defaults_patched", False):
+        return True
+
+    def positive_env(name: str, default: int) -> int:
+        try:
+            value = int(os.getenv(name, str(default)))
+        except (TypeError, ValueError):
+            value = default
+        return max(value, 1)
+
+    intra_threads = positive_env("MINERU_INTRA_OP_NUM_THREADS", 4)
+    inter_threads = positive_env("MINERU_INTER_OP_NUM_THREADS", 1)
+    original_init = session_class.__init__
+
+    def bounded_init(self, path_or_bytes, sess_options=None, *args, **kwargs):
+        options = sess_options or ort_module.SessionOptions()
+        if options.intra_op_num_threads <= 0:
+            options.intra_op_num_threads = intra_threads
+        if options.inter_op_num_threads <= 0:
+            options.inter_op_num_threads = inter_threads
+        return original_init(self, path_or_bytes, options, *args, **kwargs)
+
+    session_class.__init__ = bounded_init
+    session_class._mineru_thread_defaults_patched = True
+    return True
+
+
+configure_onnxruntime_thread_defaults()
+
 # ==============================================================================
 # 2. Dependency Checks & Global Configurations
 # ==============================================================================
@@ -128,20 +167,88 @@ except ImportError as e:
 # ==============================================================================
 # 3. VLLM Container Controller
 # ==============================================================================
+VLLM_ENDPOINT_STRATEGY_LOCAL = "local"
+VLLM_ENDPOINT_STRATEGY_RING3 = "ring3"
+VLLM_ENDPOINT_STRATEGIES = {VLLM_ENDPOINT_STRATEGY_LOCAL, VLLM_ENDPOINT_STRATEGY_RING3}
+RING3_ENDPOINT_COUNT = 8
+
+
+def normalize_vllm_endpoint_strategy(strategy: Optional[str]) -> str:
+    normalized = (strategy or VLLM_ENDPOINT_STRATEGY_LOCAL).strip().lower()
+    if normalized in VLLM_ENDPOINT_STRATEGIES:
+        return normalized
+    return VLLM_ENDPOINT_STRATEGY_LOCAL
+
+
+def parse_worker_group_index(value: Optional[str]) -> int:
+    try:
+        return max(int(value or 0), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def map_vllm_endpoint_index(
+    endpoint_count: int,
+    worker_group_index: int,
+    child_index: int = 0,
+    strategy: str = VLLM_ENDPOINT_STRATEGY_LOCAL,
+) -> int:
+    if endpoint_count <= 0:
+        raise ValueError("endpoint_count must be positive")
+
+    if normalize_vllm_endpoint_strategy(strategy) != VLLM_ENDPOINT_STRATEGY_RING3:
+        return 0
+
+    return (max(int(worker_group_index or 0), 0) + max(int(child_index or 0), 0)) % endpoint_count
+
+
+def is_transient_sqlite_lock_error(error: Exception) -> bool:
+    message = str(error).lower()
+    return "database is locked" in message or "database table is locked" in message or "database schema is locked" in message
+
+
+def is_worker_drain_requested(drain_file: Optional[str]) -> bool:
+    return bool(drain_file) and Path(drain_file).exists()
+
+
+def worker_activity_marker_name(worker_id: str, pid: int) -> str:
+    safe_worker_id = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in worker_id)
+    return f"{safe_worker_id}-{pid}.json"
+
+
+def build_worker_activity_payload(task_id: str, worker_id: str, pid: int, started_at: float) -> dict:
+    return {
+        "task_id": task_id,
+        "worker_id": worker_id,
+        "pid": pid,
+        "started_at": started_at,
+        "started_at_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started_at)),
+    }
+
+
 class VLLMController:
     """管理 vLLM Docker 容器的互斥启动"""
-    
+
     def __init__(self):
-        pass
+        self._client_initialized = False
+        self._client = None
 
     def _get_client(self):
-        """按需获取 Docker 客户端"""
+        """按需获取并缓存 Docker 客户端。"""
+        if self._client_initialized:
+            return self._client
+
+        self._client_initialized = True
+        enabled = os.getenv("VLLM_DOCKER_CONTROLLER_ENABLED", "true").strip().lower()
+        if enabled in {"0", "false", "no", "off"}:
+            return None
+
         try:
             import docker
-            return docker.from_env()
+            self._client = docker.from_env()
         except Exception as e:
             logger.warning(f"⚠️  Docker client init failed: {e}")
-            return None
+        return self._client
 
     def ensure_service(self, target_container: str, conflict_container: str):
         """
@@ -202,6 +309,8 @@ class MinerUWorkerAPI(ls.LitAPI):
         poll_interval=0.5,
         enable_worker_loop=True,
         paddleocr_vl_vllm_engine_enabled=False,
+        workers_per_device=1,
+        worker_group_index=None,
     ):
         super().__init__()
         
@@ -213,6 +322,11 @@ class MinerUWorkerAPI(ls.LitAPI):
         # 运行配置
         self.poll_interval = poll_interval
         self.enable_worker_loop = enable_worker_loop
+        self.workers_per_device = max(int(workers_per_device or 1), 1)
+        self.worker_group_index = parse_worker_group_index(
+            worker_group_index if worker_group_index is not None else os.getenv("WORKER_GROUP_INDEX")
+        )
+        self.vllm_endpoint_strategy = normalize_vllm_endpoint_strategy(os.getenv("VLLM_ENDPOINT_STRATEGY"))
         
         # API 配置
         self.paddleocr_vl_vllm_engine_enabled = paddleocr_vl_vllm_engine_enabled
@@ -226,26 +340,60 @@ class MinerUWorkerAPI(ls.LitAPI):
         # 初始化控制器
         self.vllm_controller = VLLMController()
 
+    def _select_vllm_endpoint(self, endpoints: list, child_index: int) -> str:
+        selected_index = map_vllm_endpoint_index(
+            endpoint_count=len(endpoints),
+            worker_group_index=self.worker_group_index,
+            child_index=child_index,
+            strategy=self.vllm_endpoint_strategy,
+        )
+        if self.vllm_endpoint_strategy != VLLM_ENDPOINT_STRATEGY_RING3:
+            return endpoints[selected_index]
+
+        for offset in range(len(endpoints)):
+            candidate = endpoints[(selected_index + offset) % len(endpoints)]
+            if self._is_vllm_endpoint_healthy(candidate):
+                if offset:
+                    logger.warning(
+                        f"⚠️ Ring3 vLLM endpoint {endpoints[selected_index]} is unhealthy; falling back to {candidate}"
+                    )
+                return candidate
+
+        logger.warning(f"⚠️ No healthy ring3 vLLM endpoints detected; using assigned endpoint {endpoints[selected_index]}")
+        return endpoints[selected_index]
+
+    def _is_vllm_endpoint_healthy(self, endpoint: str) -> bool:
+        health_url = endpoint.rstrip("/")
+        if health_url.endswith("/v1"):
+            health_url = health_url[:-3]
+        health_url = f"{health_url}/health"
+
+        try:
+            response = requests.get(health_url, timeout=1.0)
+            return response.status_code < 500
+        except Exception:
+            return False
+
     def setup(self, device):
         """初始化 Worker (每个 GPU 进程调用一次)"""
         with self._global_worker_counter.get_lock():
-            my_global_index = self._global_worker_counter.value
+            child_index = self._global_worker_counter.value
             self._global_worker_counter.value += 1
         
-        logger.info(f"🔢 [Init] I am Global Worker #{my_global_index} (on {device})")
+        logger.info(f"🔢 [Init] Worker group #{self.worker_group_index}, child #{child_index} (on {device})")
         
         # API 分配
         self.paddleocr_vl_vllm_api = None
         if self.paddleocr_vl_vllm_engine_enabled and self.paddleocr_vl_vllm_api_list:
-            assigned_api = self.paddleocr_vl_vllm_api_list[my_global_index % len(self.paddleocr_vl_vllm_api_list)]
+            assigned_api = self._select_vllm_endpoint(self.paddleocr_vl_vllm_api_list, child_index)
             self.paddleocr_vl_vllm_api = assigned_api
-            logger.info(f"🔧 Worker #{my_global_index} assigned Paddle OCR VL API: {assigned_api}")
+            logger.info(f"🔧 Worker group #{self.worker_group_index}, child #{child_index} assigned Paddle OCR VL API: {assigned_api}")
 
         self.mineru_vllm_api = None
         if self.mineru_vllm_api_list:
-            assigned_mineru_api = self.mineru_vllm_api_list[my_global_index % len(self.mineru_vllm_api_list)]
+            assigned_mineru_api = self._select_vllm_endpoint(self.mineru_vllm_api_list, child_index)
             self.mineru_vllm_api = assigned_mineru_api
-            logger.info(f"🔧 Worker #{my_global_index} assigned MinerU VLLM API: {assigned_mineru_api}")
+            logger.info(f"🔧 Worker group #{self.worker_group_index}, child #{child_index} assigned MinerU VLLM API: {assigned_mineru_api}")
 
         # 设置 CUDA 隔离
         if "cuda:" in str(device):
@@ -306,6 +454,13 @@ class MinerUWorkerAPI(ls.LitAPI):
         hostname = socket.gethostname()
         pid = os.getpid()
         self.worker_id = f"tianshu-{hostname}-{device}-{pid}"
+        self.worker_drain_file = os.getenv("WORKER_DRAIN_FILE")
+        self.worker_activity_dir = os.getenv("WORKER_ACTIVITY_DIR")
+        self.worker_activity_marker = None
+        if self.worker_activity_dir:
+            self.worker_activity_marker = (
+                Path(self.worker_activity_dir) / worker_activity_marker_name(self.worker_id, pid)
+            )
 
         # 引擎占位符
         self.markitdown = MarkItDown() if MARKITDOWN_AVAILABLE else None
@@ -347,6 +502,45 @@ class MinerUWorkerAPI(ls.LitAPI):
                 logger.warning(f"💓 {self.worker_id} heartbeat error: {e}")
             self._heartbeat_stop.wait(HEARTBEAT_INTERVAL)
 
+    def _is_drain_requested(self) -> bool:
+        return is_worker_drain_requested(self.worker_drain_file)
+
+    def _write_worker_activity(self, task_id: str):
+        if not self.worker_activity_marker:
+            return
+
+        marker_path = Path(self.worker_activity_marker)
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = build_worker_activity_payload(
+            task_id=task_id,
+            worker_id=self.worker_id,
+            pid=os.getpid(),
+            started_at=time.time(),
+        )
+        tmp_path = marker_path.with_name(f".{marker_path.name}.{os.getpid()}.tmp")
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp_path, marker_path)
+
+    def _remove_worker_activity(self):
+        if not self.worker_activity_marker:
+            return
+
+        try:
+            Path(self.worker_activity_marker).unlink(missing_ok=True)
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to remove worker activity marker {self.worker_activity_marker}: {e}")
+
+    def _begin_task_activity(self, task_id: str):
+        self.current_task_id = task_id
+        try:
+            self._write_worker_activity(task_id)
+        except Exception as e:
+            logger.warning(f"⚠️ {self.worker_id} failed to write activity marker for task {task_id}: {e}")
+
+    def _finish_task_activity(self):
+        self._remove_worker_activity()
+        self.current_task_id = None
+
     def _worker_loop(self):
         logger.info(f"🔁 {self.worker_id} started task polling loop")
         loop_count = 0
@@ -355,21 +549,31 @@ class MinerUWorkerAPI(ls.LitAPI):
         while self.running:
             try:
                 loop_count += 1
+                if self._is_drain_requested():
+                    if loop_count - last_stats_log >= 20:
+                        logger.info(f"⏸️ {self.worker_id} drain requested; skipping new task claims")
+                        last_stats_log = loop_count
+                    time.sleep(self.poll_interval)
+                    continue
+
                 task = self.task_db.get_next_task(worker_id=self.worker_id)
 
                 if task:
                     task_id = task["task_id"]
-                    self.current_task_id = task_id
+                    self._begin_task_activity(task_id)
                     logger.info(f"📥 {self.worker_id} pulled task: {task_id}")
 
                     try:
-                        self._process_task(task)
-                        logger.info(f"✅ {self.worker_id} completed task: {task_id}")
+                        process_state = self._process_task(task)
+                        if process_state == "deferred":
+                            logger.warning(f"⏳ {self.worker_id} deferred terminal commit for task: {task_id}")
+                        else:
+                            logger.info(f"✅ {self.worker_id} completed task: {task_id}")
                     except Exception as e:
                         logger.error(f"❌ {self.worker_id} failed task {task_id}: {e}")
                         logger.exception(e)
                     finally:
-                        self.current_task_id = None
+                        self._finish_task_activity()
                 else:
                     if loop_count - last_stats_log >= 20:
                         try:
@@ -486,18 +690,9 @@ class MinerUWorkerAPI(ls.LitAPI):
                 raise ValueError("No result generated by engine")
 
             # 6. 保存完整结果到数据库 (包含 json_content 和 pdf_path)
-            self.task_db.update_task_status(
-                task_id=task_id,
-                status="completed",
-                result_path=result["result_path"],
-                error_message=None,
-                data=json.dumps({
-                    "pdf_path": result.get("pdf_path"),      # 关键：供前端左侧预览使用
-                    "json_content": result.get("json_content"), # 关键：供前端右侧布局渲染使用
-                    "markdown": result.get("content"),
-                    "markdown_file": result.get("markdown_file") 
-                })
-            )
+            completed = self._complete_task_after_compute(task_id, result)
+            if not completed:
+                return "deferred"
 
             # 7. 合并子任务
             if parent_task_id:
@@ -506,14 +701,72 @@ class MinerUWorkerAPI(ls.LitAPI):
                     try:
                         self._merge_parent_task_results(parent_id_to_merge)
                     except Exception as e:
-                        self.task_db.update_task_status(parent_id_to_merge, "failed", error_message=str(e))
+                        self.task_db.update_task_status(
+                            parent_id_to_merge, "failed", error_message=str(e), worker_id=self.worker_id
+                        )
 
         except Exception as e:
             error_msg = f"{type(e).__name__}: {str(e)}"
-            self.task_db.update_task_status(task_id, "failed", error_message=error_msg)
+            self.task_db.update_task_status(task_id, "failed", error_message=error_msg, worker_id=self.worker_id)
             if parent_task_id:
                 self.task_db.on_child_task_failed(task_id, error_msg)
             raise
+
+    def _complete_task_after_compute(self, task_id: str, result: dict) -> bool:
+        payload = json.dumps({
+            "pdf_path": result.get("pdf_path"),
+            "json_content": result.get("json_content"),
+            "markdown": result.get("content"),
+            "markdown_file": result.get("markdown_file"),
+        })
+
+        update_kwargs = {
+            "task_id": task_id,
+            "status": "completed",
+            "result_path": result["result_path"],
+            "error_message": None,
+            "worker_id": self.worker_id,
+            "data": payload,
+        }
+        retry_safe_update = self._get_retry_safe_task_status_updater()
+        if retry_safe_update:
+            try:
+                return bool(retry_safe_update(**update_kwargs))
+            except Exception as e:
+                if not is_transient_sqlite_lock_error(e):
+                    raise
+                logger.warning(f"⚠️ Completion commit for task {task_id} was deferred after SQLite lock: {e}")
+                return False
+
+        attempts = max(int(os.getenv("TASKDB_COMPLETION_RETRY_ATTEMPTS", "3")), 1)
+        retry_delay = max(float(os.getenv("TASKDB_COMPLETION_RETRY_DELAY_SECONDS", "0.2")), 0)
+        last_error = None
+
+        for attempt in range(1, attempts + 1):
+            try:
+                return bool(self.task_db.update_task_status(**update_kwargs))
+            except Exception as e:
+                if not is_transient_sqlite_lock_error(e):
+                    raise
+                last_error = e
+                if attempt < attempts and retry_delay:
+                    time.sleep(retry_delay)
+
+        logger.warning(
+            f"⚠️ Completion commit for task {task_id} deferred after {attempts} SQLite lock retry attempt(s): {last_error}"
+        )
+        return False
+
+    def _get_retry_safe_task_status_updater(self):
+        for method_name in (
+            "update_task_status_retry_safe",
+            "update_task_status_with_retry",
+            "safe_update_task_status",
+        ):
+            method = getattr(self.task_db, method_name, None)
+            if callable(method):
+                return method
+        return None
 
     # -------------------------------------------------------------------------
     # Helper: 确保 PDF 存在于 Output 目录
@@ -868,7 +1121,9 @@ class MinerUWorkerAPI(ls.LitAPI):
         self._ensure_pdf_in_output(parent_task["file_path"], parent_out)
 
         normalize_output(parent_out)
-        self.task_db.update_task_status(parent_task_id, "completed", result_path=str(parent_out))
+        self.task_db.update_task_status(
+            parent_task_id, "completed", result_path=str(parent_out), worker_id=self.worker_id
+        )
         self._cleanup_child_task_files(children)
 
         # 清理空的 splits 目录
@@ -897,13 +1152,21 @@ class MinerUWorkerAPI(ls.LitAPI):
         elif action == "poll":
             if self.enable_worker_loop:
                 return {"status": "skipped", "message": "Auto-loop active"}
+            if self._is_drain_requested():
+                return {"status": "draining"}
             task = self.task_db.pull_task()
             if task:
+                task_id = task["task_id"]
+                self._begin_task_activity(task_id)
                 try:
-                    self._process_task(task)
-                    return {"status": "completed", "task_id": task["task_id"]}
+                    process_state = self._process_task(task)
+                    if process_state == "deferred":
+                        return {"status": "deferred", "task_id": task_id}
+                    return {"status": "completed", "task_id": task_id}
                 except Exception as e:
                     return {"status": "failed", "error": str(e)}
+                finally:
+                    self._finish_task_activity()
             return {"status": "empty"}
         return {"status": "error", "message": "Invalid action"}
     def encode_response(self, response): return response
@@ -916,7 +1179,7 @@ def start_litserve_workers(
     output_dir=None, accelerator="auto", devices="auto", workers_per_device=1,
     port=8001, poll_interval=0.5, enable_worker_loop=True,
     paddleocr_vl_vllm_engine_enabled=False, paddleocr_vl_vllm_api_list=[],
-    mineru_vllm_api_list=[]
+    mineru_vllm_api_list=[], worker_group_index=None
 ):
     def resolve_auto_accelerator():
         try:
@@ -941,6 +1204,8 @@ def start_litserve_workers(
         paddleocr_vl_vllm_engine_enabled=paddleocr_vl_vllm_engine_enabled,
         paddleocr_vl_vllm_api_list=paddleocr_vl_vllm_api_list,
         mineru_vllm_api_list=mineru_vllm_api_list,
+        workers_per_device=workers_per_device,
+        worker_group_index=worker_group_index,
     )
 
     server = ls.LitServer(

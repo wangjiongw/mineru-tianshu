@@ -1,0 +1,539 @@
+import os
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+SCRIPT = REPO / "scripts" / "tianshu.sh"
+
+
+def run_bash(script: str, tmp_path: Path) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env.update(
+        {
+            "TIANSHU_SH_SOURCE_ONLY": "1",
+            "TIANSHU_PROC_ROOT": str(tmp_path / "proc"),
+            "INSTANCE_ID": "pytest-instance",
+        }
+    )
+    return subprocess.run(
+        ["bash", "-c", f'source "{SCRIPT}"; {script}'],
+        cwd=REPO,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+
+def fake_proc(tmp_path: Path, pid: int, state: str, argv: list[str]) -> None:
+    proc_dir = tmp_path / "proc" / str(pid)
+    proc_dir.mkdir(parents=True)
+    (proc_dir / "status").write_text(f"Name:\ttest\nState:\t{state} (test)\n")
+    (proc_dir / "cmdline").write_bytes(b"\0".join(arg.encode() for arg in argv) + b"\0")
+    (proc_dir / "stat").write_text(
+        f"{pid} (test) {state} " + " ".join(["0"] * 18) + f" {pid * 100}\n"
+    )
+
+
+class TianshuProcessStatusTests(unittest.TestCase):
+    def test_pid_matches_rejects_zombie_even_when_cmdline_matches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            fake_proc(tmp_path, 101, "Z", ["python", "litserve_worker.py", "--port", "8101"])
+
+            result = run_bash('pid_matches 101 "python.*litserve_worker.py" 8101', tmp_path)
+
+        self.assertEqual(result.returncode, 1)
+
+    def test_pid_matches_rejects_wrong_cmdline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            fake_proc(tmp_path, 102, "S", ["python", "unrelated.py", "--port", "8101"])
+
+            result = run_bash('pid_matches 102 "python.*litserve_worker.py" 8101', tmp_path)
+
+        self.assertEqual(result.returncode, 1)
+
+    def test_pid_matches_requires_expected_port_when_supplied(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            fake_proc(tmp_path, 103, "S", ["python", "litserve_worker.py", "--port", "8102"])
+
+            result = run_bash('pid_matches 103 "python.*litserve_worker.py" 8101', tmp_path)
+
+        self.assertEqual(result.returncode, 1)
+
+    def test_worker_is_running_validates_instance_pid_cmdline_and_port(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            fake_proc(tmp_path, 104, "S", ["/env/bin/python", "litserve_worker.py", "--port", "8103"])
+            worker_dir = tmp_path / "worker"
+            worker_dir.mkdir()
+            (worker_dir / "worker_2.pid").write_text("104")
+
+            result = run_bash(
+                f'WORKER_LOG_DIR="{worker_dir}" WORKER_BASE_PORT=8101 WORKER_NUM_INSTANCES=8 worker_is_running 2',
+                tmp_path,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_worker_is_running_rejects_stale_wrong_port_pid_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            fake_proc(tmp_path, 105, "S", ["/env/bin/python", "litserve_worker.py", "--port", "8104"])
+            worker_dir = tmp_path / "worker"
+            worker_dir.mkdir()
+            (worker_dir / "worker_2.pid").write_text("105")
+
+            result = run_bash(
+                f'WORKER_LOG_DIR="{worker_dir}" WORKER_BASE_PORT=8101 WORKER_NUM_INSTANCES=8 worker_is_running 2',
+                tmp_path,
+            )
+
+        self.assertEqual(result.returncode, 1)
+
+
+    def test_stop_worker_process_tree_terms_only_validated_same_port_children(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            fake_proc(tmp_path, 201, "S", ["/env/bin/python", "litserve_worker.py", "--port", "8103"])
+            fake_proc(tmp_path, 202, "S", ["/env/bin/python", "litserve_worker.py", "--port", "8103", "claim"])
+            fake_proc(tmp_path, 203, "S", ["/env/bin/python", "litserve_worker.py", "--port", "8104", "claim"])
+            fake_proc(tmp_path, 204, "S", ["/env/bin/python", "unrelated.py", "--port", "8103"])
+            worker_dir = tmp_path / "worker"
+            worker_dir.mkdir()
+            pid_file = worker_dir / "worker_2.pid"
+            pid_file.write_text("201")
+
+            result = run_bash(
+                'ps() { '
+                'if [ "$1" = "-eo" ] && [ "$2" = "pid=,ppid=" ]; then '
+                'printf "201 1\n202 201\n203 1\n204 1\n"; '
+                'elif [ "$1" = "-eo" ] && [ "$2" = "pid=" ]; then '
+                'printf "201\n202\n203\n204\n"; fi; }; '
+                'kill() { echo "kill:$*"; '
+                'case "$1" in 201|202) rm -rf "$TIANSHU_PROC_ROOT/$1";; '
+                '-9) rm -rf "$TIANSHU_PROC_ROOT/$2";; esac; }; '
+                f'stop_worker_process_tree "{pid_file}" 8103',
+                tmp_path,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("kill:202", result.stdout)
+        self.assertIn("kill:201", result.stdout)
+        self.assertNotIn("kill:203", result.stdout)
+        self.assertNotIn("kill:204", result.stdout)
+
+    def test_stop_worker_process_tree_stops_captured_spawn_style_descendants(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            fake_proc(tmp_path, 401, "S", ["/env/bin/python", "litserve_worker.py", "--port", "8103"])
+            fake_proc(tmp_path, 402, "S", ["/env/bin/python", "-c", "from multiprocessing.spawn import spawn_main"])
+            fake_proc(tmp_path, 403, "S", ["/env/bin/python", "-c", "resource_tracker"])
+            fake_proc(tmp_path, 404, "S", ["/env/bin/python", "unrelated.py", "--port", "8103"])
+            worker_dir = tmp_path / "worker"
+            worker_dir.mkdir()
+            pid_file = worker_dir / "worker_2.pid"
+            pid_file.write_text("401")
+
+            result = run_bash(
+                'ps() { '
+                'if [ "$1" = "-eo" ] && [ "$2" = "pid=,ppid=" ]; then '
+                'printf "401 1\n402 401\n403 402\n404 1\n"; '
+                'elif [ "$1" = "-eo" ] && [ "$2" = "pid=" ]; then '
+                'printf "401\n402\n403\n404\n"; fi; }; '
+                'kill() { echo "kill:$*"; '
+                'case "$1" in 401|402|403) rm -rf "$TIANSHU_PROC_ROOT/$1";; '
+                '-9) rm -rf "$TIANSHU_PROC_ROOT/$2";; esac; }; '
+                f'stop_worker_process_tree "{pid_file}" 8103',
+                tmp_path,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("kill:401", result.stdout)
+        self.assertIn("kill:402", result.stdout)
+        self.assertIn("kill:403", result.stdout)
+        self.assertNotIn("kill:404", result.stdout)
+        self.assertFalse(pid_file.exists())
+
+    def test_stop_worker_process_tree_fails_if_exact_port_process_survives(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            fake_proc(tmp_path, 301, "S", ["/env/bin/python", "litserve_worker.py", "--port", "8103"])
+            worker_dir = tmp_path / "worker"
+            worker_dir.mkdir()
+            pid_file = worker_dir / "worker_2.pid"
+            pid_file.write_text("999")
+
+            result = run_bash(
+                'ps() { '
+                'if [ "$1" = "-eo" ] && [ "$2" = "pid=,ppid=" ]; then :; '
+                'elif [ "$1" = "-eo" ] && [ "$2" = "pid=" ]; then printf "301\n"; fi; }; '
+                'kill() { echo "kill:$*"; }; '
+                f'stop_worker_process_tree "{pid_file}" 8103',
+                tmp_path,
+            )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn("kill:", result.stdout)
+        self.assertFalse(pid_file.exists())
+
+    def test_worker_candidate_scan_uses_pgrep_instead_of_all_processes(self) -> None:
+        text = SCRIPT.read_text()
+        start = text.index("worker_candidate_pids()")
+        end = text.index("stop_worker_process_tree()", start)
+        implementation = text[start:end]
+
+        self.assertIn("pgrep -f '[l]itserve_worker.py'", implementation)
+        self.assertNotIn("ps -eo pid=", implementation)
+
+    def test_worker_vllm_api_list_defaults_to_local_endpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            result = run_bash('VLLM_BASE_PORT=30025 VLLM_NUM_INSTANCES=8 worker_vllm_api_list 2', tmp_path)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), '["http://localhost:30027/v1"]')
+
+    def test_worker_vllm_api_list_ring3_uses_all_local_endpoints(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            result = run_bash(
+                'VLLM_BASE_PORT=30025 VLLM_NUM_INSTANCES=8 VLLM_ENDPOINT_STRATEGY=ring3 worker_vllm_api_list 2',
+                tmp_path,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.strip(),
+            '["http://localhost:30025/v1","http://localhost:30026/v1","http://localhost:30027/v1","http://localhost:30028/v1","http://localhost:30029/v1","http://localhost:30030/v1","http://localhost:30031/v1","http://localhost:30032/v1"]',
+        )
+
+
+    def test_worker_launch_exports_group_index_strategy_and_drain_paths(self) -> None:
+        text = SCRIPT.read_text()
+
+        self.assertIn('WORKER_GROUP_INDEX="$i"', text)
+        self.assertIn('WORKER_DRAIN_FILE="$(worker_drain_file "$i")"', text)
+        self.assertIn('WORKER_ACTIVITY_DIR="$(worker_activity_dir "$i")"', text)
+        self.assertIn('VLLM_ENDPOINT_STRATEGY="${VLLM_ENDPOINT_STRATEGY:-local}"', text)
+        self.assertIn('--mineru-vllm-api-list "$vllm_api_list"', text)
+
+    def test_drain_sets_disabled_marker_without_stopping_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            runtime_dir = tmp_path / "runtime"
+            result = run_bash(
+                f'WORKER_RUNTIME_DIR="{runtime_dir}" WORKER_NUM_INSTANCES=8 DRAIN_WAIT_SECONDS=6 drain_worker_instance 3',
+                tmp_path,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((runtime_dir / "worker_3.drain").exists())
+            self.assertTrue((runtime_dir / "worker_3.disabled").exists())
+            self.assertTrue((runtime_dir / "worker_3_activity").is_dir())
+
+
+
+    def test_start_does_not_clear_runtime_state_before_running_check(self) -> None:
+        text = SCRIPT.read_text()
+        start = text.index('start_worker_instance()')
+        running = text.index('if worker_is_running "$i"', start)
+        clear_drain = text.index('rm -f "$(worker_drain_file "$i")"', start)
+
+        self.assertLess(running, clear_drain)
+        self.assertNotIn('rm -rf "$(worker_activity_dir "$i")"', text)
+        self.assertIn('find "$(worker_activity_dir "$i")" -mindepth 1 -type f -delete', text)
+
+    def test_drain_wait_requires_grace_and_two_empty_checks(self) -> None:
+        text = SCRIPT.read_text()
+
+        self.assertIn('local grace="${DRAIN_GRACE_SECONDS:-3}"', text)
+        self.assertIn('local stable_interval="${DRAIN_STABLE_INTERVAL_SECONDS:-2}"', text)
+        self.assertIn('sleep "$stable_interval"', text)
+
+    def test_worker_drain_complete_uses_empty_activity_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            runtime_dir = tmp_path / "runtime"
+            activity_dir = runtime_dir / "worker_3_activity"
+            activity_dir.mkdir(parents=True)
+
+            idle = run_bash(f'WORKER_RUNTIME_DIR="{runtime_dir}" worker_drain_complete 3', tmp_path)
+            (activity_dir / "task.json").write_text("{}")
+            busy = run_bash(f'WORKER_RUNTIME_DIR="{runtime_dir}" worker_drain_complete 3', tmp_path)
+
+        self.assertEqual(idle.returncode, 0, idle.stderr)
+        self.assertEqual(busy.returncode, 1)
+
+    def test_restart_does_not_stop_after_unverified_drain_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            result = run_bash(
+                'drain_worker_instance() { return 2; }; '
+                'stop_worker_instance() { echo stop; }; '
+                'start_worker_instance() { echo start; }; '
+                'restart_worker_instance 3',
+                tmp_path,
+            )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertNotIn("stop\n", result.stdout)
+        self.assertNotIn("start\n", result.stdout)
+
+    def test_local_efficiency_defaults_match_proven_c8_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            result = run_bash(
+                'printf "%s\n" "$VLLM_GPU_MEMORY_UTILIZATION"; '
+                'printf "%s\n" "$VLLM_PERFORMANCE_MODE"; '
+                'printf "%s\n" "$VLLM_MAX_NUM_BATCHED_TOKENS"; '
+                'worker_max_concurrent_tasks_for 0',
+                tmp_path,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ["0.60", "throughput", "4096", "8"])
+
+    def test_indexed_env_resolvers_use_specific_then_global_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            result = run_bash(
+                'VLLM_GPU_MEMORY_UTILIZATION=0.80 '
+                'VLLM_GPU_MEMORY_UTILIZATION_NPU4=0.72 '
+                'MAX_CONCURRENT_TASKS=3 '
+                'MAX_CONCURRENT_TASKS_WORKER4=1; '
+                'vllm_gpu_memory_utilization_for 4; '
+                'vllm_gpu_memory_utilization_for 5; '
+                'worker_max_concurrent_tasks_for 4; '
+                'worker_max_concurrent_tasks_for 5',
+                tmp_path,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ["0.72", "0.80", "1", "3"])
+
+    def test_vllm_performance_mode_uses_per_npu_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            result = run_bash(
+                'VLLM_PERFORMANCE_MODE=balanced '
+                'VLLM_PERFORMANCE_MODE_NPU4=throughput; '
+                'vllm_performance_mode_for 4; '
+                'vllm_performance_mode_for 5',
+                tmp_path,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ["throughput", "balanced"])
+        self.assertEqual(SCRIPT.read_text().count('--performance-mode ${performance_mode}'), 2)
+
+    def test_vllm_max_batched_tokens_uses_per_npu_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            result = run_bash(
+                'VLLM_MAX_NUM_BATCHED_TOKENS=4096 '
+                'VLLM_MAX_NUM_BATCHED_TOKENS_NPU4=8192; '
+                'vllm_max_num_batched_tokens_for 4; '
+                'vllm_max_num_batched_tokens_for 5',
+                tmp_path,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ["8192", "4096"])
+        self.assertEqual(SCRIPT.read_text().count('--max-num-batched-tokens ${max_num_batched_tokens}'), 2)
+
+    def test_restart_compute_refuses_ring3_without_stopping_services(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            result = run_bash(
+                'drain_worker_instance() { echo drain; return 0; }; '
+                'stop_worker_instance() { echo stop_worker; }; '
+                'stop_vllm_instance() { echo stop_vllm; }; '
+                'start_vllm_instance() { echo start_vllm; }; '
+                'start_worker_instance() { echo start_worker; }; '
+                'VLLM_ENDPOINT_STRATEGY=ring3 restart_compute_instance 4',
+                tmp_path,
+            )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn("drain", result.stdout)
+        self.assertNotIn("stop_worker", result.stdout)
+        self.assertNotIn("stop_vllm", result.stdout)
+        self.assertNotIn("start_vllm", result.stdout)
+        self.assertNotIn("start_worker", result.stdout)
+
+    def test_restart_compute_does_not_stop_after_unverified_drain_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            result = run_bash(
+                'init_dirs() { :; }; source_ascend_env() { :; }; check_instance_conflict() { :; }; '
+                'drain_worker_instance() { echo drain; return 2; }; '
+                'stop_worker_instance() { echo stop_worker; }; '
+                'stop_vllm_instance() { echo stop_vllm; }; '
+                'start_vllm_instance() { echo start_vllm; }; '
+                'start_worker_instance() { echo start_worker; }; '
+                'VLLM_ENDPOINT_STRATEGY=local restart_compute_instance 4',
+                tmp_path,
+            )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("drain", result.stdout)
+        self.assertNotIn("stop_worker", result.stdout)
+        self.assertNotIn("stop_vllm", result.stdout)
+        self.assertNotIn("start_vllm", result.stdout)
+        self.assertNotIn("start_worker", result.stdout)
+
+    def test_restart_compute_sequence_after_verified_drain(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            result = run_bash(
+                'init_dirs() { :; }; source_ascend_env() { :; }; check_instance_conflict() { :; }; '
+                'drain_worker_instance() { echo drain; return 0; }; '
+                'stop_worker_instance() { echo stop_worker; }; '
+                'stop_vllm_instance() { echo stop_vllm; }; '
+                'start_vllm_instance() { echo start_vllm; }; '
+                'start_worker_instance() { echo start_worker; }; '
+                'VLLM_ENDPOINT_STRATEGY=local restart_compute_instance 4',
+                tmp_path,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            [line for line in result.stdout.splitlines() if not line.startswith("\x1b[")],
+            ["drain", "stop_worker", "stop_vllm", "start_vllm", "start_worker"],
+        )
+
+    def test_restart_compute_cli_routes_instance_and_force_flag(self) -> None:
+        text = SCRIPT.read_text()
+
+        self.assertIn('compute)', text)
+        self.assertIn('restart_compute_instance "$instance_index" "$force_flag"', text)
+
+    def test_watchdog_skips_disabled_or_draining_workers(self) -> None:
+        text = SCRIPT.read_text()
+
+        self.assertIn('WORKER_RUNTIME_DIR=', text)
+        self.assertIn('worker_${idx}.disabled', text)
+        self.assertIn('worker_${idx}.drain', text)
+        self.assertIn('return 0', text)
+
+
+    def test_compute_supervisor_owns_and_cleans_both_children(self) -> None:
+        text = SCRIPT.read_text()
+        start = text.index("supervise_compute_instance()")
+        end = text.index("cmd_supervise()", start)
+        implementation = text[start:end]
+
+        self.assertIn('start_vllm_instance "$i"', implementation)
+        self.assertIn('start_worker_instance "$i"', implementation)
+        self.assertIn('vllm_pid="$(cat "$(vllm_pid_file "$i")"', implementation)
+        self.assertIn('worker_pid="$(cat "$(worker_pid_file "$i")"', implementation)
+        self.assertIn('trap cleanup_compute_supervisor EXIT', implementation)
+        self.assertIn('wait "$worker_pid"', implementation)
+        self.assertIn('wait "$vllm_pid"', implementation)
+
+    def test_compute_supervisor_restarts_owned_pair_after_child_exit(self) -> None:
+        text = SCRIPT.read_text()
+        start = text.index("supervise_compute_instance()")
+        end = text.index("cmd_supervise()", start)
+        implementation = text[start:end]
+
+        self.assertIn('failed_component="VLLM"', implementation)
+        self.assertIn('failed_component="Worker"', implementation)
+        self.assertIn('stop_owned_compute', implementation)
+        self.assertIn('supervisor restarting owned pair after ${backoff}s', implementation)
+        self.assertIn('SUPERVISOR_MAX_BACKOFF', implementation)
+
+    def test_compute_supervisor_requires_explicit_safe_replacement(self) -> None:
+        text = SCRIPT.read_text()
+        start = text.index("supervise_compute_instance()")
+        end = text.index("cmd_supervise()", start)
+        implementation = text[start:end]
+
+        self.assertIn('SUPERVISE_COMPUTE_REPLACE:-false', implementation)
+        self.assertIn('drain_worker_instance "$i"', implementation)
+        self.assertLess(
+            implementation.index('drain_worker_instance "$i"'),
+            implementation.index('stop_worker_instance "$i"'),
+        )
+        self.assertLess(
+            implementation.index('stop_worker_instance "$i"'),
+            implementation.index('stop_vllm_instance "$i"'),
+        )
+
+    def test_supervise_cli_routes_compute_instance(self) -> None:
+        text = SCRIPT.read_text()
+
+        self.assertIn('supervise) cmd_supervise "$2" "$3"', text)
+        self.assertIn('supervise_compute_instance "$instance_index"', text)
+
+    def test_rustfs_upload_is_disabled_by_default_but_overridable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            default = run_bash('printf "%s" "$RUSTFS_ENABLED"', tmp_path)
+            override = run_bash(
+                'RUSTFS_ENABLED=true; source "{}"; printf "%s" "$RUSTFS_ENABLED"'.format(SCRIPT),
+                tmp_path,
+            )
+
+        self.assertEqual(default.returncode, 0, default.stderr)
+        self.assertEqual(default.stdout, "false")
+        self.assertEqual(override.returncode, 0, override.stderr)
+        self.assertEqual(override.stdout, "true")
+        self.assertIn('RUSTFS_ENABLED="$RUSTFS_ENABLED"', SCRIPT.read_text())
+
+    def test_docker_controller_is_disabled_for_host_managed_vllm(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            default = run_bash('printf "%s" "$VLLM_DOCKER_CONTROLLER_ENABLED"', tmp_path)
+            override = run_bash(
+                'VLLM_DOCKER_CONTROLLER_ENABLED=true; source "{}"; printf "%s" "$VLLM_DOCKER_CONTROLLER_ENABLED"'.format(SCRIPT),
+                tmp_path,
+            )
+
+        self.assertEqual(default.returncode, 0, default.stderr)
+        self.assertEqual(default.stdout, "false")
+        self.assertEqual(override.returncode, 0, override.stderr)
+        self.assertEqual(override.stdout, "true")
+        self.assertIn(
+            'VLLM_DOCKER_CONTROLLER_ENABLED="$VLLM_DOCKER_CONTROLLER_ENABLED"',
+            SCRIPT.read_text(),
+        )
+
+    def test_queue_envs_are_instance_scoped_and_exported(self) -> None:
+        text = SCRIPT.read_text()
+
+        self.assertIn('REDIS_CLAIM_MAINTENANCE_KEY="tianshu:claim_maintenance:${INSTANCE_ID}"', text)
+        self.assertIn('REDIS_CLAIM_PAUSE_KEY="tianshu:claim_pause:${INSTANCE_ID}"', text)
+        self.assertIn('SQLITE_QUEUE_FALLBACK="${SQLITE_QUEUE_FALLBACK:-false}"', text)
+        self.assertNotIn('record_worker_maintenance', text)
+        self.assertGreaterEqual(text.count('REDIS_CLAIM_MAINTENANCE_KEY="$REDIS_CLAIM_MAINTENANCE_KEY"'), 3)
+        self.assertGreaterEqual(text.count('REDIS_CLAIM_PAUSE_KEY="$REDIS_CLAIM_PAUSE_KEY"'), 3)
+        self.assertGreaterEqual(text.count('SQLITE_QUEUE_FALLBACK="$SQLITE_QUEUE_FALLBACK"'), 3)
+
+    def test_sqlite_queue_fallback_defaults_false_but_allows_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            default = run_bash('printf "%s" "$SQLITE_QUEUE_FALLBACK"', tmp_path)
+            override = run_bash('SQLITE_QUEUE_FALLBACK=true; source "{}"; printf "%s" "$SQLITE_QUEUE_FALLBACK"'.format(SCRIPT), tmp_path)
+
+        self.assertEqual(default.returncode, 0, default.stderr)
+        self.assertEqual(default.stdout, "false")
+        self.assertEqual(override.returncode, 0, override.stderr)
+        self.assertEqual(override.stdout, "true")
+
+    def test_watchdog_repairs_by_instance_not_global_restart(self) -> None:
+        text = SCRIPT.read_text()
+
+        self.assertIn('bash "$TIANSHU_SCRIPT" start worker "$idx"', text)
+        self.assertNotIn('bash "$TIANSHU_SCRIPT" start worker >>', text)
+        self.assertNotIn('pkill -f "litserve_worker.py', text)
+
+
+if __name__ == "__main__":
+    unittest.main()
