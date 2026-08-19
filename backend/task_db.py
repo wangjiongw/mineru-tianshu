@@ -20,6 +20,12 @@ import json
 import uuid
 import shutil
 import os
+import errno
+import fcntl
+import hashlib
+import random
+import tempfile
+import time
 from contextlib import contextmanager
 from typing import Optional, List, Dict
 from pathlib import Path
@@ -35,6 +41,126 @@ except ImportError:
 
     def get_redis_queue():
         return None
+
+
+_SQLITE_LOCK_DEADLINE_SECONDS = float(os.getenv("SQLITE_LOCK_DEADLINE_SECONDS", "45"))
+_SQLITE_BUSY_BASE_SLEEP_SECONDS = float(os.getenv("SQLITE_BUSY_BASE_SLEEP_SECONDS", "0.02"))
+_SQLITE_BUSY_MAX_SLEEP_SECONDS = float(os.getenv("SQLITE_BUSY_MAX_SLEEP_SECONDS", "0.5"))
+_SQLITE_BUSY_ERRORS = ("database is locked", "database table is locked", "SQLITE_BUSY", "SQLITE_LOCKED")
+
+
+def _sqlite_queue_fallback_enabled() -> bool:
+    return os.getenv("SQLITE_QUEUE_FALLBACK", "true").lower() not in {"0", "false", "no", "off"}
+
+
+_REDIS_MAINTENANCE_SENTINEL = object()
+_REDIS_COORDINATION_FAILURE_SENTINEL = object()
+
+
+def _is_sqlite_busy(exc: Exception) -> bool:
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    message = str(exc)
+    return any(token in message for token in _SQLITE_BUSY_ERRORS)
+
+
+class RetryableSQLiteWriteTimeout(sqlite3.OperationalError):
+    """Raised when the local SQLite write lock cannot be acquired in time."""
+
+
+class _SQLiteWriteLock:
+    def __init__(self, db_path: str, deadline_seconds: float = _SQLITE_LOCK_DEADLINE_SECONDS):
+        digest = hashlib.sha256(str(Path(db_path).resolve()).encode()).hexdigest()[:16]
+        self.path = Path(tempfile.gettempdir()) / f"mineru_tianshu_sqlite_{digest}.lock"
+        self.deadline_seconds = deadline_seconds
+        self._fh = None
+        self.deadline = time.monotonic() + deadline_seconds
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = self.path.open("a+")
+        attempt = 0
+        while True:
+            try:
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self.deadline
+            except OSError as exc:
+                if exc.errno not in (errno.EACCES, errno.EAGAIN) or time.monotonic() >= self.deadline:
+                    raise RetryableSQLiteWriteTimeout(f"database is locked: timed out waiting for {self.path}") from exc
+                sleep_for = min(_SQLITE_BUSY_MAX_SLEEP_SECONDS, _SQLITE_BUSY_BASE_SLEEP_SECONDS * (2 ** attempt))
+                time.sleep(random.uniform(0, sleep_for))
+                attempt += 1
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._fh is not None:
+            try:
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+            finally:
+                self._fh.close()
+                self._fh = None
+
+
+class _LazyLockingCursor:
+    WRITE_PREFIXES = ("INSERT", "UPDATE", "DELETE", "REPLACE", "CREATE", "DROP", "ALTER", "BEGIN IMMEDIATE", "BEGIN EXCLUSIVE", "VACUUM")
+    WRITE_PRAGMAS = ("PRAGMA JOURNAL_MODE", "PRAGMA WAL_CHECKPOINT")
+
+    def __init__(self, cursor, db_path: str):
+        self._cursor = cursor
+        self._db_path = db_path
+        self._lock = None
+        self._deadline = time.monotonic() + _SQLITE_LOCK_DEADLINE_SECONDS
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+    @property
+    def has_write_lock(self) -> bool:
+        return self._lock is not None
+
+    @property
+    def deadline(self) -> float:
+        return self._deadline
+
+    def close_lock(self) -> None:
+        if self._lock is not None:
+            self._lock.__exit__(None, None, None)
+            self._lock = None
+
+    def _needs_write_lock(self, sql: str) -> bool:
+        normalized = sql.lstrip().upper()
+        return normalized.startswith(self.WRITE_PREFIXES) or normalized.startswith(self.WRITE_PRAGMAS)
+
+    def _ensure_write_lock(self) -> None:
+        if self._lock is None:
+            self._lock = _SQLiteWriteLock(self._db_path)
+            self._deadline = self._lock.__enter__()
+
+    def _retry(self, func, *args, **kwargs):
+        attempt = 0
+        while True:
+            try:
+                return func(*args, **kwargs)
+            except sqlite3.OperationalError as exc:
+                if not _is_sqlite_busy(exc) or time.monotonic() >= self._deadline:
+                    raise
+                sleep_for = min(_SQLITE_BUSY_MAX_SLEEP_SECONDS, _SQLITE_BUSY_BASE_SLEEP_SECONDS * (2 ** attempt))
+                time.sleep(random.uniform(0, sleep_for))
+                attempt += 1
+
+    def execute(self, sql, *args, **kwargs):
+        if self._needs_write_lock(sql):
+            self._ensure_write_lock()
+        return self._retry(self._cursor.execute, sql, *args, **kwargs)
+
+    def executemany(self, sql, *args, **kwargs):
+        if self._needs_write_lock(sql):
+            self._ensure_write_lock()
+        return self._retry(self._cursor.executemany, sql, *args, **kwargs)
+
+    def executescript(self, sql, *args, **kwargs):
+        if any(self._needs_write_lock(part) for part in sql.split(";")):
+            self._ensure_write_lock()
+        return self._retry(self._cursor.executescript, sql, *args, **kwargs)
 
 
 class TaskDB:
@@ -82,15 +208,24 @@ class TaskDB:
     def get_cursor(self):
         """上下文管理器，自动提交和错误处理"""
         conn = self._get_conn()
-        cursor = conn.cursor()
+        cursor = _LazyLockingCursor(conn.cursor(), self.db_path)
         try:
             yield cursor
-            conn.commit()
+            while True:
+                try:
+                    conn.commit()
+                    break
+                except sqlite3.OperationalError as exc:
+                    if not cursor.has_write_lock or not _is_sqlite_busy(exc) or time.monotonic() >= cursor.deadline:
+                        raise
+                    time.sleep(random.uniform(0, _SQLITE_BUSY_MAX_SLEEP_SECONDS))
         except Exception as e:
             conn.rollback()
             raise e
         finally:
+            cursor.close_lock()
             conn.close()  # 关闭连接
+
 
     def _init_db(self):
         """初始化数据库表"""
@@ -195,6 +330,42 @@ class TaskDB:
             cursor.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_task_dedup ON tasks(file_hash, backend, lang, method)"
             )
+
+            if os.getenv("MINERU_AUTO_CREATE_QUEUE_INDEXES", "false").lower() in {"1", "true", "yes", "on"}:
+                logger.warning("MINERU_AUTO_CREATE_QUEUE_INDEXES enabled; building queue indexes during startup")
+                self.ensure_queue_indexes(cursor)
+
+    def ensure_queue_indexes(self, cursor=None) -> None:
+        """Create optional queue/reconciliation indexes during an explicit maintenance window."""
+        statements = [
+            """
+            CREATE INDEX IF NOT EXISTS idx_tasks_pending_claim
+            ON tasks(priority DESC, created_at ASC, task_id)
+            WHERE status = 'pending'
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_tasks_active_started
+            ON tasks(started_at, task_id)
+            WHERE status IN ('processing', 'merging')
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_tasks_parent_status_nonnull
+            ON tasks(parent_task_id, status)
+            WHERE parent_task_id IS NOT NULL
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_tasks_terminal_completed_at
+            ON tasks(completed_at, status)
+            WHERE completed_at IS NOT NULL
+            """,
+        ]
+        if cursor is not None:
+            for statement in statements:
+                cursor.execute(statement)
+            return
+        with self.get_cursor() as locked_cursor:
+            for statement in statements:
+                locked_cursor.execute(statement)
 
     def get_task_by_dedup(self, file_hash: str, backend: str, lang: str, method: str) -> Optional[Dict]:
         with self.get_cursor() as cursor:
@@ -319,10 +490,17 @@ class TaskDB:
 
         # 尝试使用 Redis 队列（如果可用）
         task = self._get_next_task_redis(worker_id)
+        if task is _REDIS_MAINTENANCE_SENTINEL:
+            return None
+        if task is _REDIS_COORDINATION_FAILURE_SENTINEL:
+            return None
         if task is not None:
             return task
 
-        # Redis 不可用或出错，回退到 SQLite
+        # Redis 不可用或出错，按开关决定是否回退到 SQLite（默认启用）
+        if not _sqlite_queue_fallback_enabled():
+            return None
+
         for attempt in range(max_retries):
             try:
                 with self.get_cursor() as cursor:
@@ -333,7 +511,7 @@ class TaskDB:
                     cursor.execute("""
                         SELECT * FROM tasks
                         WHERE status = 'pending'
-                        ORDER BY priority DESC, created_at ASC
+                        ORDER BY priority DESC, created_at ASC, task_id
                         LIMIT 1
                     """)
 
@@ -387,6 +565,12 @@ class TaskDB:
         logger.warning(f"⚠️  Failed to get task after {max_retries} attempts")
         return None
 
+    def _cleanup_failed_redis_claim(self, redis_queue, task_id: str, worker_id: str) -> None:
+        try:
+            redis_queue.fail(task_id, worker_id, requeue=True)
+        except Exception as cleanup_error:
+            logger.error(f"❌ Failed to clean up Redis claim {task_id}: {cleanup_error}")
+
     def _get_next_task_redis(self, worker_id: str) -> Optional[Dict]:
         """从 Redis 队列获取下一个任务"""
         if not REDIS_QUEUE_AVAILABLE:
@@ -396,11 +580,24 @@ class TaskDB:
         if not redis_queue:
             return None
 
+        task_id = None
         try:
-            # 从 Redis 获取任务 ID（阻塞式，1秒超时）
-            task_id = redis_queue.dequeue(worker_id, timeout=1.0)
-            if not task_id:
-                return None
+            # 从 Redis 原子 claim 任务 ID，并区分空队列与 Redis 不可用
+            if hasattr(redis_queue, "claim"):
+                claim = redis_queue.claim(worker_id, timeout=1.0)
+                if claim.status == "unavailable":
+                    logger.error(f"❌ Redis unavailable during claim: {claim.error}")
+                    return None
+                if claim.status == "maintenance":
+                    logger.info("Redis queue claims paused for maintenance")
+                    return _REDIS_MAINTENANCE_SENTINEL
+                if claim.status == "empty":
+                    return None
+                task_id = claim.task_id
+            else:
+                task_id = redis_queue.dequeue(worker_id, timeout=1.0)
+                if not task_id:
+                    return None
 
             # 从 SQLite 获取完整任务数据
             with self.get_cursor() as cursor:
@@ -410,7 +607,7 @@ class TaskDB:
                 if not task:
                     logger.error(f"❌ Task {task_id} found in Redis but not in SQLite")
                     redis_queue.fail(task_id, worker_id, requeue=False)
-                    return None
+                    return _REDIS_COORDINATION_FAILURE_SENTINEL
 
                 # 更新 SQLite 中的任务状态
                 cursor.execute(
@@ -426,15 +623,17 @@ class TaskDB:
 
                 if cursor.rowcount == 0:
                     logger.warning(f"⚠️  Task {task_id} status changed, skipping")
-                    redis_queue.fail(task_id, worker_id, requeue=False)
-                    return None
+                    redis_queue.fail(task_id, worker_id, requeue=(task["status"] == "pending"))
+                    return _REDIS_COORDINATION_FAILURE_SENTINEL
 
                 logger.info(f"📤 [Redis] Task {task_id} claimed by worker {worker_id}")
                 return dict(task)
 
         except Exception as e:
-            logger.error(f"❌ Redis dequeue failed, falling back to SQLite: {e}")
-            return None
+            logger.error(f"❌ Redis/SQLite claim coordination failed: {e}")
+            if task_id:
+                self._cleanup_failed_redis_claim(redis_queue, task_id, worker_id)
+            return _REDIS_COORDINATION_FAILURE_SENTINEL
 
     def update_task_status(
         self,

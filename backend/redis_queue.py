@@ -42,6 +42,8 @@ class RedisConfig:
     # 队列配置
     queue_key: str = "tianshu:task_queue"  # 优先级队列 (Sorted Set)
     processing_key: str = "tianshu:processing"  # 处理中任务 (Set)
+    claim_maintenance_key: str = "tianshu:claim_maintenance"  # claim/reconcile maintenance metadata
+    claim_pause_key: str = "tianshu:claim_pause"  # explicit claim pause flag
     task_data_prefix: str = "tianshu:task:"  # 任务数据前缀 (Hash)
 
     # 超时配置
@@ -58,8 +60,23 @@ class RedisConfig:
             password=os.getenv("REDIS_PASSWORD") or None,
             queue_key=os.getenv("REDIS_QUEUE_KEY", "tianshu:task_queue"),
             processing_key=os.getenv("REDIS_PROCESSING_KEY", "tianshu:processing"),
+            claim_maintenance_key=os.getenv("REDIS_CLAIM_MAINTENANCE_KEY", "tianshu:claim_maintenance"),
+            claim_pause_key=os.getenv("REDIS_CLAIM_PAUSE_KEY", "tianshu:claim_pause"),
             task_timeout_seconds=int(os.getenv("REDIS_TASK_TIMEOUT", "3600")),
         )
+
+
+@dataclass
+class QueueClaim:
+    """Result of a Redis queue claim."""
+
+    status: str
+    task_id: Optional[str] = None
+    error: Optional[str] = None
+
+    @property
+    def claimed(self) -> bool:
+        return self.status == "claimed" and self.task_id is not None
 
 
 class RedisTaskQueue:
@@ -89,6 +106,7 @@ class RedisTaskQueue:
         self.config = config or RedisConfig.from_env()
         self._client: Optional[redis.Redis] = None
         self._connected = False
+        self._claim_script_sha: Optional[str] = None
 
     @property
     def client(self) -> redis.Redis:
@@ -115,6 +133,95 @@ class RedisTaskQueue:
         except Exception as e:
             logger.warning(f"Redis not available: {e}")
             self._connected = False
+            return False
+
+    def _claim_script(self) -> str:
+        return """
+if redis.call('GET', KEYS[4]) then
+  return { 'maintenance', false }
+end
+local item = redis.call('ZRANGE', KEYS[1], 0, 0, 'WITHSCORES')
+if #item == 0 then
+  return { 'empty', false }
+end
+local task_id = item[1]
+local removed = redis.call('ZREM', KEYS[1], task_id)
+if removed == 0 then
+  return { 'empty', false }
+end
+redis.call('HSET', KEYS[2], task_id, ARGV[1])
+redis.call('HSET', KEYS[3], 'last_claimed_at', ARGV[2], 'last_worker_id', ARGV[3])
+return { 'claimed', task_id }
+"""
+
+    def claim(self, worker_id: str, timeout: float = 1.0) -> QueueClaim:
+        """Atomically move one task from the sorted queue into processing."""
+        deadline = time.monotonic() + max(timeout, 0.0)
+
+        while True:
+            try:
+                now = time.time()
+                processing_data = json.dumps({"worker_id": worker_id, "claimed_at": now})
+                if self._claim_script_sha is None:
+                    self._claim_script_sha = self.client.script_load(self._claim_script())
+
+                result = self.client.evalsha(
+                    self._claim_script_sha,
+                    4,
+                    self.config.queue_key,
+                    self.config.processing_key,
+                    self.config.claim_maintenance_key,
+                    self.config.claim_pause_key,
+                    processing_data,
+                    str(now),
+                    worker_id,
+                )
+                status = result[0] if result else "empty"
+                if status == "claimed":
+                    task_id = result[1]
+                    logger.debug(f"📤 Task {task_id} claimed by worker {worker_id}")
+                    return QueueClaim(status="claimed", task_id=task_id)
+                if status == "maintenance":
+                    return QueueClaim(status="maintenance")
+                return QueueClaim(status="empty")
+            except Exception as e:
+                if e.__class__.__name__ == "NoScriptError" or "NOSCRIPT" in str(e).upper():
+                    self._claim_script_sha = None
+                    continue
+                logger.error(f"❌ Failed to claim task: {e}")
+                self._connected = False
+                return QueueClaim(status="unavailable", error=str(e))
+
+            if time.monotonic() >= deadline:
+                return QueueClaim(status="empty")
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+    def set_claim_maintenance(self, reason: str = "maintenance") -> bool:
+        """Pause new Redis claims without altering queue metadata."""
+        try:
+            self.client.set(self.config.claim_pause_key, reason)
+            self.client.hset(self.config.claim_maintenance_key, mapping={"paused_at": str(time.time()), "pause_reason": reason})
+            return True
+        except Exception as e:
+            logger.error(f"❌ Failed to pause Redis claims: {e}")
+            return False
+
+    def clear_claim_maintenance(self) -> bool:
+        """Resume Redis claims."""
+        try:
+            self.client.delete(self.config.claim_pause_key)
+            self.client.hset(self.config.claim_maintenance_key, mapping={"resumed_at": str(time.time())})
+            return True
+        except Exception as e:
+            logger.error(f"❌ Failed to resume Redis claims: {e}")
+            return False
+
+    def is_claim_maintenance(self) -> bool:
+        """Return whether new Redis claims are paused."""
+        try:
+            return bool(self.client.get(self.config.claim_pause_key))
+        except Exception as e:
+            logger.error(f"❌ Failed to read Redis claim maintenance flag: {e}")
             return False
 
     def enqueue(
@@ -186,31 +293,8 @@ class RedisTaskQueue:
         Returns:
             task_id: 任务ID，如果没有任务返回 None
         """
-        try:
-            # 使用 BZPOPMIN 阻塞获取最小 score 的元素（最高优先级）
-            result = self.client.bzpopmin(self.config.queue_key, timeout=timeout)
-
-            if result is None:
-                return None
-
-            # result = (key, member, score)
-            _, task_id, _ = result
-
-            # 将任务添加到 processing set（带时间戳）
-            processing_data = json.dumps(
-                {
-                    "worker_id": worker_id,
-                    "claimed_at": time.time(),
-                }
-            )
-            self.client.hset(self.config.processing_key, task_id, processing_data)
-
-            logger.debug(f"📤 Task {task_id} claimed by worker {worker_id}")
-            return task_id
-
-        except Exception as e:
-            logger.error(f"❌ Failed to dequeue task: {e}")
-            return None
+        claim = self.claim(worker_id, timeout=timeout)
+        return claim.task_id if claim.claimed else None
 
     def complete(self, task_id: str, worker_id: str) -> bool:
         """
@@ -394,6 +478,8 @@ class RedisTaskQueue:
             pipe = self.client.pipeline()
             pipe.delete(self.config.queue_key)
             pipe.delete(self.config.processing_key)
+            pipe.delete(self.config.claim_maintenance_key)
+            pipe.delete(self.config.claim_pause_key)
             # 清理所有任务数据
             keys = self.client.keys(f"{self.config.task_data_prefix}*")
             if keys:
