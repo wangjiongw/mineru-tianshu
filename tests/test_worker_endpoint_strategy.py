@@ -121,6 +121,10 @@ _install_import_stubs()
 worker = importlib.import_module("backend.litserve_worker")
 
 
+def test_worker_import_binds_output_normalizer_stub():
+    assert worker.normalize_output is sys.modules["output_normalizer"].normalize_output
+
+
 class FakeTaskDB:
     def __init__(self, failures):
         self.failures = list(failures)

@@ -77,6 +77,7 @@ except Exception as e:
 import litserve as ls
 from litserve.connector import check_cuda_with_nvidia_smi
 from loguru import logger
+from output_normalizer import normalize_output
 
 # Add parent dir to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
