@@ -897,6 +897,7 @@ def sqlite_task_cohort_floor(db_path: Path) -> dict[str, Any]:
             "reason": f"database not found: {db_path}",
             "rowid_floor": None,
             "scope": "unknown",
+            "source": "auto_before_collection",
             "semantics": semantics,
         }
     try:
@@ -912,6 +913,7 @@ def sqlite_task_cohort_floor(db_path: Path) -> dict[str, Any]:
             "reason": str(exc),
             "rowid_floor": None,
             "scope": "unknown",
+            "source": "auto_before_collection",
             "semantics": semantics,
         }
     return {
@@ -919,7 +921,22 @@ def sqlite_task_cohort_floor(db_path: Path) -> dict[str, Any]:
         "reason": None,
         "rowid_floor": 0 if rowid_floor is None else int(rowid_floor),
         "scope": "rowid_gt_floor",
+        "source": "auto_before_collection",
         "semantics": semantics,
+    }
+
+
+def explicit_task_cohort_floor(rowid_floor: int) -> dict[str, Any]:
+    return {
+        "status": "known",
+        "reason": None,
+        "rowid_floor": rowid_floor,
+        "scope": "rowid_gt_floor",
+        "source": "explicit_cli",
+        "semantics": (
+            "duration task counts and typed metrics include tasks with rowid greater than the explicit CLI floor; "
+            "reuse the same --cohort-floor for repeated baseline/canary/final evaluations of one already submitted batch"
+        ),
     }
 
 
@@ -929,6 +946,7 @@ def sample_task_cohort() -> dict[str, Any]:
         "reason": None,
         "rowid_floor": None,
         "scope": "global_status_only_sample",
+        "source": "sample",
         "semantics": "sample mode reports global task status counts and skips typed completed-task metrics",
     }
 
@@ -1737,7 +1755,13 @@ def run_evaluation(args: argparse.Namespace) -> dict[str, Any]:
     started_at = utc_now()
     start_monotonic = time.monotonic()
     start_cpu = read_cpu_times()
-    task_cohort = sample_task_cohort() if args.sample else sqlite_task_cohort_floor(args.database)
+    explicit_cohort_floor = getattr(args, "cohort_floor", None)
+    if args.sample:
+        task_cohort = sample_task_cohort()
+    elif explicit_cohort_floor is not None:
+        task_cohort = explicit_task_cohort_floor(explicit_cohort_floor)
+    else:
+        task_cohort = sqlite_task_cohort_floor(args.database)
     cohort_floor = task_cohort["rowid_floor"] if task_cohort["status"] == "known" else None
     collect_task_metrics = not args.sample and task_cohort["status"] == "known"
     task_start = sqlite_counts(
@@ -1883,6 +1907,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--record-baseline", type=Path, help="write this run's successful throughput baseline JSON to path")
     parser.add_argument("--evaluate-report", type=Path, help="re-evaluate an existing report without collecting new evidence")
     parser.add_argument("--sample", action="store_true", help="take one short sample for tests/smoke checks")
+    parser.add_argument(
+        "--cohort-floor",
+        type=int,
+        default=None,
+        help="duration mode task rowid floor; count only tasks with rowid greater than this value",
+    )
     parser.add_argument("--host", default="localhost", help="host for local HTTP probes")
     parser.add_argument("--database", type=Path, default=default_db_path())
     parser.add_argument("--log-path", type=Path, action="append", default=None, help="log file or directory to scan")
@@ -1894,6 +1924,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.cohort_floor is not None and args.cohort_floor < 0:
+        parser.error("--cohort-floor must be >= 0")
+    if args.sample and args.cohort_floor is not None:
+        parser.error("--cohort-floor cannot be used with --sample")
     if args.evaluate_report:
         if args.record_baseline:
             parser.error("--evaluate-report cannot be combined with --record-baseline")
