@@ -50,6 +50,7 @@ DEFAULT_WORKER_PORTS = list(range(8101, 8109))
 DEFAULT_VLLM_PORTS = list(range(30025, 30033))
 EXPECTED_WORKER_COUNT = 8
 EXPECTED_VLLM_COUNT = 8
+DEFAULT_STALE_PARENT_MERGE_THRESHOLD_SECONDS = 600.0
 DB_LOCK_TERMINAL_RE = re.compile(
     r"(?:\b(?:terminal|failed|failure|mark(?:ed)?\s+failed|status[=: ]+failed)\b.{0,240}database\s+is\s+locked)"
     r"|(?:database\s+is\s+locked.{0,240}\b(?:terminal|failed|failure|mark(?:ed)?\s+failed|status[=: ]+failed)\b)",
@@ -59,6 +60,11 @@ OOM_PREEMPTION_RE = re.compile(
     r"\b(?:oom|out\s+of\s+memory|memory\s+allocation\s+fail(?:ed|ure)?|acl_error_rt_memory_allocation|preempt(?:ion|ed)?)\b",
     re.IGNORECASE,
 )
+API_HTTP_500_RE = re.compile(
+    r"(?:\b(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\b.{0,240}\b500\b)|(?:\bstatus(?:_code)?[=: ]+500\b)|(?:\bHTTP/\d(?:\.\d)?[\"]?\s+500\b)|(?:\b500\s+(?:Internal Server Error|ERROR)\b)",
+    re.IGNORECASE,
+)
+PAGE_COUNT_KEYS = ("page_count", "total_pages", "pages")
 
 
 @dataclass(frozen=True)
@@ -194,6 +200,20 @@ def parse_vllm_metrics(text: str) -> dict[str, float]:
     return summary
 
 
+def first_number(text: str) -> float | None:
+    match = re.search(r"-?\d+(?:\.\d+)?", text)
+    return None if match is None else float(match.group(0))
+
+
+def parse_percent_or_ratio(text: str) -> float | None:
+    numbers = [float(match) for match in re.findall(r"\d+(?:\.\d+)?", text)]
+    if not numbers:
+        return None
+    if "/" in text and len(numbers) >= 2 and numbers[-1] > 0:
+        return numbers[-2] * 100.0 / numbers[-1]
+    return numbers[-1]
+
+
 def parse_npu_smi(text: str) -> list[dict[str, float]]:
     cards: dict[int, dict[str, float]] = {}
     current_card: int | None = None
@@ -201,11 +221,52 @@ def parse_npu_smi(text: str) -> list[dict[str, float]]:
         line = raw_line.strip()
         if not line:
             continue
+        lower = line.lower()
+        if "npu-smi" in lower or "version" in lower:
+            continue
         if line.startswith("|"):
             cols = [part.strip() for part in line.strip("|").split("|")]
             if len(cols) >= 2:
                 first_match = re.match(r"\s*(\d+)", cols[0])
                 first = int(first_match.group(1)) if first_match else -1
+                if 0 <= first < 8:
+                    card = cards.setdefault(first, {"card_id": float(first)})
+                    if len(cols) >= 3 and re.match(r"^\d+\s+\S+", cols[0]) and cols[1].lower() in {"ok", "warning", "fault", "unhealthy"}:
+                        power_temp = [float(match) for match in re.findall(r"\d+(?:\.\d+)?", cols[2])]
+                        if len(power_temp) >= 2:
+                            card["power_w"] = power_temp[0]
+                            card["temperature_c"] = power_temp[1]
+                            current_card = first
+                            continue
+                    positional_values = [first_number(col) for col in cols[1:5]]
+                    if len(cols) >= 5 and all(value is not None for value in positional_values):
+                        card["power_w"] = float(positional_values[0])
+                        card["temperature_c"] = float(positional_values[1])
+                        card["util_percent"] = float(positional_values[2])
+                        card["hbm_percent"] = float(positional_values[3])
+                        continue
+                    parsed_named_metric = False
+                    for col in cols[1:]:
+                        col_lower = col.lower()
+                        value = first_number(col)
+                        if value is None:
+                            continue
+                        if "power" in col_lower or re.search(r"\b\d+(?:\.\d+)?\s*w\b", col_lower):
+                            card["power_w"] = value
+                            parsed_named_metric = True
+                        elif "temp" in col_lower or "temperature" in col_lower or re.search(r"\b\d+(?:\.\d+)?\s*c\b", col_lower):
+                            card["temperature_c"] = value
+                            parsed_named_metric = True
+                        elif "aicore" in col_lower or "ai core" in col_lower or "util" in col_lower:
+                            card["util_percent"] = value
+                            parsed_named_metric = True
+                        elif "hbm" in col_lower or "memory" in col_lower:
+                            hbm = parse_percent_or_ratio(col)
+                            if hbm is not None:
+                                card["hbm_percent"] = hbm
+                                parsed_named_metric = True
+                    if parsed_named_metric:
+                        continue
                 if 0 <= first < 8 and ":" not in cols[1] and cols[1] != "0":
                     current_card = first
                     cards.setdefault(first, {"card_id": float(first)})
@@ -219,9 +280,6 @@ def parse_npu_smi(text: str) -> list[dict[str, float]]:
                         card["hbm_percent"] = numeric_tail[-2] * 100.0 / numeric_tail[-1]
                     continue
 
-        lower = line.lower()
-        if "npu-smi" in lower or "version" in lower:
-            continue
         numbers = [float(match) for match in re.findall(r"\d+(?:\.\d+)?", line)]
         if not numbers:
             continue
@@ -230,11 +288,18 @@ def parse_npu_smi(text: str) -> list[dict[str, float]]:
             continue
         card = cards.setdefault(card_id, {"card_id": float(card_id)})
         if "hbm" in lower or "memory" in lower:
-            if len(numbers) >= 2:
-                card["hbm_percent"] = numbers[-1]
+            hbm = parse_percent_or_ratio(line)
+            if hbm is not None:
+                card["hbm_percent"] = hbm
         if "util" in lower or "aicore" in lower or "ai core" in lower:
             if len(numbers) >= 2:
                 card["util_percent"] = numbers[-1]
+        if "power" in lower or re.search(r"\b\d+(?:\.\d+)?\s*w\b", lower):
+            if len(numbers) >= 2:
+                card["power_w"] = numbers[-1]
+        if "temp" in lower or "temperature" in lower or re.search(r"\b\d+(?:\.\d+)?\s*c\b", lower):
+            if len(numbers) >= 2:
+                card["temperature_c"] = numbers[-1]
     return [cards[key] for key in sorted(cards)]
 
 
@@ -287,21 +352,520 @@ def cpu_delta(start: dict[str, int] | Unknown, end: dict[str, int] | Unknown) ->
     )
 
 
-def sqlite_counts(db_path: Path) -> dict[str, Any]:
+def parse_json_object(raw: Any) -> dict[str, Any]:
+    if raw in (None, ""):
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    try:
+        parsed = json.loads(str(raw))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def nested_get(mapping: dict[str, Any], path: tuple[str, ...]) -> Any:
+    current: Any = mapping
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+        if current is None:
+            return None
+    return current
+
+
+def task_page_count(row: sqlite3.Row) -> float | None:
+    data = parse_json_object(row["data"] if "data" in row.keys() else None)
+    for key in PAGE_COUNT_KEYS:
+        value = nested_get(data, ("metrics", key))
+        if value is not None:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                pass
+    options = parse_json_object(row["options"] if "options" in row.keys() else None)
+    for key in PAGE_COUNT_KEYS:
+        value = nested_get(options, ("chunk_info", key))
+        if value is not None:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
+
+def float_row_value(row: sqlite3.Row, key: str) -> float | None:
+    if key not in row.keys():
+        return None
+    value = row[key]
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def task_page_count_from_options(row: sqlite3.Row) -> float | None:
+    options = parse_json_object(row["options"] if "options" in row.keys() else None)
+    for key in PAGE_COUNT_KEYS:
+        value = nested_get(options, ("chunk_info", key))
+        if value is not None:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
+def task_page_count_light(row: sqlite3.Row) -> tuple[float | None, str | None]:
+    page_count = float_row_value(row, "page_count")
+    if page_count is not None:
+        return page_count, "page_count"
+    page_count = task_page_count_from_options(row)
+    if page_count is not None:
+        return page_count, "options.chunk_info"
+    return None, None
+
+
+def parse_timestamp(raw: Any) -> datetime | None:
+    if raw in (None, ""):
+        return None
+    text = str(raw).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    for fmt in (None, "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
+        try:
+            if fmt is None:
+                parsed = datetime.fromisoformat(text)
+            else:
+                parsed = datetime.strptime(text, fmt)
+            return parsed
+        except ValueError:
+            continue
+    return None
+
+
+def processing_seconds(row: sqlite3.Row) -> float | None:
+    started = parse_timestamp(row["started_at"] if "started_at" in row.keys() else None)
+    completed = parse_timestamp(row["completed_at"] if "completed_at" in row.keys() else None)
+    if started is None or completed is None:
+        return None
+    value = (completed - started).total_seconds()
+    return value if value >= 0 else None
+
+
+
+def task_processing_seconds_light(row: sqlite3.Row) -> tuple[float | None, str | None]:
+    seconds = float_row_value(row, "processing_seconds")
+    if seconds is not None:
+        return seconds, "processing_seconds"
+    seconds = processing_seconds(row)
+    if seconds is not None:
+        return seconds, "timestamps"
+    return None, None
+
+
+def timestamp_age_seconds(value: Any, now: datetime) -> float | None:
+    parsed = parse_timestamp(value)
+    if parsed is None:
+        return None
+    if parsed.tzinfo is not None:
+        now_value = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+        parsed_value = parsed
+    else:
+        now_value = now.replace(tzinfo=None)
+        parsed_value = parsed.replace(tzinfo=None)
+    age = (now_value - parsed_value).total_seconds()
+    return age if age >= 0 else 0.0
+
+
+def empty_parent_merge_backlog(status: str, reason: str, threshold_seconds: float) -> dict[str, Any]:
+    return {
+        "status": status,
+        "reason": reason,
+        "threshold_seconds": threshold_seconds,
+        "total_merging_parents": None,
+        "active_merging_parents": None,
+        "recoverable_stale_merging_parents": None,
+        "blocked_merging_parents": None,
+        "stale_merging_parents": None,
+        "oldest_age_seconds": None,
+        "age_sources": [],
+        "age_source": None,
+    }
+
+
+def row_value(row: sqlite3.Row, columns: set[str], key: str) -> Any:
+    return row[key] if key in columns else None
+
+
+def int_or_none(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def compute_parent_merge_backlog(
+    rows: list[sqlite3.Row],
+    columns: set[str],
+    stale_threshold_seconds: float = DEFAULT_STALE_PARENT_MERGE_THRESHOLD_SECONDS,
+    now: datetime | None = None,
+    max_attempts: int = 3,
+) -> dict[str, Any]:
+    required = {"status", "parent_task_id", "started_at"}
+    missing = sorted(required - columns)
+    if missing:
+        return empty_parent_merge_backlog("unknown", f"task schema missing columns: {missing}", stale_threshold_seconds)
+    now_value = now or datetime.now(timezone.utc)
+    total = 0
+    active = 0
+    recoverable_stale = 0
+    blocked = 0
+    ages: list[float] = []
+    age_sources: set[str] = set()
+    notes: set[str] = set()
+    for row in rows:
+        if row["status"] != "merging" or row["parent_task_id"] not in (None, ""):
+            continue
+        total += 1
+        attempts = int_or_none(row_value(row, columns, "merge_attempts"))
+        if attempts is None:
+            attempts = int_or_none(row_value(row, columns, "retry_count")) or 0
+        merge_owner = row_value(row, columns, "merge_owner")
+        merge_claimed_at = row_value(row, columns, "merge_claimed_at")
+        started_at = row_value(row, columns, "started_at")
+        age = None
+        age_source = None
+        if merge_claimed_at not in (None, ""):
+            age = timestamp_age_seconds(merge_claimed_at, now_value)
+            age_source = "merge_claimed_at"
+        elif started_at not in (None, ""):
+            age = timestamp_age_seconds(started_at, now_value)
+            age_source = "started_at"
+            if "merge_claimed_at" in columns:
+                notes.add("merge_claimed_at NULL; using started_at for reporting")
+            else:
+                notes.add("merge_claimed_at missing; using started_at fallback")
+        if age is not None:
+            ages.append(age)
+            if age_source:
+                age_sources.add(age_source)
+        if attempts >= max_attempts:
+            blocked += 1
+        elif merge_owner in (None, "") or merge_claimed_at in (None, ""):
+            recoverable_stale += 1
+        elif age is not None and age > stale_threshold_seconds:
+            recoverable_stale += 1
+        else:
+            active += 1
+    reason = None if not notes else "; ".join(sorted(notes))
+    sorted_age_sources = sorted(age_sources)
+    return {
+        "status": "known",
+        "reason": reason,
+        "threshold_seconds": stale_threshold_seconds,
+        "max_attempts": max_attempts,
+        "total_merging_parents": total,
+        "active_merging_parents": active,
+        "recoverable_stale_merging_parents": recoverable_stale,
+        "blocked_merging_parents": blocked,
+        "stale_merging_parents": recoverable_stale,
+        "oldest_age_seconds": None if not ages else round(max(ages), 3),
+        "age_sources": sorted_age_sources,
+        "age_source": sorted_age_sources[0] if len(sorted_age_sources) == 1 else ("mixed" if sorted_age_sources else None),
+    }
+
+
+def worker_group_key(worker_id: Any) -> str:
+    if worker_id in (None, ""):
+        return "unknown"
+    text = str(worker_id)
+    match = re.search(r"(?:group|worker)[_-]?(\d+)", text, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    match = re.search(r"\d+", text)
+    return match.group(0) if match else text
+
+
+
+def worker_group_key_light(row: sqlite3.Row) -> str:
+    if "worker_group_index" in row.keys() and row["worker_group_index"] not in (None, ""):
+        return str(row["worker_group_index"])
+    return worker_group_key(row["worker_id"] if "worker_id" in row.keys() else None)
+
+
+def empty_task_metrics(status: str, reason: str) -> dict[str, Any]:
+    return {
+        "status": status,
+        "reason": reason,
+        "logical_pdf_completed": None,
+        "leaf_completed": None,
+        "completed_pages": None,
+        "page_count_coverage": None,
+        "page_count_source": None,
+        "processing_seconds": None,
+        "worker_groups": {},
+    }
+
+
+def compute_task_metrics(rows: list[sqlite3.Row], columns: set[str]) -> dict[str, Any]:
+    required = {"parent_task_id", "options", "data", "started_at", "completed_at", "worker_id"}
+    missing = sorted(required - columns)
+    if missing:
+        return empty_task_metrics("unknown", f"task schema missing columns: {missing}")
+
+    child_counts: dict[str, int] = {}
+    for row in rows:
+        parent_id = row["parent_task_id"]
+        if parent_id:
+            child_counts[str(parent_id)] = child_counts.get(str(parent_id), 0) + 1
+
+    logical_pdf_completed = 0
+    leaf_completed = 0
+    completed_pages = 0.0
+    known_pages = 0
+    processing_total = 0.0
+    known_processing = 0
+    worker_groups: dict[str, dict[str, float]] = {}
+    for row in rows:
+        if row["status"] != "completed":
+            continue
+        task_id = str(row["task_id"])
+        is_root = row["parent_task_id"] in (None, "")
+        is_leaf = task_id not in child_counts
+        if is_root:
+            logical_pdf_completed += 1
+        if not is_leaf:
+            continue
+        leaf_completed += 1
+        page_count = task_page_count(row)
+        if page_count is not None:
+            completed_pages += page_count
+            known_pages += 1
+        seconds = processing_seconds(row)
+        if seconds is not None:
+            processing_total += seconds
+            known_processing += 1
+        group_key = worker_group_key(row["worker_id"])
+        group = worker_groups.setdefault(
+            group_key,
+            {"tasks_completed": 0.0, "pages_completed": 0.0, "processing_seconds": 0.0},
+        )
+        group["tasks_completed"] += 1.0
+        if page_count is not None:
+            group["pages_completed"] += page_count
+        if seconds is not None:
+            group["processing_seconds"] += seconds
+
+    return {
+        "status": "known",
+        "reason": None,
+        "logical_pdf_completed": logical_pdf_completed,
+        "leaf_completed": leaf_completed,
+        "completed_pages": round(completed_pages, 6),
+        "known_page_count_tasks": known_pages,
+        "processing_seconds": round(processing_total, 6),
+        "known_processing_seconds_tasks": known_processing,
+        "worker_groups": {
+            key: {
+                "tasks_completed": int(value["tasks_completed"]),
+                "pages_completed": round(value["pages_completed"], 6),
+                "processing_seconds": round(value["processing_seconds"], 6),
+            }
+            for key, value in sorted(worker_groups.items())
+        },
+    }
+
+
+def compute_task_metrics_from_leaf_rows(
+    logical_pdf_completed: int,
+    leaf_rows: Any,
+    columns: set[str],
+) -> dict[str, Any]:
+    required = {"task_id", "parent_task_id"}
+    missing = sorted(required - columns)
+    if missing:
+        return empty_task_metrics("unknown", f"task schema missing columns: {missing}")
+
+    leaf_completed = 0
+    completed_pages = 0.0
+    known_pages = 0
+    processing_total = 0.0
+    known_processing = 0
+    page_sources: set[str] = set()
+    processing_sources: set[str] = set()
+    worker_group_sources: set[str] = set()
+    worker_groups: dict[str, dict[str, float]] = {}
+    for row in leaf_rows:
+        leaf_completed += 1
+        page_count, page_source = task_page_count_light(row)
+        if page_count is not None:
+            completed_pages += page_count
+            known_pages += 1
+        if page_source:
+            page_sources.add(page_source)
+        seconds, processing_source = task_processing_seconds_light(row)
+        if seconds is not None:
+            processing_total += seconds
+            known_processing += 1
+        if processing_source:
+            processing_sources.add(processing_source)
+        group_key = worker_group_key_light(row)
+        worker_group_sources.add("worker_group_index" if "worker_group_index" in row.keys() and row["worker_group_index"] not in (None, "") else "worker_id")
+        group = worker_groups.setdefault(
+            group_key,
+            {"tasks_completed": 0.0, "pages_completed": 0.0, "processing_seconds": 0.0},
+        )
+        group["tasks_completed"] += 1.0
+        if page_count is not None:
+            group["pages_completed"] += page_count
+        if seconds is not None:
+            group["processing_seconds"] += seconds
+
+    coverage = None if leaf_completed == 0 else round(known_pages / leaf_completed, 6)
+    reason = None
+    if leaf_completed and known_pages < leaf_completed:
+        reason = "page counts only read from page_count/options.chunk_info; data.metrics not scanned during periodic snapshots"
+    return {
+        "status": "known",
+        "reason": reason,
+        "logical_pdf_completed": logical_pdf_completed,
+        "leaf_completed": leaf_completed,
+        "completed_pages": round(completed_pages, 6),
+        "known_page_count_tasks": known_pages,
+        "page_count_coverage": coverage,
+        "page_count_sources": sorted(page_sources),
+        "page_count_source": sorted(page_sources)[0] if len(page_sources) == 1 else ("mixed" if page_sources else None),
+        "processing_seconds": round(processing_total, 6),
+        "known_processing_seconds_tasks": known_processing,
+        "processing_seconds_sources": sorted(processing_sources),
+        "worker_group_sources": sorted(worker_group_sources),
+        "worker_groups": {
+            key: {
+                "tasks_completed": int(value["tasks_completed"]),
+                "pages_completed": round(value["pages_completed"], 6),
+                "processing_seconds": round(value["processing_seconds"], 6),
+            }
+            for key, value in sorted(worker_groups.items())
+        },
+    }
+
+
+def sqlite_counts(
+    db_path: Path,
+    stale_parent_threshold_seconds: float = DEFAULT_STALE_PARENT_MERGE_THRESHOLD_SECONDS,
+    now: datetime | None = None,
+) -> dict[str, Any]:
     if not db_path.exists():
-        return {"status": "unknown", "reason": f"database not found: {db_path}", "counts": {}}
+        result = {"status": "unknown", "reason": f"database not found: {db_path}", "counts": {}}
+        result["metrics"] = empty_task_metrics("unknown", result["reason"])
+        result["parent_merge_backlog"] = empty_parent_merge_backlog("unknown", result["reason"], stale_parent_threshold_seconds)
+        return result
     try:
         uri = f"file:{db_path}?mode=ro"
         conn = sqlite3.connect(uri, uri=True, timeout=2.0)
         conn.row_factory = sqlite3.Row
         try:
-            rows = conn.execute("SELECT status, COUNT(*) AS count FROM tasks GROUP BY status").fetchall()
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+            if "status" not in columns:
+                reason = "task schema missing status column"
+                return {
+                    "status": "unknown",
+                    "reason": reason,
+                    "counts": {},
+                    "metrics": empty_task_metrics("unknown", reason),
+                    "parent_merge_backlog": empty_parent_merge_backlog("unknown", reason, stale_parent_threshold_seconds),
+                }
+
+            count_rows = conn.execute("SELECT status, COUNT(*) AS count FROM tasks GROUP BY status").fetchall()
+            counts = {row["status"]: int(row["count"]) for row in count_rows}
+
+            metric_required = {"task_id", "parent_task_id"}
+            if metric_required.issubset(columns):
+                logical_pdf_completed = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*) AS count FROM tasks
+                        WHERE status = 'completed' AND (parent_task_id IS NULL OR parent_task_id = '')
+                        """
+                    ).fetchone()["count"]
+                )
+                leaf_columns = []
+                for candidate in (
+                    "page_count",
+                    "processing_seconds",
+                    "worker_group_index",
+                    "worker_child_index",
+                    "options",
+                    "started_at",
+                    "completed_at",
+                    "worker_id",
+                ):
+                    if candidate in columns:
+                        leaf_columns.append(candidate)
+                selected_leaf_columns = ", ".join(leaf_columns) if leaf_columns else "task_id"
+                leaf_rows = conn.execute(
+                    f"""
+                    SELECT {selected_leaf_columns}
+                    FROM tasks AS task
+                    WHERE status = 'completed'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM tasks AS child WHERE child.parent_task_id = task.task_id
+                      )
+                    """
+                )
+                metrics = compute_task_metrics_from_leaf_rows(logical_pdf_completed, leaf_rows, columns)
+            else:
+                missing = sorted(metric_required - columns)
+                metrics = empty_task_metrics("unknown", f"task schema missing columns: {missing}")
+
+            backlog_required = {"status", "parent_task_id", "started_at"}
+            if backlog_required.issubset(columns):
+                backlog_columns = ["status", "parent_task_id", "started_at"]
+                for optional in ("merge_claimed_at", "merge_owner", "merge_attempts", "retry_count"):
+                    if optional in columns:
+                        backlog_columns.append(optional)
+                selected = ", ".join(backlog_columns)
+                backlog_rows = conn.execute(
+                    f"""
+                    SELECT {selected} FROM tasks
+                    WHERE status = 'merging' AND (parent_task_id IS NULL OR parent_task_id = '')
+                    """
+                ).fetchall()
+                parent_merge_backlog = compute_parent_merge_backlog(
+                    backlog_rows,
+                    columns,
+                    stale_parent_threshold_seconds,
+                    now,
+                )
+            else:
+                missing = sorted(backlog_required - columns)
+                parent_merge_backlog = empty_parent_merge_backlog(
+                    "unknown",
+                    f"task schema missing columns: {missing}",
+                    stale_parent_threshold_seconds,
+                )
         finally:
             conn.close()
     except Exception as exc:
-        return {"status": "unknown", "reason": str(exc), "counts": {}}
-    counts = {row["status"]: int(row["count"]) for row in rows}
-    return {"status": "known", "reason": None, "counts": counts}
+        return {
+            "status": "unknown",
+            "reason": str(exc),
+            "counts": {},
+            "metrics": empty_task_metrics("unknown", str(exc)),
+            "parent_merge_backlog": empty_parent_merge_backlog("unknown", str(exc), stale_parent_threshold_seconds),
+        }
+    return {
+        "status": "known",
+        "reason": None,
+        "counts": counts,
+        "metrics": metrics,
+        "parent_merge_backlog": parent_merge_backlog,
+    }
 
 
 def discover_log_files(paths: list[Path]) -> tuple[list[Path], list[str]]:
@@ -446,6 +1010,28 @@ def count_delta(start: dict[str, Any], end: dict[str, Any]) -> dict[str, Any]:
     return {"status": "known", "reason": None, "delta": end["count"] - start["count"]}
 
 
+def subtract_optional(start_value: Any, end_value: Any) -> float | None:
+    if start_value is None or end_value is None:
+        return None
+    try:
+        return float(end_value) - float(start_value)
+    except (TypeError, ValueError):
+        return None
+
+
+def subtract_worker_groups(start_groups: dict[str, Any], end_groups: dict[str, Any]) -> dict[str, Any]:
+    groups: dict[str, Any] = {}
+    for key in sorted(set(start_groups) | set(end_groups)):
+        start_row = start_groups.get(key, {})
+        end_row = end_groups.get(key, {})
+        groups[key] = {
+            "tasks_completed": int(subtract_optional(start_row.get("tasks_completed", 0), end_row.get("tasks_completed", 0)) or 0),
+            "pages_completed": round(subtract_optional(start_row.get("pages_completed", 0), end_row.get("pages_completed", 0)) or 0.0, 6),
+            "processing_seconds": round(subtract_optional(start_row.get("processing_seconds", 0), end_row.get("processing_seconds", 0)) or 0.0, 6),
+        }
+    return groups
+
+
 def task_delta(start: dict[str, Any], end: dict[str, Any]) -> dict[str, Any]:
     if start["status"] != "known":
         return {"status": "unknown", "reason": start["reason"]}
@@ -457,14 +1043,36 @@ def task_delta(start: dict[str, Any], end: dict[str, Any]) -> dict[str, Any]:
     failed = end_counts.get("failed", 0) - start_counts.get("failed", 0)
     total_terminal = completed + failed
     failed_rate = None if total_terminal <= 0 else failed / total_terminal
-    return {
+    delta = {
         "status": "known",
         "completed_delta": completed,
         "failed_delta": failed,
         "terminal_delta": total_terminal,
         "failed_rate": failed_rate,
     }
-
+    start_metrics = start.get("metrics", empty_task_metrics("unknown", "task metrics unavailable"))
+    end_metrics = end.get("metrics", empty_task_metrics("unknown", "task metrics unavailable"))
+    if start_metrics["status"] != "known" or end_metrics["status"] != "known":
+        delta["metrics"] = {
+            "status": "unknown",
+            "reason": start_metrics.get("reason") or end_metrics.get("reason") or "task metrics unavailable",
+        }
+        return delta
+    delta["logical_pdf_completed_delta"] = int(
+        subtract_optional(start_metrics.get("logical_pdf_completed"), end_metrics.get("logical_pdf_completed")) or 0
+    )
+    delta["leaf_completed_delta"] = int(subtract_optional(start_metrics.get("leaf_completed"), end_metrics.get("leaf_completed")) or 0)
+    delta["completed_pages_delta"] = round(
+        subtract_optional(start_metrics.get("completed_pages"), end_metrics.get("completed_pages")) or 0.0,
+        6,
+    )
+    delta["processing_seconds_delta"] = round(
+        subtract_optional(start_metrics.get("processing_seconds"), end_metrics.get("processing_seconds")) or 0.0,
+        6,
+    )
+    delta["worker_groups"] = subtract_worker_groups(start_metrics.get("worker_groups", {}), end_metrics.get("worker_groups", {}))
+    delta["metrics"] = {"status": "known", "reason": None}
+    return delta
 
 
 def median(values: list[float]) -> float | None:
@@ -560,7 +1168,8 @@ def build_throughput_windows(snapshots: list[dict[str, Any]]) -> list[dict[str, 
         duration = end["elapsed_seconds"] - start["elapsed_seconds"]
         start_counts = start["snapshot"]
         end_counts = end["snapshot"]
-        if duration <= 0 or start_counts["status"] != "known" or end_counts["status"] != "known":
+        delta = task_delta(start_counts, end_counts) if duration > 0 else {"status": "unknown"}
+        if duration <= 0 or start_counts["status"] != "known" or end_counts["status"] != "known" or delta["status"] != "known":
             windows.append(
                 {
                     "index": index,
@@ -568,11 +1177,16 @@ def build_throughput_windows(snapshots: list[dict[str, Any]]) -> list[dict[str, 
                     "duration_seconds": round(duration, 3),
                     "reason": "task snapshot unavailable or non-positive duration",
                     "completed_delta": None,
+                    "logical_pdf_completed_delta": None,
+                    "completed_pages_delta": None,
                     "successful_per_minute": None,
+                    "logical_pdf_per_minute": None,
+                    "pages_per_minute": None,
                 }
             )
             continue
-        completed = end_counts["counts"].get("completed", 0) - start_counts["counts"].get("completed", 0)
+        logical_delta = delta.get("logical_pdf_completed_delta", delta.get("completed_delta"))
+        page_delta = delta.get("completed_pages_delta")
         windows.append(
             {
                 "index": index,
@@ -580,8 +1194,12 @@ def build_throughput_windows(snapshots: list[dict[str, Any]]) -> list[dict[str, 
                 "start_elapsed_seconds": round(start["elapsed_seconds"], 3),
                 "end_elapsed_seconds": round(end["elapsed_seconds"], 3),
                 "duration_seconds": round(duration, 3),
-                "completed_delta": completed,
-                "successful_per_minute": round(completed / duration * 60.0, 6),
+                "completed_delta": delta.get("completed_delta"),
+                "logical_pdf_completed_delta": logical_delta,
+                "completed_pages_delta": page_delta,
+                "successful_per_minute": round(logical_delta / duration * 60.0, 6),
+                "logical_pdf_per_minute": round(logical_delta / duration * 60.0, 6),
+                "pages_per_minute": None if page_delta is None else round(page_delta / duration * 60.0, 6),
             }
         )
     return windows
@@ -594,11 +1212,15 @@ def compute_throughput(
     window_snapshots: list[dict[str, Any]],
 ) -> dict[str, Any]:
     windows = build_throughput_windows(window_snapshots)
-    known_window_rates = [window["successful_per_minute"] for window in windows if window["status"] == "known"]
-    if elapsed_seconds >= 1800 and len(known_window_rates) >= 6:
-        value = median(known_window_rates[:6])
+    known_logical_rates = [window["logical_pdf_per_minute"] for window in windows if window["status"] == "known"]
+    known_page_rates = [window["pages_per_minute"] for window in windows if window["status"] == "known" and window["pages_per_minute"] is not None]
+    if elapsed_seconds >= 1800 and len(known_logical_rates) >= 6:
+        logical_value = median(known_logical_rates[:6])
+        page_value = median(known_page_rates[:6]) if len(known_page_rates) >= 6 else None
         return {
-            "successful_per_minute": None if value is None else round(value, 6),
+            "successful_per_minute": None if logical_value is None else round(logical_value, 6),
+            "logical_pdf_per_minute": None if logical_value is None else round(logical_value, 6),
+            "pages_per_minute": None if page_value is None else round(page_value, 6),
             "method": "median_6x5m_windows",
             "window_seconds": 300,
             "windows_required": 6,
@@ -606,14 +1228,118 @@ def compute_throughput(
         }
 
     delta = task_delta(task_start, task_end)
-    completed_delta = delta.get("completed_delta") if delta["status"] == "known" else None
-    value = None if completed_delta is None else completed_delta / elapsed_seconds * 60.0
+    if delta["status"] != "known":
+        logical_delta = None
+        page_delta = None
+    else:
+        logical_delta = delta.get("logical_pdf_completed_delta", delta.get("completed_delta"))
+        page_delta = delta.get("completed_pages_delta")
+    logical_value = None if logical_delta is None else logical_delta / elapsed_seconds * 60.0
+    page_value = None if page_delta is None else page_delta / elapsed_seconds * 60.0
     return {
-        "successful_per_minute": None if value is None else round(value, 6),
+        "successful_per_minute": None if logical_value is None else round(logical_value, 6),
+        "logical_pdf_per_minute": None if logical_value is None else round(logical_value, 6),
+        "pages_per_minute": None if page_value is None else round(page_value, 6),
         "method": "aggregate_short_run",
         "reason": "duration < 1800 seconds or fewer than 6 known 5-minute windows",
         "windows": windows,
     }
+
+
+def summarize_energy(
+    npu_sample_records: list[dict[str, Any]],
+    expected_card_count: int = EXPECTED_WORKER_COUNT,
+) -> dict[str, Any]:
+    if len(npu_sample_records) < 2:
+        return {"status": "unknown", "reason": "fewer than two NPU power samples", "fleet_energy_wh": None, "cards": []}
+    card_energy: dict[int, float] = {card_id: 0.0 for card_id in range(expected_card_count)}
+    integrated_intervals = 0
+    for interval_index, (previous, current) in enumerate(zip(npu_sample_records, npu_sample_records[1:]), start=1):
+        dt = float(current["elapsed_seconds"]) - float(previous["elapsed_seconds"])
+        if dt <= 0:
+            continue
+        previous_sample = previous["sample"]
+        current_sample = current["sample"]
+        if previous_sample.get("status") != "known" or current_sample.get("status") != "known":
+            return {
+                "status": "unknown",
+                "reason": f"NPU sample status unknown in interval {interval_index}",
+                "fleet_energy_wh": None,
+                "cards": [],
+            }
+        previous_cards = {int(card["card_id"]): card for card in previous_sample.get("cards", []) if "card_id" in card}
+        current_cards = {int(card["card_id"]): card for card in current_sample.get("cards", []) if "card_id" in card}
+        expected_ids = set(range(expected_card_count))
+        missing_cards = sorted((expected_ids - set(previous_cards)) | (expected_ids - set(current_cards)))
+        if missing_cards:
+            return {
+                "status": "unknown",
+                "reason": f"missing NPU cards in power interval {interval_index}: {missing_cards}",
+                "fleet_energy_wh": None,
+                "cards": [],
+            }
+        missing_power = sorted(
+            card_id
+            for card_id in expected_ids
+            if previous_cards[card_id].get("power_w") is None or current_cards[card_id].get("power_w") is None
+        )
+        if missing_power:
+            return {
+                "status": "unknown",
+                "reason": f"missing NPU power_w in interval {interval_index}: {missing_power}",
+                "fleet_energy_wh": None,
+                "cards": [],
+            }
+        for card_id in sorted(expected_ids):
+            start_power = float(previous_cards[card_id]["power_w"])
+            end_power = float(current_cards[card_id]["power_w"])
+            card_energy[card_id] += ((start_power + end_power) / 2.0) * dt / 3600.0
+        integrated_intervals += 1
+    if integrated_intervals == 0:
+        return {"status": "unknown", "reason": "no positive-duration NPU power intervals", "fleet_energy_wh": None, "cards": []}
+    cards = [{"card_id": card_id, "energy_wh": round(value, 6)} for card_id, value in sorted(card_energy.items())]
+    return {
+        "status": "known",
+        "reason": None,
+        "expected_card_count": expected_card_count,
+        "integrated_intervals": integrated_intervals,
+        "fleet_energy_wh": round(sum(card_energy.values()), 6),
+        "cards": cards,
+    }
+
+
+def derive_efficiency(energy: dict[str, Any], delta: dict[str, Any]) -> dict[str, Any]:
+    if energy.get("status") != "known" or energy.get("fleet_energy_wh") is None:
+        return {
+            "status": "unknown",
+            "reason": energy.get("reason", "energy unknown"),
+            "fleet_energy_wh_per_completed_page": None,
+            "fleet_energy_wh_per_logical_pdf": None,
+        }
+    pages = delta.get("completed_pages_delta") if delta.get("status") == "known" else None
+    logical = delta.get("logical_pdf_completed_delta") if delta.get("status") == "known" else None
+    if not pages and not logical:
+        return {
+            "status": "unknown",
+            "reason": "completed page and logical PDF deltas unavailable or zero",
+            "fleet_energy_wh_per_completed_page": None,
+            "fleet_energy_wh_per_logical_pdf": None,
+        }
+    fleet_wh = float(energy["fleet_energy_wh"])
+    return {
+        "status": "known",
+        "reason": None,
+        "fleet_energy_wh_per_completed_page": None if not pages else round(fleet_wh / float(pages), 6),
+        "fleet_energy_wh_per_logical_pdf": None if not logical else round(fleet_wh / float(logical), 6),
+    }
+
+
+def float_or_none(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
 
 def load_baseline(path: Path | None) -> dict[str, Any]:
     if path is None:
@@ -622,38 +1348,63 @@ def load_baseline(path: Path | None) -> dict[str, Any]:
         data = json.loads(path.read_text(encoding="utf-8"))
     except Exception as exc:
         return {"status": "unknown", "reason": str(exc)}
-    throughput = (
-        data.get("throughput", {}).get("successful_per_minute")
+    throughput_data = data.get("throughput", {}) if isinstance(data.get("throughput"), dict) else {}
+    efficiency_data = data.get("efficiency", {}) if isinstance(data.get("efficiency"), dict) else {}
+    logical = float_or_none(
+        throughput_data.get("logical_pdf_per_minute")
+        or throughput_data.get("successful_per_minute")
         or data.get("successful_throughput_per_minute")
         or data.get("successful_per_minute")
     )
-    try:
-        throughput = float(throughput)
-    except (TypeError, ValueError):
-        return {"status": "unknown", "reason": "baseline missing successful throughput"}
+    pages = float_or_none(throughput_data.get("pages_per_minute") or data.get("pages_per_minute"))
+    energy_per_page = float_or_none(
+        efficiency_data.get("fleet_energy_wh_per_completed_page")
+        or data.get("fleet_energy_wh_per_completed_page")
+        or data.get("energy_wh_per_completed_page")
+    )
+    energy_per_logical_pdf = float_or_none(
+        efficiency_data.get("fleet_energy_wh_per_logical_pdf")
+        or data.get("fleet_energy_wh_per_logical_pdf")
+        or data.get("energy_wh_per_logical_pdf")
+    )
+    if logical is None and pages is None and energy_per_page is None and energy_per_logical_pdf is None:
+        return {"status": "unknown", "reason": "baseline missing throughput and energy metrics"}
     return {
         "status": "known",
         "path": str(path),
-        "successful_per_minute": throughput,
-        "method": data.get("throughput", {}).get("method") or data.get("method") or "unknown",
-        "windows": data.get("throughput", {}).get("windows", data.get("windows", [])),
+        "successful_per_minute": logical,
+        "logical_pdf_per_minute": logical,
+        "pages_per_minute": pages,
+        "fleet_energy_wh_per_completed_page": energy_per_page,
+        "fleet_energy_wh_per_logical_pdf": energy_per_logical_pdf,
+        "method": throughput_data.get("method") or data.get("method") or "unknown",
+        "windows": throughput_data.get("windows", data.get("windows", [])),
     }
 
 
-
 def baseline_from_result(result: dict[str, Any]) -> dict[str, Any]:
-    throughput = result["throughput"]["successful_per_minute"]
-    if throughput is None:
-        return {"status": "unknown", "reason": "successful throughput unknown"}
+    logical = result["throughput"].get("logical_pdf_per_minute", result["throughput"].get("successful_per_minute"))
+    pages = result["throughput"].get("pages_per_minute")
+    efficiency = result.get("efficiency", {})
+    energy_per_page = efficiency.get("fleet_energy_wh_per_completed_page")
+    energy_per_logical_pdf = efficiency.get("fleet_energy_wh_per_logical_pdf")
+    if logical is None and pages is None and energy_per_page is None and energy_per_logical_pdf is None:
+        return {"status": "unknown", "reason": "baseline metrics unknown"}
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "known",
         "created_at": result["ended_at"],
         "source_duration_seconds": result["duration_seconds"],
         "throughput": {
-            "successful_per_minute": throughput,
+            "successful_per_minute": logical,
+            "logical_pdf_per_minute": logical,
+            "pages_per_minute": pages,
             "method": result["throughput"].get("method"),
             "windows": result["throughput"].get("windows", []),
+        },
+        "efficiency": {
+            "fleet_energy_wh_per_completed_page": energy_per_page,
+            "fleet_energy_wh_per_logical_pdf": energy_per_logical_pdf,
         },
     }
 
@@ -690,16 +1441,49 @@ def evaluate(result: dict[str, Any]) -> dict[str, Any]:
     }
 
     baseline = result["baseline"]
-    throughput = result["throughput"]["successful_per_minute"]
+    throughput = result["throughput"]
+    logical_rate = throughput.get("logical_pdf_per_minute", throughput.get("successful_per_minute"))
+    pages_rate = throughput.get("pages_per_minute")
     if baseline["status"] != "known":
-        checks["throughput_plus_20_percent"] = {"passed": False, "reason": baseline["reason"]}
-    elif throughput is None:
-        checks["throughput_plus_20_percent"] = {"passed": False, "reason": "successful throughput unknown"}
+        checks["logical_pdf_per_minute_gte_90_percent_baseline"] = {"passed": False, "reason": baseline["reason"]}
+        checks["pages_per_minute_gte_90_percent_baseline"] = {"passed": False, "reason": baseline["reason"]}
     else:
-        required = baseline["successful_per_minute"] * 1.2
-        checks["throughput_plus_20_percent"] = {
-            "passed": throughput >= required,
-            "reason": f"{throughput:.6g} >= required {required:.6g}",
+        baseline_logical = baseline.get("logical_pdf_per_minute", baseline.get("successful_per_minute"))
+        if baseline_logical is None:
+            checks["logical_pdf_per_minute_gte_90_percent_baseline"] = {"passed": False, "reason": "baseline logical PDF throughput unknown"}
+        elif logical_rate is None:
+            checks["logical_pdf_per_minute_gte_90_percent_baseline"] = {"passed": False, "reason": "logical PDF throughput unknown"}
+        else:
+            required = baseline_logical * 0.9
+            checks["logical_pdf_per_minute_gte_90_percent_baseline"] = {
+                "passed": logical_rate >= required,
+                "reason": f"{logical_rate:.6g} >= required {required:.6g}",
+            }
+        baseline_pages = baseline.get("pages_per_minute")
+        if baseline_pages is None:
+            checks["pages_per_minute_gte_90_percent_baseline"] = {"passed": False, "reason": "baseline page throughput unknown"}
+        elif pages_rate is None:
+            checks["pages_per_minute_gte_90_percent_baseline"] = {"passed": False, "reason": "page throughput unknown"}
+        else:
+            required = baseline_pages * 0.9
+            checks["pages_per_minute_gte_90_percent_baseline"] = {
+                "passed": pages_rate >= required,
+                "reason": f"{pages_rate:.6g} >= required {required:.6g}",
+            }
+
+    efficiency = result.get("efficiency", {})
+    energy_per_page = efficiency.get("fleet_energy_wh_per_completed_page")
+    if baseline["status"] != "known":
+        checks["energy_per_completed_page_lte_90_percent_baseline"] = {"passed": False, "reason": baseline["reason"]}
+    elif baseline.get("fleet_energy_wh_per_completed_page") is None:
+        checks["energy_per_completed_page_lte_90_percent_baseline"] = {"passed": False, "reason": "baseline energy/page unknown"}
+    elif energy_per_page is None:
+        checks["energy_per_completed_page_lte_90_percent_baseline"] = {"passed": False, "reason": "energy/page unknown"}
+    else:
+        required = baseline["fleet_energy_wh_per_completed_page"] * 0.9
+        checks["energy_per_completed_page_lte_90_percent_baseline"] = {
+            "passed": energy_per_page <= required,
+            "reason": f"{energy_per_page:.6g} <= required {required:.6g}",
         }
 
     failed_rate = result["tasks"]["delta"].get("failed_rate") if result["tasks"]["delta"]["status"] == "known" else None
@@ -722,10 +1506,14 @@ def evaluate(result: dict[str, Any]) -> dict[str, Any]:
     }
 
     hbm_max = result["fleet"].get("hbm_max_percent")
+    checks["hbm_max_lt_98_percent"] = {
+        "passed": hbm_max is not None and hbm_max < 98.0,
+        "reason": "HBM max unknown" if hbm_max is None else f"{hbm_max:.6g} < 98",
+    }
     diagnostics["hbm_max_lt_98_percent"] = {
         "available": hbm_max is not None,
         "meets_reference": hbm_max is not None and hbm_max < 98.0,
-        "gating": False,
+        "gating": True,
         "reason": "HBM max unknown" if hbm_max is None else f"{hbm_max:.6g} < 98",
     }
 
@@ -761,10 +1549,31 @@ def evaluate(result: dict[str, Any]) -> dict[str, Any]:
         "reason": preemptions.get("reason") if preemptions["status"] != "known" else f"{preemption_delta} == 0",
     }
 
+    parent_merge_backlog = result.get("parent_merge_backlog", {"status": "unknown", "reason": "parent merge backlog unavailable"})
+    stale_merges = parent_merge_backlog.get(
+        "recoverable_stale_merging_parents", parent_merge_backlog.get("stale_merging_parents")
+    )
+    checks["stale_parent_merges_zero"] = {
+        "passed": parent_merge_backlog.get("status") == "known" and stale_merges == 0,
+        "reason": parent_merge_backlog.get("reason")
+        if parent_merge_backlog.get("status") != "known"
+        else (
+            f"{stale_merges} recoverable stale merging parents; "
+            f"blocked={parent_merge_backlog.get('blocked_merging_parents')}; "
+            f"oldest_age_seconds={parent_merge_backlog.get('oldest_age_seconds')}"
+        ),
+    }
+
     oom_preemption = result["logs"]["oom_preemption"]
     checks["no_oom_or_preemption"] = {
         "passed": oom_preemption["status"] == "known" and oom_preemption["count"] == 0,
         "reason": oom_preemption["reason"] if oom_preemption["status"] != "known" else f"{oom_preemption['count']} matches",
+    }
+
+    api_500 = result.get("logs", {}).get("api_500", {"status": "unknown", "reason": "API 500 log evidence unavailable", "count": None})
+    checks["api_500_delta_zero"] = {
+        "passed": api_500.get("status") == "known" and api_500.get("count") == 0,
+        "reason": api_500.get("reason") if api_500.get("status") != "known" else f"{api_500.get('count')} matches",
     }
 
     cpu = result["cpu"]
@@ -849,11 +1658,12 @@ def run_evaluation(args: argparse.Namespace) -> dict[str, Any]:
     started_at = utc_now()
     start_monotonic = time.monotonic()
     start_cpu = read_cpu_times()
-    task_start = sqlite_counts(args.database)
+    task_start = sqlite_counts(args.database, args.stale_parent_threshold_seconds)
     log_start = snapshot_log_files(args.log_path)
     throughput_snapshots = [{"elapsed_seconds": 0.0, "snapshot": task_start}]
     next_task_sample_at = 300.0
     npu_samples: list[dict[str, Any]] = []
+    npu_sample_records: list[dict[str, Any]] = []
     worker_samples: list[list[dict[str, Any]]] = []
     vllm_samples: list[list[dict[str, Any]]] = []
 
@@ -861,10 +1671,12 @@ def run_evaluation(args: argparse.Namespace) -> dict[str, Any]:
     for index in range(sample_count):
         worker_samples.append(collect_worker_health(args.host, args.worker_ports))
         vllm_samples.append(collect_vllm(args.host, args.vllm_ports))
-        npu_samples.append(collect_npu_smi())
+        npu_sample = collect_npu_smi()
         elapsed_now = time.monotonic() - start_monotonic
+        npu_samples.append(npu_sample)
+        npu_sample_records.append({"elapsed_seconds": elapsed_now, "sample": npu_sample})
         while not args.sample and elapsed_now >= next_task_sample_at and next_task_sample_at <= args.duration:
-            throughput_snapshots.append({"elapsed_seconds": next_task_sample_at, "snapshot": sqlite_counts(args.database)})
+            throughput_snapshots.append({"elapsed_seconds": next_task_sample_at, "snapshot": sqlite_counts(args.database, args.stale_parent_threshold_seconds)})
             next_task_sample_at += 300.0
         if index + 1 < sample_count:
             sleep_for = min(args.interval, max(0.0, args.duration - elapsed_now))
@@ -872,14 +1684,17 @@ def run_evaluation(args: argparse.Namespace) -> dict[str, Any]:
                 time.sleep(sleep_for)
 
     end_cpu = read_cpu_times()
-    task_end = sqlite_counts(args.database)
+    task_end = sqlite_counts(args.database, args.stale_parent_threshold_seconds)
     db_lock_log_delta = count_log_delta(args.log_path, log_start, DB_LOCK_TERMINAL_RE)
     oom_preemption = count_log_delta(args.log_path, log_start, OOM_PREEMPTION_RE)
+    api_500_delta = count_log_delta(args.log_path, log_start, API_HTTP_500_RE)
     elapsed = max(time.monotonic() - start_monotonic, 0.001)
     if throughput_snapshots[-1]["elapsed_seconds"] < elapsed:
         throughput_snapshots.append({"elapsed_seconds": elapsed, "snapshot": task_end})
     delta = task_delta(task_start, task_end)
     throughput = compute_throughput(task_start, task_end, elapsed, throughput_snapshots)
+    energy = summarize_energy(npu_sample_records)
+    efficiency = derive_efficiency(energy, delta)
 
     log_lock_delta = db_lock_log_delta.get("count") if db_lock_log_delta["status"] == "known" else None
     if log_lock_delta is None:
@@ -893,7 +1708,7 @@ def run_evaluation(args: argparse.Namespace) -> dict[str, Any]:
         }
 
     result = {
-        "schema_version": 1,
+        "schema_version": 2,
         "started_at": started_at,
         "ended_at": utc_now(),
         "duration_seconds": round(elapsed, 3),
@@ -910,6 +1725,8 @@ def run_evaluation(args: argparse.Namespace) -> dict[str, Any]:
             "vllm": vllm_samples[-1],
         },
         "fleet": summarize_fleet(npu_samples),
+        "energy": energy,
+        "efficiency": efficiency,
         "vllm_metrics": summarize_vllm_metrics(vllm_samples),
         "cpu": cpu_delta(start_cpu, end_cpu),
         "tasks": {
@@ -922,8 +1739,14 @@ def run_evaluation(args: argparse.Namespace) -> dict[str, Any]:
             "db_locked_terminal_delta": summarize_log_delta(db_lock_log_delta),
             "oom_preemption_delta": summarize_log_delta(oom_preemption),
             "oom_preemption": summarize_log_delta(oom_preemption),
+            "api_500_delta": summarize_log_delta(api_500_delta),
+            "api_500": summarize_log_delta(api_500_delta),
         },
         "throughput": throughput,
+        "parent_merge_backlog": task_end.get(
+            "parent_merge_backlog",
+            empty_parent_merge_backlog("unknown", "parent merge backlog unavailable", args.stale_parent_threshold_seconds),
+        ),
         "db_lock_evidence": db_lock_evidence,
         "baseline": load_baseline(args.baseline),
     }
@@ -950,6 +1773,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--duration", type=float, default=60.0, help="collection duration in seconds")
     parser.add_argument("--interval", type=float, default=5.0, help="sample interval in seconds")
     parser.add_argument("--baseline", type=Path, help="baseline JSON path")
+    parser.add_argument(
+        "--stale-parent-threshold-seconds",
+        type=float,
+        default=DEFAULT_STALE_PARENT_MERGE_THRESHOLD_SECONDS,
+        help="age threshold for stale merging parent tasks",
+    )
     parser.add_argument("--record-baseline", type=Path, help="write this run's successful throughput baseline JSON to path")
     parser.add_argument("--evaluate-report", type=Path, help="re-evaluate an existing report without collecting new evidence")
     parser.add_argument("--sample", action="store_true", help="take one short sample for tests/smoke checks")
