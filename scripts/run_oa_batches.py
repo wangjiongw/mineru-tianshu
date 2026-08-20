@@ -11,7 +11,7 @@ import signal
 import sqlite3
 import time
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Iterator
@@ -29,6 +29,18 @@ _STOP = False
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def timestamp_is_stale(value: object, age_seconds: float) -> bool:
+    if not value:
+        return False
+    try:
+        observed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if observed.tzinfo is None:
+        observed = observed.replace(tzinfo=timezone.utc)
+    return observed <= datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
 
 
 def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -85,7 +97,15 @@ def open_inventory_for_run(args: argparse.Namespace) -> sqlite3.Connection:
     return connect_inventory_read_only(args.inventory)
 
 def get_batch(conn: sqlite3.Connection, batch_key: str) -> dict[str, Any] | None:
-    row = conn.execute("SELECT * FROM batches WHERE batch_key=?", (batch_key,)).fetchone()
+    row = conn.execute(
+        """
+        SELECT b.*,
+               (SELECT COUNT(*) FROM batch_items bi
+                WHERE bi.batch_id=b.batch_id AND bi.item_status='deferred') AS deferred_count
+        FROM batches b WHERE b.batch_key=?
+        """,
+        (batch_key,),
+    ).fetchone()
     return dict(row) if row else None
 
 
@@ -95,7 +115,7 @@ def first_batch(conn: sqlite3.Connection, statuses: tuple[str, ...]) -> dict[str
         f"SELECT * FROM batches WHERE status IN ({placeholders}) ORDER BY generation,ordinal LIMIT 1",
         statuses,
     ).fetchone()
-    return dict(row) if row else None
+    return get_batch(conn, row["batch_key"]) if row else None
 
 
 def checkpoint_payload(args: argparse.Namespace, *, action: str, stop_reason: str | None, batch: dict[str, Any] | None, errors: int) -> dict[str, Any]:
@@ -109,6 +129,7 @@ def checkpoint_payload(args: argparse.Namespace, *, action: str, stop_reason: st
         "last_refresh_at": getattr(args, "_last_refresh_at", None),
         "last_submit_at": getattr(args, "_last_submit_at", None),
         "consecutive_health_failures": errors,
+        "deferred_backlog": getattr(args, "_deferred_backlog", 0),
     }
 
 
@@ -183,7 +204,7 @@ def submit(conn: sqlite3.Connection, args: argparse.Namespace, batch_key: str) -
         batch_key=batch_key,
         limit=None,
         priority=args.priority,
-        high_watermark=args.high_watermark,
+        high_watermark=args.high_watermark + args.max_deferred_backlog,
         allow_live_claims=args.allow_live_claims,
         task_db=args.task_db,
         redis_host=args.redis_host,
@@ -200,6 +221,181 @@ def submit(conn: sqlite3.Connection, args: argparse.Namespace, batch_key: str) -
     return report
 
 
+def deferred_backlog_count(conn: sqlite3.Connection) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) AS count FROM batch_items WHERE item_status='deferred'"
+    ).fetchone()
+    return int(row["count"] if row else 0)
+
+
+def stale_tail_task_ids(
+    conn: sqlite3.Connection,
+    args: argparse.Namespace,
+    batch: dict[str, Any],
+) -> list[str]:
+    max_per_batch = max(0, int(args.max_deferred_items_per_batch))
+    if (
+        args.defer_stale_after_seconds <= 0
+        or max_per_batch == 0
+        or args.max_deferred_backlog == 0
+        or batch["submitted_count"] <= 0
+        or batch["submitted_count"] > max_per_batch
+        or batch["item_count"] <= 0
+    ):
+        return []
+
+    terminal_fraction = (batch["item_count"] - batch["submitted_count"]) / batch["item_count"]
+    if terminal_fraction < args.min_terminal_fraction:
+        return []
+
+    backlog = deferred_backlog_count(conn)
+    budget = min(
+        batch["submitted_count"],
+        max_per_batch,
+        max(0, args.max_deferred_backlog - backlog),
+    )
+    if budget <= 0 or not args.task_db.exists():
+        return []
+
+    rows = conn.execute(
+        """
+        SELECT bi.task_id,d.last_submit_at
+        FROM batch_items bi JOIN documents d USING(sha256)
+        WHERE bi.batch_id=? AND bi.item_status='submitted'
+          AND bi.task_id IS NOT NULL
+        ORDER BY bi.position
+        """,
+        (batch["batch_id"],),
+    ).fetchall()
+    task_ids = [row["task_id"] for row in rows]
+    if not task_ids:
+        return []
+
+    inventory_stale_ids = {
+        row["task_id"]
+        for row in rows
+        if timestamp_is_stale(row["last_submit_at"], args.defer_stale_after_seconds)
+    }
+    placeholders = ",".join("?" for _ in task_ids)
+    task_uri = f"file:{args.task_db}?mode=ro"
+    task_conn = sqlite3.connect(task_uri, uri=True, timeout=10.0)
+    task_conn.row_factory = sqlite3.Row
+    try:
+        task_rows = task_conn.execute(
+            f"""
+            SELECT task_id,status,
+                   CASE
+                       WHEN COALESCE(started_at,created_at) <= datetime('now', ?)
+                       THEN 1 ELSE 0
+                   END AS stale
+            FROM tasks
+            WHERE task_id IN ({placeholders})
+            """,
+            (f"-{int(args.defer_stale_after_seconds)} seconds", *task_ids),
+        ).fetchall()
+    finally:
+        task_conn.close()
+
+    known_ids = {row["task_id"] for row in task_rows}
+    eligible_ids = {
+        row["task_id"]
+        for row in task_rows
+        if row["status"] in ("pending", "processing", "merging") and row["stale"] == 1
+    }
+    eligible_ids.update(task_id for task_id in task_ids if task_id not in known_ids)
+    eligible_ids.update(inventory_stale_ids)
+    return [task_id for task_id in task_ids if task_id in eligible_ids][:budget]
+
+
+def defer_stale_batch_tail(
+    conn: sqlite3.Connection,
+    args: argparse.Namespace,
+    batch: dict[str, Any],
+) -> dict[str, Any]:
+    task_ids = stale_tail_task_ids(conn, args, batch)
+    if not task_ids:
+        return {"deferred": 0, "task_ids": []}
+    reason = (
+        f"batch tail <= {args.max_deferred_items_per_batch}; "
+        f"task age >= {int(args.defer_stale_after_seconds)}s; "
+        f"terminal fraction >= {args.min_terminal_fraction:.4f}"
+    )
+    report = batches.defer_batch_items(
+        conn,
+        batch["batch_key"],
+        task_ids,
+        reason=reason,
+    )
+    args._deferred_backlog = deferred_backlog_count(conn)
+    report["deferred_backlog"] = args._deferred_backlog
+    if args.write_progress_reports:
+        batches.write_progress_reports(conn, args.inventory, args.legacy_progress)
+    return report
+
+
+def retry_exhausted_task_ids(
+    conn: sqlite3.Connection,
+    args: argparse.Namespace,
+    batch: dict[str, Any],
+) -> list[str]:
+    max_per_batch = max(0, int(args.max_deferred_items_per_batch))
+    if (
+        args.max_item_submit_attempts <= 0
+        or max_per_batch == 0
+        or args.max_deferred_backlog == 0
+        or batch["submitted_count"] > 0
+        or batch["item_count"] <= 0
+    ):
+        return []
+
+    rows = conn.execute(
+        """
+        SELECT bi.task_id
+        FROM batch_items bi JOIN documents d USING(sha256)
+        WHERE bi.batch_id=? AND bi.item_status='error'
+          AND bi.task_id IS NOT NULL
+          AND d.state='failed_retryable'
+          AND d.submit_attempts>=?
+        ORDER BY bi.position
+        """,
+        (batch["batch_id"], args.max_item_submit_attempts),
+    ).fetchall()
+    if not rows or len(rows) > max_per_batch:
+        return []
+    terminal_fraction = (batch["item_count"] - len(rows)) / batch["item_count"]
+    if terminal_fraction < args.min_terminal_fraction:
+        return []
+
+    backlog = deferred_backlog_count(conn)
+    budget = min(len(rows), max(0, args.max_deferred_backlog - backlog))
+    return [row["task_id"] for row in rows[:budget]]
+
+
+def defer_retry_exhausted_tail(
+    conn: sqlite3.Connection,
+    args: argparse.Namespace,
+    batch: dict[str, Any],
+) -> dict[str, Any]:
+    task_ids = retry_exhausted_task_ids(conn, args, batch)
+    if not task_ids:
+        return {"deferred": 0, "task_ids": []}
+    reason = (
+        f"retryable batch tail exhausted {args.max_item_submit_attempts} submit attempts; "
+        f"terminal fraction >= {args.min_terminal_fraction:.4f}"
+    )
+    report = batches.defer_batch_items(
+        conn,
+        batch["batch_key"],
+        task_ids,
+        reason=reason,
+    )
+    args._deferred_backlog = deferred_backlog_count(conn)
+    report["deferred_backlog"] = args._deferred_backlog
+    if args.write_progress_reports:
+        batches.write_progress_reports(conn, args.inventory, args.legacy_progress)
+    return report
+
+
 def run_loop(args: argparse.Namespace, health_check: Callable[[argparse.Namespace], tuple[bool, dict[str, Any]]] = health_gate) -> int:
     install_signal_handlers()
     health_failures = 0
@@ -212,6 +408,7 @@ def run_loop(args: argparse.Namespace, health_check: Callable[[argparse.Namespac
                 return 130
             emit("full_refresh_done")
         conn = open_inventory_for_run(args)
+        args._deferred_backlog = deferred_backlog_count(conn)
         try:
             while True:
                 if stop_requested(args, errors=health_failures):
@@ -230,12 +427,30 @@ def run_loop(args: argparse.Namespace, health_check: Callable[[argparse.Namespac
                         if args.once:
                             return 0
                         continue
+                    if batch and args.apply:
+                        exhausted = defer_retry_exhausted_tail(conn, args, batch)
+                        if exhausted["deferred"]:
+                            batch = get_batch(conn, batch["batch_key"])
+                            emit("batch_retry_tail_deferred", **exhausted)
+                            write_checkpoint(args, action="batch_retry_tail_deferred", batch=batch, errors=health_failures)
+                            if args.once:
+                                return 0
+                            continue
                     if batch and batch["failed_count"] > args.max_batch_errors:
                         write_checkpoint(args, action="stopped", stop_reason="batch_error_threshold", batch=batch, errors=health_failures)
                         emit("stop", reason="batch_error_threshold", batch_key=batch["batch_key"], failed_count=batch["failed_count"])
                         return 2
+                    if batch and batch["submitted_count"] > 0 and args.apply:
+                        deferred = defer_stale_batch_tail(conn, args, batch)
+                        if deferred["deferred"]:
+                            batch = get_batch(conn, batch["batch_key"])
+                            emit("batch_tail_deferred", **deferred)
+                            write_checkpoint(args, action="batch_tail_deferred", batch=batch, errors=health_failures)
+                            if args.once:
+                                return 0
+                            continue
                     if batch and batch["submitted_count"] > 0:
-                        emit("wait_batch", batch_key=batch["batch_key"], status=batch["status"], submitted_count=batch["submitted_count"], completed_count=batch["completed_count"], failed_count=batch["failed_count"])
+                        emit("wait_batch", batch_key=batch["batch_key"], status=batch["status"], submitted_count=batch["submitted_count"], completed_count=batch["completed_count"], failed_count=batch["failed_count"], deferred_count=batch.get("deferred_count", 0))
                         write_checkpoint(args, action="wait_batch", batch=batch, errors=health_failures)
                         if args.once:
                             return 0
@@ -245,8 +460,14 @@ def run_loop(args: argparse.Namespace, health_check: Callable[[argparse.Namespac
                 else:
                     target = first_batch(conn, ("prepared",))
                     if not target:
-                        write_checkpoint(args, action="complete", stop_reason="no_remaining_batches", errors=health_failures)
-                        emit("complete", reason="no_remaining_batches")
+                        backlog = deferred_backlog_count(conn)
+                        args._deferred_backlog = backlog
+                        if backlog:
+                            write_checkpoint(args, action="primary_complete_with_deferred", stop_reason="deferred_backfill_required", errors=health_failures)
+                            emit("primary_complete_with_deferred", deferred_backlog=backlog)
+                        else:
+                            write_checkpoint(args, action="complete", stop_reason="no_remaining_batches", errors=health_failures)
+                            emit("complete", reason="no_remaining_batches")
                         return 0
 
                 if stop_requested(args, batch=target, errors=health_failures):
@@ -325,6 +546,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--priority", type=int, default=0)
     parser.add_argument("--high-watermark", type=int, default=batches.DEFAULT_HIGH_WATERMARK)
     parser.add_argument("--allow-live-claims", action="store_true")
+    parser.add_argument("--defer-stale-after-seconds", type=float, default=3600.0, help="defer a small stale batch tail after this age; 0 disables")
+    parser.add_argument("--max-deferred-items-per-batch", type=int, default=20, help="maximum stale tail items released from one batch")
+    parser.add_argument("--max-deferred-backlog", type=int, default=100, help="global deferred backlog cap and queue headroom")
+    parser.add_argument("--min-terminal-fraction", type=float, default=0.99, help="minimum terminal fraction before stale tail deferral")
+    parser.add_argument("--max-item-submit-attempts", type=int, default=2, help="defer a retryable tail after this many submissions; 0 disables")
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--worker-ports", type=parse_ports, default=parse_ports("8101,8102,8103,8104,8105,8106,8107,8108"))
     parser.add_argument("--vllm-ports", type=parse_ports, default=parse_ports("30025,30026,30027,30028,30029,30030,30031,30032"))
@@ -350,6 +576,11 @@ def normalize_args(args: argparse.Namespace) -> argparse.Namespace:
         args.log_path = [Path("/share/wangjiong/databases/mineru_database/mineru-runner-worker-0/mineru_logs")]
     args._last_refresh_at = None
     args._last_submit_at = None
+    if not 0.0 <= args.min_terminal_fraction <= 1.0:
+        raise ValueError("min-terminal-fraction must be between 0 and 1")
+    if args.defer_stale_after_seconds < 0 or args.max_deferred_items_per_batch < 0 or args.max_deferred_backlog < 0 or args.max_item_submit_attempts < 0:
+        raise ValueError("deferred-tail limits must be non-negative")
+    args._deferred_backlog = 0
     return args
 
 

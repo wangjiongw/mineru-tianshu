@@ -38,7 +38,7 @@ SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 SHA_PDF_RE = re.compile(r"^([0-9a-f]{64})\.pdf$")
 ELIGIBLE_STATES = ("unsubmitted", "failed_retryable")
 READY_STATES = ("complete_valid", "legacy_result_only")
-TERMINAL_BATCH_STATES = ("completed", "completed_with_errors")
+TERMINAL_BATCH_STATES = ("completed", "completed_with_errors", "completed_with_deferred")
 
 
 def utc_now() -> str:
@@ -489,6 +489,9 @@ def refresh_one_batch_progress(conn: sqlite3.Connection, batch_key: str) -> None
             WHEN (SELECT state FROM documents d WHERE d.sha256=batch_items.sha256)
                  IN ('complete_valid','legacy_result_only','completed_db_unsynced') THEN 'completed'
             WHEN (SELECT state FROM documents d WHERE d.sha256=batch_items.sha256)
+                 = 'failed_permanent' THEN 'error'
+            WHEN item_status='deferred' THEN 'deferred'
+            WHEN (SELECT state FROM documents d WHERE d.sha256=batch_items.sha256)
                  IN ('queued','active') THEN 'submitted'
             WHEN (SELECT state FROM documents d WHERE d.sha256=batch_items.sha256)
                  IN ('failed_retryable','failed_permanent') THEN 'error'
@@ -528,6 +531,7 @@ def refresh_one_batch_progress(conn: sqlite3.Connection, batch_key: str) -> None
     )
     completed = item_counts["completed"]
     submitted = item_counts["submitted"]
+    deferred = item_counts["deferred"]
     permanent_failed = state_counts["failed_permanent"]
     failed = int(
         conn.execute(
@@ -535,7 +539,10 @@ def refresh_one_batch_progress(conn: sqlite3.Connection, batch_key: str) -> None
             SELECT COUNT(*) AS count
             FROM batch_items bi JOIN documents d USING(sha256)
             WHERE bi.batch_id=?
-              AND (bi.item_status='error' OR d.state IN ('failed_retryable','failed_permanent'))
+              AND (
+                  bi.item_status='error'
+                  OR (bi.item_status!='deferred' AND d.state IN ('failed_retryable','failed_permanent'))
+              )
             """,
             (batch["batch_id"],),
         ).fetchone()["count"]
@@ -544,9 +551,11 @@ def refresh_one_batch_progress(conn: sqlite3.Connection, batch_key: str) -> None
         status = "completed"
     elif completed + permanent_failed == batch["item_count"] and permanent_failed:
         status = "completed_with_errors"
+    elif completed + permanent_failed + deferred == batch["item_count"] and deferred:
+        status = "completed_with_deferred"
     elif submitted or completed:
         status = "partial" if failed else "running"
-    elif failed:
+    elif failed or deferred:
         status = "partial"
     else:
         status = "prepared"
@@ -560,6 +569,72 @@ def refresh_one_batch_progress(conn: sqlite3.Connection, batch_key: str) -> None
     )
     conn.commit()
 
+
+def defer_batch_items(
+    conn: sqlite3.Connection,
+    batch_key: str,
+    task_ids: Sequence[str],
+    *,
+    reason: str,
+) -> dict[str, object]:
+    """Release stale batch tails without cancelling their underlying tasks."""
+    unique_task_ids = tuple(dict.fromkeys(str(task_id) for task_id in task_ids if task_id))
+    if not unique_task_ids:
+        return {"batch_key": batch_key, "deferred": 0, "task_ids": []}
+    batch = conn.execute(
+        "SELECT batch_id FROM batches WHERE batch_key=?",
+        (batch_key,),
+    ).fetchone()
+    if not batch:
+        raise RuntimeError(f"unknown batch: {batch_key}")
+    placeholders = ",".join("?" for _ in unique_task_ids)
+    rows = conn.execute(
+        f"""
+        SELECT task_id,sha256
+        FROM batch_items
+        WHERE batch_id=? AND item_status IN ('submitted','error')
+          AND task_id IN ({placeholders})
+        ORDER BY position
+        """,
+        (batch["batch_id"], *unique_task_ids),
+    ).fetchall()
+    selected_task_ids = [row["task_id"] for row in rows]
+    if not selected_task_ids:
+        return {"batch_key": batch_key, "deferred": 0, "task_ids": []}
+    selected_placeholders = ",".join("?" for _ in selected_task_ids)
+    now = utc_now()
+    conn.execute(
+        f"""
+        UPDATE batch_items
+        SET item_status='deferred',submit_error=NULL,updated_at=?
+        WHERE batch_id=? AND item_status IN ('submitted','error')
+          AND task_id IN ({selected_placeholders})
+        """,
+        (now, batch["batch_id"], *selected_task_ids),
+    )
+    conn.execute(
+        "INSERT INTO events(event_time,event_type,batch_id,detail_json) VALUES (?,?,?,?)",
+        (
+            now,
+            "batch_tail_deferred",
+            batch["batch_id"],
+            json.dumps(
+                {"count": len(selected_task_ids), "reason": reason, "task_ids": selected_task_ids},
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+        ),
+    )
+    conn.commit()
+    refresh_one_batch_progress(conn, batch_key)
+    return {
+        "batch_key": batch_key,
+        "deferred": len(selected_task_ids),
+        "task_ids": selected_task_ids,
+        "reason": reason,
+    }
+
+
 def refresh_batch_progress(conn: sqlite3.Connection) -> None:
     now = utc_now()
     conn.execute(
@@ -568,6 +643,9 @@ def refresh_batch_progress(conn: sqlite3.Connection) -> None:
         SET item_status = CASE
             WHEN (SELECT state FROM documents d WHERE d.sha256=batch_items.sha256)
                  IN ('complete_valid','legacy_result_only','completed_db_unsynced') THEN 'completed'
+            WHEN (SELECT state FROM documents d WHERE d.sha256=batch_items.sha256)
+                 = 'failed_permanent' THEN 'error'
+            WHEN item_status='deferred' THEN 'deferred'
             WHEN (SELECT state FROM documents d WHERE d.sha256=batch_items.sha256)
                  IN ('queued','active') THEN 'submitted'
             WHEN (SELECT state FROM documents d WHERE d.sha256=batch_items.sha256)
@@ -608,6 +686,7 @@ def refresh_batch_progress(conn: sqlite3.Connection) -> None:
         )
         completed = item_counts["completed"]
         submitted = item_counts["submitted"]
+        deferred = item_counts["deferred"]
         permanent_failed = state_counts["failed_permanent"]
         failed = int(
             conn.execute(
@@ -615,7 +694,10 @@ def refresh_batch_progress(conn: sqlite3.Connection) -> None:
                 SELECT COUNT(*) AS count
                 FROM batch_items bi JOIN documents d USING(sha256)
                 WHERE bi.batch_id=?
-                  AND (bi.item_status='error' OR d.state IN ('failed_retryable','failed_permanent'))
+                  AND (
+                      bi.item_status='error'
+                      OR (bi.item_status!='deferred' AND d.state IN ('failed_retryable','failed_permanent'))
+                  )
                 """,
                 (row["batch_id"],),
             ).fetchone()["count"]
@@ -624,9 +706,11 @@ def refresh_batch_progress(conn: sqlite3.Connection) -> None:
             status = "completed"
         elif completed + permanent_failed == row["item_count"] and permanent_failed:
             status = "completed_with_errors"
+        elif completed + permanent_failed + deferred == row["item_count"] and deferred:
+            status = "completed_with_deferred"
         elif submitted or completed:
             status = "partial" if failed else "running"
-        elif failed:
+        elif failed or deferred:
             status = "partial"
         else:
             status = "prepared"
@@ -776,13 +860,16 @@ def build_progress_report(
     db_completed = ready + states.get("completed_db_unsynced", 0)
     batches = [dict(row) for row in conn.execute(
         """
-        SELECT batch_id,batch_key,generation,ordinal,status,item_count,
-               submitted_count,completed_count,failed_count,created_at,updated_at
-        FROM batches ORDER BY batch_id
+        SELECT b.batch_id,b.batch_key,b.generation,b.ordinal,b.status,b.item_count,
+               b.submitted_count,b.completed_count,b.failed_count,
+               (SELECT COUNT(*) FROM batch_items bi
+                WHERE bi.batch_id=b.batch_id AND bi.item_status='deferred') AS deferred_count,
+               b.created_at,b.updated_at
+        FROM batches b ORDER BY b.batch_id
         """
     )]
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "updated_at": utc_now(),
         "inventory_path": str(inventory_path),
         "total_source": total,
@@ -827,6 +914,7 @@ def write_progress_reports(
                 "submitted_count",
                 "completed_count",
                 "failed_count",
+                "deferred_count",
                 "created_at",
                 "updated_at",
             ),

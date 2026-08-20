@@ -131,6 +131,8 @@ SCHEDULER_MONITOR_INTERVAL="${SCHEDULER_MONITOR_INTERVAL:-300}"   # 监控周期
 SCHEDULER_HEALTH_INTERVAL="${SCHEDULER_HEALTH_INTERVAL:-900}"     # 健康检查周期(秒,默认 15 分钟)
 SCHEDULER_STALE_TIMEOUT="${SCHEDULER_STALE_TIMEOUT:-10}"          # 孤儿任务判定阈值(分钟,默认 10)
 SCHEDULER_CLEANUP_DAYS="${SCHEDULER_CLEANUP_DAYS:-0}"             # 旧任务文件清理(天, 0=禁用;批量处理时必须关闭否则边跑边删)
+SCHEDULER_ORPHAN_RECOVERY_APPLY="${SCHEDULER_ORPHAN_RECOVERY_APPLY:-true}" # 本机批处理默认实际恢复; false 可退回审计模式
+SCHEDULER_ORPHAN_RECOVERY_BATCH_SIZE="${SCHEDULER_ORPHAN_RECOVERY_BATCH_SIZE:-500}"
 
 # PDF 自动拆分（降低单次推理峰值内存，缓解 worker 原生崩溃）
 PDF_SPLIT_ENABLED="${PDF_SPLIT_ENABLED:-true}"
@@ -1702,6 +1704,25 @@ start_scheduler() {
 
     cd "$BACKEND_DIR"
 
+    local scheduler_args=(
+        task_scheduler.py
+        --litserve-url "http://localhost:${WORKER_BASE_PORT}/predict"
+        --monitor-interval "$SCHEDULER_MONITOR_INTERVAL"
+        --health-check-interval "$SCHEDULER_HEALTH_INTERVAL"
+        --stale-task-timeout "$SCHEDULER_STALE_TIMEOUT"
+        --orphan-recovery-batch-size "$SCHEDULER_ORPHAN_RECOVERY_BATCH_SIZE"
+        --cleanup-old-files-days "$SCHEDULER_CLEANUP_DAYS"
+        --wait-for-workers
+    )
+    case "${SCHEDULER_ORPHAN_RECOVERY_APPLY,,}" in
+        1|true|yes|on) scheduler_args+=(--orphan-recovery-apply) ;;
+        0|false|no|off) ;;
+        *)
+            log_error "SCHEDULER_ORPHAN_RECOVERY_APPLY 必须是 true/false"
+            return 1
+            ;;
+    esac
+
     DATABASE_PATH="$DATABASE_PATH" \
     OUTPUT_PATH="$OUTPUT_PATH" \
     REDIS_QUEUE_ENABLED="$REDIS_QUEUE_ENABLED" \
@@ -1715,14 +1736,7 @@ start_scheduler() {
     REDIS_CLAIM_PAUSE_KEY="$REDIS_CLAIM_PAUSE_KEY" \
     SQLITE_QUEUE_FALLBACK="$SQLITE_QUEUE_FALLBACK" \
     REDIS_TASK_TIMEOUT="$REDIS_TASK_TIMEOUT" \
-    nohup ${PYTHON_BIN} task_scheduler.py \
-        --litserve-url "http://localhost:${WORKER_BASE_PORT}/predict" \
-        --monitor-interval "$SCHEDULER_MONITOR_INTERVAL" \
-        --health-check-interval "$SCHEDULER_HEALTH_INTERVAL" \
-        --stale-task-timeout "$SCHEDULER_STALE_TIMEOUT" \
-        --cleanup-old-files-days "$SCHEDULER_CLEANUP_DAYS" \
-        --wait-for-workers \
-        > "$log_file" 2>&1 &
+    nohup "$PYTHON_BIN" "${scheduler_args[@]}" > "$log_file" 2>&1 &
 
     local pid=$!
     echo "$pid" > "$pid_file"
@@ -1731,7 +1745,7 @@ start_scheduler() {
     sleep 3
 
     if pid_matches "$pid" "python.*task_scheduler.py"; then
-        log_info "Task Scheduler 就绪 - 孤儿恢复阈值 ${SCHEDULER_STALE_TIMEOUT}m, 监控周期 ${SCHEDULER_MONITOR_INTERVAL}s"
+        log_info "Task Scheduler 就绪 - 孤儿恢复 apply=${SCHEDULER_ORPHAN_RECOVERY_APPLY}, 阈值 ${SCHEDULER_STALE_TIMEOUT}m, 监控周期 ${SCHEDULER_MONITOR_INTERVAL}s"
     else
         log_error "Task Scheduler 启动失败，查看: $log_file"
         return 1
@@ -2551,6 +2565,7 @@ MinerU Tianshu - 统一启动脚本
     WORKER_BASE_PORT     Worker 起始端口
     WORKER_NUM_INSTANCES Worker 数量
     DATABASE_PATH        数据库路径(自动派生自 INSTANCE_DATA_DIR)
+    SCHEDULER_ORPHAN_RECOVERY_APPLY  是否实际恢复孤儿任务(默认 true)
     OUTPUT_PATH          输出路径(自动派生)
 EOF
 }

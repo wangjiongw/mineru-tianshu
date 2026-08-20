@@ -553,3 +553,78 @@ def test_submit_batch_accepts_split_processing_modes_with_empty_requeued_childre
     assert doc["state"] == "queued"
     assert doc["db_status"] == "processing"
     assert doc["last_submit_error"] is None
+
+
+def test_deferred_items_are_tracked_and_reconcile_when_results_arrive(tmp_path):
+    inventory = tmp_path / "inventory" / "oa.sqlite3"
+    conn = module.connect_inventory(inventory)
+    completed_sha = "a" * 64
+    deferred_sha = "b" * 64
+    source = tmp_path / "source"
+    insert_document(
+        conn,
+        completed_sha,
+        make_source(source, completed_sha),
+        "completed_db_unsynced",
+        task_id=f"task-{completed_sha[-8:]}",
+        db_status="completed",
+    )
+    insert_document(
+        conn,
+        deferred_sha,
+        make_source(source, deferred_sha),
+        "active",
+        task_id=f"task-{deferred_sha[-8:]}",
+        db_status="processing",
+    )
+    batch_id = insert_batch(
+        conn,
+        "oa-g001-b00001",
+        [completed_sha, deferred_sha],
+        item_status="submitted",
+    )
+
+    result = module.defer_batch_items(
+        conn,
+        "oa-g001-b00001",
+        [f"task-{deferred_sha[-8:]}"],
+        reason="stale test tail",
+    )
+    batch = conn.execute(
+        "SELECT status,submitted_count,completed_count,failed_count FROM batches WHERE batch_id=?",
+        (batch_id,),
+    ).fetchone()
+    report = module.build_progress_report(conn, inventory, tmp_path / "legacy.json")
+
+    assert result["deferred"] == 1
+    assert dict(batch) == {
+        "status": "completed_with_deferred",
+        "submitted_count": 0,
+        "completed_count": 1,
+        "failed_count": 0,
+    }
+    assert report["schema_version"] == 2
+    assert report["batches"][0]["deferred_count"] == 1
+
+    conn.execute(
+        """
+        UPDATE documents
+        SET state='completed_db_unsynced',db_status='completed'
+        WHERE sha256=?
+        """,
+        (deferred_sha,),
+    )
+    conn.commit()
+    module.refresh_one_batch_progress(conn, "oa-g001-b00001")
+    resolved = conn.execute(
+        """
+        SELECT b.status,
+               (SELECT COUNT(*) FROM batch_items bi
+                WHERE bi.batch_id=b.batch_id AND bi.item_status='deferred') AS deferred_count
+        FROM batches b WHERE b.batch_id=?
+        """,
+        (batch_id,),
+    ).fetchone()
+    conn.close()
+
+    assert dict(resolved) == {"status": "completed", "deferred_count": 0}

@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import sqlite3
 import sys
 from pathlib import Path
@@ -45,6 +46,12 @@ def make_args(tmp_path: Path, *, apply: bool = False, once: bool = True) -> Simp
         write_progress_reports=False,
         priority=0,
         high_watermark=5000,
+        defer_stale_after_seconds=3600.0,
+        max_deferred_items_per_batch=20,
+        max_deferred_backlog=100,
+        min_terminal_fraction=0.99,
+        max_item_submit_attempts=2,
+        _deferred_backlog=0,
         allow_live_claims=True,
         host="localhost",
         worker_ports=[8101],
@@ -357,3 +364,216 @@ def test_submit_bridges_task_db_and_redis_fields_to_manage_submit(tmp_path, monk
     assert seen["task_db"] == args.task_db
     assert seen["redis_queue_key"] == args.redis_queue_key
     assert args._last_submit_at is not None
+
+
+def test_stale_tail_is_deferred_and_batch_becomes_terminal(tmp_path):
+    args = make_args(tmp_path, apply=True, once=True)
+    args.min_terminal_fraction = 0.5
+    completed_sha = "a" * 64
+    stale_sha = "b" * 64
+    conn = batches.connect_inventory(args.inventory)
+    add_doc(conn, completed_sha, state="complete_valid", task_id=f"task-{completed_sha[-8:]}")
+    add_doc(conn, stale_sha, state="active", task_id=f"task-{stale_sha[-8:]}")
+    add_batch(
+        conn,
+        "oa-g001-b00001",
+        [completed_sha, stale_sha],
+        status="partial",
+        item_status="submitted",
+        submitted=1,
+        completed=1,
+    )
+    conn.execute(
+        "UPDATE batch_items SET item_status='completed' WHERE sha256=?",
+        (completed_sha,),
+    )
+    conn.commit()
+
+    task_conn = sqlite3.connect(args.task_db)
+    task_conn.executescript(
+        """
+        CREATE TABLE tasks (
+            task_id TEXT PRIMARY KEY,
+            status TEXT,
+            created_at TIMESTAMP,
+            started_at TIMESTAMP
+        );
+        """
+    )
+    task_conn.execute(
+        """
+        INSERT INTO tasks(task_id,status,created_at,started_at)
+        VALUES (?,'processing',datetime('now','-2 hours'),datetime('now','-2 hours'))
+        """,
+        (f"task-{stale_sha[-8:]}",),
+    )
+    task_conn.commit()
+    task_conn.close()
+
+    batch = runner.get_batch(conn, "oa-g001-b00001")
+    report = runner.defer_stale_batch_tail(conn, args, batch)
+    refreshed = runner.get_batch(conn, "oa-g001-b00001")
+    event = conn.execute(
+        "SELECT event_type,detail_json FROM events WHERE event_type='batch_tail_deferred'"
+    ).fetchone()
+    conn.close()
+
+    assert report["deferred"] == 1
+    assert report["deferred_backlog"] == 1
+    assert refreshed["status"] == "completed_with_deferred"
+    assert refreshed["submitted_count"] == 0
+    assert refreshed["deferred_count"] == 1
+    assert event["event_type"] == "batch_tail_deferred"
+    assert json.loads(event["detail_json"])["task_ids"] == [f"task-{stale_sha[-8:]}"]
+
+
+def test_recovered_tail_uses_original_submit_time_not_reset_start_time(tmp_path):
+    args = make_args(tmp_path, apply=True, once=True)
+    args.min_terminal_fraction = 0.5
+    completed_sha = "a" * 64
+    recovered_sha = "b" * 64
+    conn = batches.connect_inventory(args.inventory)
+    add_doc(conn, completed_sha, state="complete_valid", task_id=f"task-{completed_sha[-8:]}")
+    add_doc(conn, recovered_sha, state="active", task_id=f"task-{recovered_sha[-8:]}")
+    add_batch(
+        conn,
+        "oa-g001-b00001",
+        [completed_sha, recovered_sha],
+        status="partial",
+        item_status="submitted",
+        submitted=1,
+        completed=1,
+    )
+    conn.execute(
+        "UPDATE batch_items SET item_status='completed' WHERE sha256=?",
+        (completed_sha,),
+    )
+    conn.execute(
+        "UPDATE documents SET last_submit_at=datetime('now','-2 hours') WHERE sha256=?",
+        (recovered_sha,),
+    )
+    conn.commit()
+
+    task_conn = sqlite3.connect(args.task_db)
+    task_conn.executescript(
+        """
+        CREATE TABLE tasks (
+            task_id TEXT PRIMARY KEY,
+            status TEXT,
+            created_at TIMESTAMP,
+            started_at TIMESTAMP
+        );
+        """
+    )
+    task_conn.execute(
+        """
+        INSERT INTO tasks(task_id,status,created_at,started_at)
+        VALUES (?,'processing',datetime('now'),datetime('now'))
+        """,
+        (f"task-{recovered_sha[-8:]}",),
+    )
+    task_conn.commit()
+    task_conn.close()
+
+    batch = runner.get_batch(conn, "oa-g001-b00001")
+    report = runner.defer_stale_batch_tail(conn, args, batch)
+    refreshed = runner.get_batch(conn, "oa-g001-b00001")
+    conn.close()
+
+    assert report["deferred"] == 1
+    assert report["task_ids"] == [f"task-{recovered_sha[-8:]}"]
+    assert refreshed["status"] == "completed_with_deferred"
+
+
+def test_retry_exhausted_tail_is_deferred_after_one_retry(tmp_path):
+    args = make_args(tmp_path, apply=True, once=True)
+    args.min_terminal_fraction = 0.5
+    completed_sha = "a" * 64
+    failed_sha = "b" * 64
+    conn = batches.connect_inventory(args.inventory)
+    add_doc(conn, completed_sha, state="complete_valid", task_id=f"task-{completed_sha[-8:]}")
+    add_doc(conn, failed_sha, state="failed_retryable", task_id=f"task-{failed_sha[-8:]}")
+    add_batch(
+        conn,
+        "oa-g001-b00001",
+        [completed_sha, failed_sha],
+        status="partial",
+        item_status="error",
+        failed=1,
+        completed=1,
+    )
+    conn.execute(
+        "UPDATE batch_items SET item_status='completed' WHERE sha256=?",
+        (completed_sha,),
+    )
+    conn.execute(
+        "UPDATE documents SET submit_attempts=2 WHERE sha256=?",
+        (failed_sha,),
+    )
+    conn.commit()
+
+    batch = runner.get_batch(conn, "oa-g001-b00001")
+    report = runner.defer_retry_exhausted_tail(conn, args, batch)
+    refreshed = runner.get_batch(conn, "oa-g001-b00001")
+    conn.close()
+
+    assert report["deferred"] == 1
+    assert refreshed["status"] == "completed_with_deferred"
+    assert refreshed["deferred_count"] == 1
+
+
+def test_stale_tail_respects_global_deferred_backlog_cap(tmp_path):
+    args = make_args(tmp_path, apply=True, once=True)
+    args.min_terminal_fraction = 0.5
+    args.max_deferred_backlog = 1
+    old_sha = "a" * 64
+    stale_sha = "b" * 64
+    conn = batches.connect_inventory(args.inventory)
+    add_doc(conn, old_sha, state="active", task_id=f"task-{old_sha[-8:]}")
+    add_batch(
+        conn,
+        "oa-g001-b00001",
+        [old_sha],
+        status="completed_with_deferred",
+        item_status="deferred",
+    )
+    add_doc(conn, stale_sha, state="active", task_id=f"task-{stale_sha[-8:]}")
+    add_batch(
+        conn,
+        "oa-g001-b00002",
+        [stale_sha],
+        status="partial",
+        item_status="submitted",
+        submitted=1,
+    )
+    batch = runner.get_batch(conn, "oa-g001-b00002")
+    conn.close()
+
+    check_conn = batches.connect_inventory(args.inventory)
+    try:
+        assert runner.stale_tail_task_ids(check_conn, args, batch) == []
+    finally:
+        check_conn.close()
+
+
+def test_primary_batches_finish_with_explicit_deferred_backfill_checkpoint(tmp_path):
+    args = make_args(tmp_path, apply=True, once=True)
+    sha = "a" * 64
+    conn = batches.connect_inventory(args.inventory)
+    add_doc(conn, sha, state="active", task_id=f"task-{sha[-8:]}")
+    add_batch(
+        conn,
+        "oa-g001-b00001",
+        [sha],
+        status="completed_with_deferred",
+        item_status="deferred",
+    )
+    conn.close()
+
+    rc = runner.run_loop(args, health_check=healthy)
+    checkpoint = json.loads(args.checkpoint.read_text(encoding="utf-8"))
+
+    assert rc == 0
+    assert checkpoint["action"] == "primary_complete_with_deferred"
+    assert checkpoint["stop_reason"] == "deferred_backfill_required"
+    assert checkpoint["deferred_backlog"] == 1
