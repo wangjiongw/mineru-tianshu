@@ -543,7 +543,7 @@ class TianshuProcessStatusTests(unittest.TestCase):
             fake_proc(tmp_path, 601, "S", ["/env/bin/python", "litserve_worker.py", "--port", "8103"])
             (worker_dir / "worker_2.pid").write_text("601")
             result = run_bash(
-                f'WORKER_LOG_DIR="{worker_dir}" WORKER_BASE_PORT=8101 WORKER_NUM_INSTANCES=8 WORKER_READY_POLL_SECONDS=1; '
+                f'WORKER_LOG_DIR="{worker_dir}" WORKER_BASE_PORT=8101 WORKER_NUM_INSTANCES=8 WORKER_READY_POLL_SECONDS=1 WORKER_READY_SUCCESS_THRESHOLD=1; '
                 f'curl() {{ n=$(cat "{counter}" 2>/dev/null || echo 0); n=$((n + 1)); printf "%s" "$n" > "{counter}"; printf "%s\n" "$*" >> "{calls}"; [ "$n" -ge 3 ]; }}; '
                 'sleep() { :; }; '
                 'wait_worker_instance_ready 2 5',
@@ -554,6 +554,27 @@ class TianshuProcessStatusTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(recorded), 3)
         self.assertTrue(all('http://localhost:8103/health' in call for call in recorded))
+
+    def test_wait_worker_instance_ready_requires_stable_consecutive_health(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            worker_dir = tmp_path / "worker"
+            calls = tmp_path / "curl-calls"
+            counter = tmp_path / "curl-count"
+            worker_dir.mkdir()
+            fake_proc(tmp_path, 603, "S", ["/env/bin/python", "litserve_worker.py", "--port", "8103"])
+            (worker_dir / "worker_2.pid").write_text("603")
+            result = run_bash(
+                f'WORKER_LOG_DIR="{worker_dir}" WORKER_BASE_PORT=8101 WORKER_NUM_INSTANCES=8 WORKER_READY_POLL_SECONDS=1 WORKER_READY_SUCCESS_THRESHOLD=3; '
+                f'curl() {{ n=$(cat "{counter}" 2>/dev/null || echo 0); n=$((n + 1)); printf "%s" "$n" > "{counter}"; printf "%s\n" "$*" >> "{calls}"; case "$n" in 1|4) return 1 ;; *) return 0 ;; esac; }}; '
+                'sleep() { :; }; '
+                'wait_worker_instance_ready 2 10',
+                tmp_path,
+            )
+            recorded = calls.read_text().splitlines()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(recorded), 7)
 
     def test_wait_worker_instance_ready_fails_if_worker_process_exits_before_health(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

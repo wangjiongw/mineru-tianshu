@@ -35,6 +35,7 @@ VLLM_MAX_NUM_BATCHED_TOKENS="${VLLM_MAX_NUM_BATCHED_TOKENS:-4096}" # 8192 实测
 #                                                                # hybrid/VLM 推理走本卡 vLLM；0.60 + c8 在 10 分钟压力下 0 OOM/0 preemption
 VLLM_READY_TIMEOUT="${VLLM_READY_TIMEOUT:-900}"   # vllm 健康检查总超时(秒);首次含 NPU kernel 编译,默认 15min,可调大
 WORKER_READY_TIMEOUT="${WORKER_READY_TIMEOUT:-180}" # worker cold-start /health 等待超时(秒)
+WORKER_READY_SUCCESS_THRESHOLD="${WORKER_READY_SUCCESS_THRESHOLD:-6}" # 连续健康次数；默认 6x5s，避免 LitServe 端口早开导致假 ready
 SUPERVISOR_HEALTH_PROBE_TIMEOUT_SECONDS="${SUPERVISOR_HEALTH_PROBE_TIMEOUT_SECONDS:-5}"
 COMPUTE_SUPERVISOR_POLL_SECONDS="${COMPUTE_SUPERVISOR_POLL_SECONDS:-5}"
 COMPUTE_SUPERVISOR_HEALTH_INTERVAL_SECONDS="${COMPUTE_SUPERVISOR_HEALTH_INTERVAL_SECONDS:-15}"
@@ -1118,6 +1119,7 @@ handle_supervised_worker_restart_request() {
         return 75
     fi
     worker_health_failures=0
+    last_health_check="$(date +%s)"
     write_supervised_worker_restart_ack "$i" "$revision" "ok" "worker-pid=${worker_pid}" || true
     log_info "Compute #${i} supervisor restarted ready Worker PID ${worker_pid} without replacing VLLM PID ${vllm_pid}"
 }
@@ -1277,13 +1279,19 @@ wait_worker_instance_ready() {
     local timeout="${2:-$WORKER_READY_TIMEOUT}"
     local elapsed=0
     local interval="${WORKER_READY_POLL_SECONDS:-5}"
+    local success_threshold="${WORKER_READY_SUCCESS_THRESHOLD:-6}"
+    local consecutive_successes=0
     case "$timeout" in ""|*[!0-9]*) timeout=180 ;; esac
     case "$interval" in ""|*[!0-9]*|0) interval=5 ;; esac
+    case "$success_threshold" in ""|*[!0-9]*|0) success_threshold=6 ;; esac
 
     while [ "$elapsed" -le "$timeout" ]; do
         worker_is_running "$index" || return 1
         if worker_http_healthy "$index" "$SUPERVISOR_HEALTH_PROBE_TIMEOUT_SECONDS"; then
-            return 0
+            consecutive_successes=$((consecutive_successes + 1))
+            [ "$consecutive_successes" -ge "$success_threshold" ] && return 0
+        else
+            consecutive_successes=0
         fi
         sleep "$interval"
         elapsed=$((elapsed + interval))
