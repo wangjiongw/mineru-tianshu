@@ -21,6 +21,9 @@ import manage_oa_batches as batches
 
 DEFAULT_LOCK_NAME = "run_oa_batches.lock"
 DEFAULT_CHECKPOINT_NAME = "run_oa_batches_checkpoint.json"
+DEFAULT_HEALTH_BACKOFF_INITIAL_SECONDS = 60.0
+DEFAULT_HEALTH_BACKOFF_MAX_SECONDS = 300.0
+DEFAULT_HEALTH_RECOVERY_SUCCESSES = 3
 ACTIVE_BATCH_STATES = ("running", "partial")
 TERMINAL_BATCH_STATES = batches.TERMINAL_BATCH_STATES
 
@@ -129,6 +132,11 @@ def checkpoint_payload(args: argparse.Namespace, *, action: str, stop_reason: st
         "last_refresh_at": getattr(args, "_last_refresh_at", None),
         "last_submit_at": getattr(args, "_last_submit_at", None),
         "consecutive_health_failures": errors,
+        "consecutive_health_successes": getattr(args, "_consecutive_health_successes", 0),
+        "health_first_failure_at": getattr(args, "_health_first_failure_at", None),
+        "health_last_failure_at": getattr(args, "_health_last_failure_at", None),
+        "health_last_failure_reason": getattr(args, "_health_last_failure_reason", None),
+        "next_health_check_at": getattr(args, "_next_health_check_at", None),
         "deferred_backlog": getattr(args, "_deferred_backlog", 0),
     }
 
@@ -144,6 +152,50 @@ def stop_requested(args: argparse.Namespace, *, batch: dict[str, Any] | None = N
     write_checkpoint(args, action="stopped", stop_reason="signal", batch=batch, errors=errors)
     emit("stop", reason="signal")
     return True
+
+
+def health_failure_reason(health: dict[str, Any]) -> str:
+    checks = health.get("checks")
+    if not isinstance(checks, dict):
+        return "health_gate"
+    failed = [
+        name
+        for name, detail in checks.items()
+        if not isinstance(detail, dict) or detail.get("passed") is not True
+    ]
+    return ",".join(sorted(failed)) or "health_gate"
+
+
+def health_retry_delay(args: argparse.Namespace, failures: int) -> float:
+    pause_attempt = max(0, failures - max(1, args.max_health_failures))
+    if pause_attempt >= 2:
+        return args.health_backoff_max_seconds
+    delay = args.health_backoff_initial_seconds * (2**pause_attempt)
+    return min(delay, args.health_backoff_max_seconds)
+
+
+def next_health_check_at(delay_seconds: float) -> str:
+    return (
+        datetime.now(timezone.utc) + timedelta(seconds=max(0.0, delay_seconds))
+    ).isoformat(timespec="seconds")
+
+
+def wait_for_health_retry(
+    args: argparse.Namespace,
+    delay_seconds: float,
+    *,
+    batch: dict[str, Any] | None,
+    errors: int,
+) -> bool:
+    remaining = max(0.0, delay_seconds)
+    while remaining > 0:
+        if stop_requested(args, batch=batch, errors=errors):
+            return False
+        interval = min(1.0, remaining)
+        time.sleep(interval)
+        remaining -= interval
+    return not stop_requested(args, batch=batch, errors=errors)
+
 
 def health_gate(args: argparse.Namespace) -> tuple[bool, dict[str, Any]]:
     report = efficiency.run_evaluation(
@@ -399,6 +451,8 @@ def defer_retry_exhausted_tail(
 def run_loop(args: argparse.Namespace, health_check: Callable[[argparse.Namespace], tuple[bool, dict[str, Any]]] = health_gate) -> int:
     install_signal_handlers()
     health_failures = 0
+    health_successes = 0
+    health_paused = False
     with runner_lock(args.lock_file):
         write_checkpoint(args, action="started")
         if args.initial_refresh and args.apply:
@@ -480,19 +534,76 @@ def run_loop(args: argparse.Namespace, health_check: Callable[[argparse.Namespac
 
                 ok, health = health_check(args)
                 if not ok:
+                    observed_at = utc_now()
+                    if health_failures == 0:
+                        args._health_first_failure_at = observed_at
                     health_failures += 1
-                    write_checkpoint(args, action="health_failed", batch=target, errors=health_failures)
-                    emit("health_failed", batch_key=target["batch_key"], consecutive=health_failures, health=health)
-                    if health_failures >= args.max_health_failures:
+                    health_successes = 0
+                    args._consecutive_health_successes = 0
+                    args._health_last_failure_at = observed_at
+                    args._health_last_failure_reason = health_failure_reason(health)
+                    if args.once or (
+                        args.exit_on_health_failure
+                        and health_failures >= args.max_health_failures
+                    ):
+                        write_checkpoint(args, action="health_failed", batch=target, errors=health_failures)
+                        emit("health_failed", batch_key=target["batch_key"], consecutive=health_failures, health=health)
                         write_checkpoint(args, action="stopped", stop_reason="health_gate", batch=target, errors=health_failures)
                         return 3
-                    if args.once:
-                        return 3
-                    time.sleep(args.poll_seconds)
+                    if health_failures >= args.max_health_failures:
+                        health_paused = True
+                        delay = health_retry_delay(args, health_failures)
+                        args._next_health_check_at = next_health_check_at(delay)
+                        write_checkpoint(args, action="health_paused", batch=target, errors=health_failures)
+                        emit(
+                            "health_paused",
+                            batch_key=target["batch_key"],
+                            consecutive=health_failures,
+                            next_check_at=args._next_health_check_at,
+                            health=health,
+                        )
+                        if not wait_for_health_retry(args, delay, batch=target, errors=health_failures):
+                            return 130
+                    else:
+                        args._next_health_check_at = next_health_check_at(args.poll_seconds)
+                        write_checkpoint(args, action="health_failed", batch=target, errors=health_failures)
+                        emit("health_failed", batch_key=target["batch_key"], consecutive=health_failures, health=health)
+                        if not wait_for_health_retry(args, args.poll_seconds, batch=target, errors=health_failures):
+                            return 130
                     continue
                 if stop_requested(args, batch=target, errors=health_failures):
                     return 130
+                if health_paused:
+                    health_successes += 1
+                    args._consecutive_health_successes = health_successes
+                    if health_successes < args.health_recovery_successes:
+                        args._next_health_check_at = next_health_check_at(args.poll_seconds)
+                        write_checkpoint(args, action="health_recovering", batch=target, errors=health_failures)
+                        emit(
+                            "health_recovering",
+                            batch_key=target["batch_key"],
+                            consecutive_successes=health_successes,
+                            required_successes=args.health_recovery_successes,
+                            next_check_at=args._next_health_check_at,
+                        )
+                        if not wait_for_health_retry(args, args.poll_seconds, batch=target, errors=health_failures):
+                            return 130
+                        continue
+                    emit(
+                        "health_resumed",
+                        batch_key=target["batch_key"],
+                        consecutive_successes=health_successes,
+                    )
+                    args._next_health_check_at = None
+                    write_checkpoint(args, action="health_resumed", batch=target, errors=health_failures)
+                    health_paused = False
                 health_failures = 0
+                health_successes = 0
+                args._consecutive_health_successes = 0
+                args._health_first_failure_at = None
+                args._health_last_failure_at = None
+                args._health_last_failure_reason = None
+                args._next_health_check_at = None
 
                 if not args.apply:
                     write_checkpoint(args, action="dry_run_submit", stop_reason="dry_run", batch=target, errors=health_failures)
@@ -541,6 +652,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lock-file", type=Path, default=None)
     parser.add_argument("--poll-seconds", type=float, default=60.0)
     parser.add_argument("--max-health-failures", type=int, default=3)
+    parser.add_argument("--exit-on-health-failure", action="store_true", help="exit after the health failure threshold instead of waiting for recovery")
+    parser.add_argument("--health-backoff-initial-seconds", type=float, default=DEFAULT_HEALTH_BACKOFF_INITIAL_SECONDS)
+    parser.add_argument("--health-backoff-max-seconds", type=float, default=DEFAULT_HEALTH_BACKOFF_MAX_SECONDS)
+    parser.add_argument("--health-recovery-successes", type=int, default=DEFAULT_HEALTH_RECOVERY_SUCCESSES)
     parser.add_argument("--max-batch-errors", type=int, default=100)
     parser.add_argument("--write-progress-reports", action="store_true", help="rewrite full progress.json/batches.csv on every batch poll")
     parser.add_argument("--priority", type=int, default=0)
@@ -576,8 +691,17 @@ def normalize_args(args: argparse.Namespace) -> argparse.Namespace:
         args.log_path = [Path("/share/wangjiong/databases/mineru_database/mineru-runner-worker-0/mineru_logs")]
     args._last_refresh_at = None
     args._last_submit_at = None
+    args._consecutive_health_successes = 0
+    args._health_first_failure_at = None
+    args._health_last_failure_at = None
+    args._health_last_failure_reason = None
+    args._next_health_check_at = None
     if not 0.0 <= args.min_terminal_fraction <= 1.0:
         raise ValueError("min-terminal-fraction must be between 0 and 1")
+    if args.max_health_failures < 1 or args.health_recovery_successes < 1:
+        raise ValueError("health failure and recovery thresholds must be at least 1")
+    if args.health_backoff_initial_seconds < 0 or args.health_backoff_max_seconds < args.health_backoff_initial_seconds:
+        raise ValueError("health backoff must be non-negative and max must be >= initial")
     if args.defer_stale_after_seconds < 0 or args.max_deferred_items_per_batch < 0 or args.max_deferred_backlog < 0 or args.max_item_submit_attempts < 0:
         raise ValueError("deferred-tail limits must be non-negative")
     args._deferred_backlog = 0

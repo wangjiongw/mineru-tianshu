@@ -42,6 +42,10 @@ def make_args(tmp_path: Path, *, apply: bool = False, once: bool = True) -> Simp
         lock_file=tmp_path / "inventory" / "runner.lock",
         poll_seconds=0.01,
         max_health_failures=1,
+        exit_on_health_failure=False,
+        health_backoff_initial_seconds=0.01,
+        health_backoff_max_seconds=0.03,
+        health_recovery_successes=3,
         max_batch_errors=10,
         write_progress_reports=False,
         priority=0,
@@ -68,6 +72,11 @@ def make_args(tmp_path: Path, *, apply: bool = False, once: bool = True) -> Simp
         redis_pause_key="pause",
         _last_refresh_at=None,
         _last_submit_at=None,
+        _consecutive_health_successes=0,
+        _health_first_failure_at=None,
+        _health_last_failure_at=None,
+        _health_last_failure_reason=None,
+        _next_health_check_at=None,
     )
 
 
@@ -187,6 +196,94 @@ def test_health_failure_stops_before_submit(tmp_path, monkeypatch):
 
     assert rc == 3
     assert checkpoint["stop_reason"] == "health_gate"
+
+
+def test_health_retry_delay_uses_60_120_300_schedule(tmp_path):
+    args = make_args(tmp_path)
+    args.max_health_failures = 3
+    args.health_backoff_initial_seconds = 60.0
+    args.health_backoff_max_seconds = 300.0
+
+    assert [runner.health_retry_delay(args, failures) for failures in (3, 4, 5, 20)] == [60.0, 120.0, 300.0, 300.0]
+
+
+def test_health_pause_recovers_after_three_successes_and_submits_once(tmp_path, monkeypatch):
+    args = make_args(tmp_path, apply=True, once=False)
+    args.max_health_failures = 3
+    setup_inventory(args, [("a" * 64, "oa-g001-b00001", "prepared", 0, 0, 0)])
+    health_results = iter([False, False, False, True, True, True])
+    events = []
+    submissions = []
+
+    def sequenced_health(_args):
+        ok = next(health_results)
+        return healthy(_args) if ok else unhealthy(_args)
+
+    def fake_submit(_conn, _args, batch_key):
+        submissions.append(batch_key)
+        args.once = True
+        return {"submitted": 1}
+
+    monkeypatch.setattr(runner, "submit", fake_submit)
+    monkeypatch.setattr(runner, "fast_refresh", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(runner, "emit", lambda event, **fields: events.append((event, fields)))
+
+    rc = runner.run_loop(args, health_check=sequenced_health)
+
+    assert rc == 0
+    assert submissions == ["oa-g001-b00001"]
+    assert "health_paused" in [event for event, _fields in events]
+    assert [event for event, _fields in events].count("health_recovering") == 2
+    assert "health_resumed" in [event for event, _fields in events]
+
+
+def test_signal_during_health_pause_exits_and_checkpoints(tmp_path, monkeypatch):
+    args = make_args(tmp_path, apply=True, once=False)
+    setup_inventory(args, [("a" * 64, "oa-g001-b00001", "prepared", 0, 0, 0)])
+    monkeypatch.setattr(runner, "submit", lambda *_args: (_ for _ in ()).throw(AssertionError("submit called")))
+
+    def request_stop(_seconds):
+        runner._STOP = True
+
+    monkeypatch.setattr(runner.time, "sleep", request_stop)
+
+    rc = runner.run_loop(args, health_check=unhealthy)
+    checkpoint = json.loads(args.checkpoint.read_text(encoding="utf-8"))
+
+    assert rc == 130
+    assert checkpoint["action"] == "stopped"
+    assert checkpoint["stop_reason"] == "signal"
+    assert checkpoint["health_last_failure_reason"] == "services_healthy"
+
+
+def test_exit_on_health_failure_keeps_one_shot_job_behavior(tmp_path, monkeypatch):
+    args = make_args(tmp_path, apply=True, once=False)
+    args.exit_on_health_failure = True
+    setup_inventory(args, [("a" * 64, "oa-g001-b00001", "prepared", 0, 0, 0)])
+    monkeypatch.setattr(runner, "submit", lambda *_args: (_ for _ in ()).throw(AssertionError("submit called")))
+
+    rc = runner.run_loop(args, health_check=unhealthy)
+    checkpoint = json.loads(args.checkpoint.read_text(encoding="utf-8"))
+
+    assert rc == 3
+    assert checkpoint["stop_reason"] == "health_gate"
+
+
+def test_submit_exception_remains_a_hard_failure(tmp_path, monkeypatch):
+    args = make_args(tmp_path, apply=True, once=False)
+    setup_inventory(args, [("a" * 64, "oa-g001-b00001", "prepared", 0, 0, 0)])
+
+    def fail_submit(*_args):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(runner, "submit", fail_submit)
+
+    rc = runner.run_loop(args, health_check=healthy)
+    checkpoint = json.loads(args.checkpoint.read_text(encoding="utf-8"))
+
+    assert rc == 4
+    assert checkpoint["action"] == "stopped"
+    assert checkpoint["stop_reason"].startswith("submit_failed: OperationalError")
 
 
 def test_lock_prevents_duplicate_runner(tmp_path):
