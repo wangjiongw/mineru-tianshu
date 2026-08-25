@@ -41,16 +41,24 @@ def log(msg):
 
 
 def build_processed_set():
-    """构建已处理 SHA256 集合 (从 pdfs_parsed/ 和 mineru_outputs/)"""
+    """构建已处理 SHA256 集合 (从 pdfs_parsed/{xx}/{sha}/ 分片布局、顶层平铺遗留、mineru_outputs/)"""
     processed = set()
 
-    # pdfs_parsed/: 目录名 = sha256
     if PARSED_OUT.exists():
         for name in os.listdir(PARSED_OUT):
+            d = PARSED_OUT / name
+            if not d.is_dir():
+                continue
             if len(name) == 64 and re.match(r"^[0-9a-f]{64}$", name):
-                d = PARSED_OUT / name
-                if d.is_dir() and (d / "result.md").exists():
+                # 顶层平铺遗留布局
+                if (d / "result.md").exists():
                     processed.add(name)
+            elif len(name) == 2 and re.match(r"^[0-9a-f]{2}$", name):
+                # 分片布局 {xx}/{sha256}/
+                for sub in os.listdir(d):
+                    if len(sub) == 64 and re.match(r"^[0-9a-f]{64}$", sub):
+                        if (d / sub / "result.md").exists():
+                            processed.add(sub)
 
     # mineru_outputs/: {md5}_{sha256}
     if MINERU_OUT.exists():
