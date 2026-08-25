@@ -56,12 +56,15 @@ data/
 *.bak
 *.swp
 *~
+scripts/.__dpc*
 
 docker-images
 docker-images-cpu
 models-offline
 cpu-deployment
 docs/*.md
+!docs/MINERU_POPO_ADAPTATION.md
+docs/zhuangpeiqin_tasks.tsv
 
 # NPU build artifacts
 backend/kernel_meta/
