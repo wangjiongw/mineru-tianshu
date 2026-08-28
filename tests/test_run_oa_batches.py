@@ -619,9 +619,9 @@ def test_retry_exhausted_tail_is_deferred_after_one_retry(tmp_path):
     assert refreshed["deferred_count"] == 1
 
 
-def test_stale_tail_respects_global_deferred_backlog_cap(tmp_path):
+def test_stale_tail_ignores_global_deferred_backlog_cap(tmp_path):
     args = make_args(tmp_path, apply=True, once=True)
-    args.min_terminal_fraction = 0.5
+    args.min_terminal_fraction = 0.0
     args.max_deferred_backlog = 1
     old_sha = "a" * 64
     stale_sha = "b" * 64
@@ -646,11 +646,114 @@ def test_stale_tail_respects_global_deferred_backlog_cap(tmp_path):
     batch = runner.get_batch(conn, "oa-g001-b00002")
     conn.close()
 
+    task_conn = sqlite3.connect(args.task_db)
+    task_conn.execute(
+        "CREATE TABLE tasks (task_id TEXT PRIMARY KEY,status TEXT,created_at TIMESTAMP,started_at TIMESTAMP)"
+    )
+    task_conn.commit()
+    task_conn.close()
+
     check_conn = batches.connect_inventory(args.inventory)
     try:
-        assert runner.stale_tail_task_ids(check_conn, args, batch) == []
+        assert runner.stale_tail_task_ids(check_conn, args, batch) == [f"task-{stale_sha[-8:]}"]
     finally:
         check_conn.close()
+
+
+def test_retry_exhausted_tail_ignores_global_deferred_backlog_cap(tmp_path):
+    args = make_args(tmp_path, apply=True, once=True)
+    args.max_deferred_backlog = 1
+    old_sha = "a" * 64
+    failed_sha = "b" * 64
+    conn = batches.connect_inventory(args.inventory)
+    add_doc(conn, old_sha, state="active", task_id=f"task-{old_sha[-8:]}")
+    add_batch(
+        conn,
+        "oa-g001-b00001",
+        [old_sha],
+        status="completed_with_deferred",
+        item_status="deferred",
+    )
+    add_doc(conn, failed_sha, state="failed_retryable", task_id=f"task-{failed_sha[-8:]}")
+    add_batch(
+        conn,
+        "oa-g001-b00002",
+        [failed_sha],
+        status="partial",
+        item_status="error",
+        failed=1,
+    )
+    conn.execute(
+        "UPDATE documents SET submit_attempts=? WHERE sha256=?",
+        (args.max_item_submit_attempts, failed_sha),
+    )
+    conn.commit()
+
+    batch = runner.get_batch(conn, "oa-g001-b00002")
+    report = runner.defer_retry_exhausted_tail(conn, args, batch)
+    refreshed = runner.get_batch(conn, "oa-g001-b00002")
+    conn.close()
+
+    assert report["deferred"] == 1
+    assert report["deferred_backlog"] == 2
+    assert refreshed["status"] == "completed_with_deferred"
+
+
+def test_run_loop_never_resubmits_item_at_attempt_cap(tmp_path, monkeypatch):
+    args = make_args(tmp_path, apply=True, once=True)
+    failed_sha = "b" * 64
+    conn = batches.connect_inventory(args.inventory)
+    add_doc(conn, failed_sha, state="failed_retryable", task_id=f"task-{failed_sha[-8:]}")
+    add_batch(
+        conn,
+        "oa-g001-b00001",
+        [failed_sha],
+        status="partial",
+        item_status="error",
+        failed=1,
+    )
+    conn.execute(
+        "UPDATE documents SET submit_attempts=? WHERE sha256=?",
+        (args.max_item_submit_attempts, failed_sha),
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(runner, "fast_refresh", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        runner,
+        "submit",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("exhausted item was resubmitted")),
+    )
+
+    rc = runner.run_loop(args, health_check=healthy)
+    checkpoint = json.loads(args.checkpoint.read_text(encoding="utf-8"))
+
+    assert rc == 0
+    assert checkpoint["action"] == "batch_retry_tail_deferred"
+
+
+def test_retryable_item_below_attempt_cap_is_not_deferred(tmp_path):
+    args = make_args(tmp_path, apply=True, once=True)
+    failed_sha = "b" * 64
+    conn = batches.connect_inventory(args.inventory)
+    add_doc(conn, failed_sha, state="failed_retryable", task_id=f"task-{failed_sha[-8:]}")
+    add_batch(
+        conn,
+        "oa-g001-b00001",
+        [failed_sha],
+        status="partial",
+        item_status="error",
+        failed=1,
+    )
+    conn.execute(
+        "UPDATE documents SET submit_attempts=? WHERE sha256=?",
+        (args.max_item_submit_attempts - 1, failed_sha),
+    )
+    conn.commit()
+    batch = runner.get_batch(conn, "oa-g001-b00001")
+
+    assert runner.retry_exhausted_task_ids(conn, args, batch) == []
+    conn.close()
 
 
 def test_primary_batches_finish_with_explicit_deferred_backfill_checkpoint(tmp_path):

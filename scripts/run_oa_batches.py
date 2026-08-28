@@ -289,7 +289,6 @@ def stale_tail_task_ids(
     if (
         args.defer_stale_after_seconds <= 0
         or max_per_batch == 0
-        or args.max_deferred_backlog == 0
         or batch["submitted_count"] <= 0
         or batch["submitted_count"] > max_per_batch
         or batch["item_count"] <= 0
@@ -300,11 +299,9 @@ def stale_tail_task_ids(
     if terminal_fraction < args.min_terminal_fraction:
         return []
 
-    backlog = deferred_backlog_count(conn)
     budget = min(
         batch["submitted_count"],
         max_per_batch,
-        max(0, args.max_deferred_backlog - backlog),
     )
     if budget <= 0 or not args.task_db.exists():
         return []
@@ -394,7 +391,6 @@ def retry_exhausted_task_ids(
     if (
         args.max_item_submit_attempts <= 0
         or max_per_batch == 0
-        or args.max_deferred_backlog == 0
         or batch["submitted_count"] > 0
         or batch["item_count"] <= 0
     ):
@@ -412,15 +408,9 @@ def retry_exhausted_task_ids(
         """,
         (batch["batch_id"], args.max_item_submit_attempts),
     ).fetchall()
-    if not rows or len(rows) > max_per_batch:
+    if not rows:
         return []
-    terminal_fraction = (batch["item_count"] - len(rows)) / batch["item_count"]
-    if terminal_fraction < args.min_terminal_fraction:
-        return []
-
-    backlog = deferred_backlog_count(conn)
-    budget = min(len(rows), max(0, args.max_deferred_backlog - backlog))
-    return [row["task_id"] for row in rows[:budget]]
+    return [row["task_id"] for row in rows[:max_per_batch]]
 
 
 def defer_retry_exhausted_tail(
@@ -432,8 +422,7 @@ def defer_retry_exhausted_tail(
     if not task_ids:
         return {"deferred": 0, "task_ids": []}
     reason = (
-        f"retryable batch tail exhausted {args.max_item_submit_attempts} submit attempts; "
-        f"terminal fraction >= {args.min_terminal_fraction:.4f}"
+        f"retryable batch item exhausted {args.max_item_submit_attempts} submit attempts"
     )
     report = batches.defer_batch_items(
         conn,
@@ -481,6 +470,10 @@ def run_loop(args: argparse.Namespace, health_check: Callable[[argparse.Namespac
                         if args.once:
                             return 0
                         continue
+                    if batch and batch["failed_count"] > args.max_batch_errors:
+                        write_checkpoint(args, action="stopped", stop_reason="batch_error_threshold", batch=batch, errors=health_failures)
+                        emit("stop", reason="batch_error_threshold", batch_key=batch["batch_key"], failed_count=batch["failed_count"])
+                        return 2
                     if batch and args.apply:
                         exhausted = defer_retry_exhausted_tail(conn, args, batch)
                         if exhausted["deferred"]:
@@ -490,10 +483,6 @@ def run_loop(args: argparse.Namespace, health_check: Callable[[argparse.Namespac
                             if args.once:
                                 return 0
                             continue
-                    if batch and batch["failed_count"] > args.max_batch_errors:
-                        write_checkpoint(args, action="stopped", stop_reason="batch_error_threshold", batch=batch, errors=health_failures)
-                        emit("stop", reason="batch_error_threshold", batch_key=batch["batch_key"], failed_count=batch["failed_count"])
-                        return 2
                     if batch and batch["submitted_count"] > 0 and args.apply:
                         deferred = defer_stale_batch_tail(conn, args, batch)
                         if deferred["deferred"]:
