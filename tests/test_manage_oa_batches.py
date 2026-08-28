@@ -237,6 +237,376 @@ def insert_batch(conn, batch_key: str, shas: list[str], *, item_status: str = "s
     return batch_id
 
 
+class FakeTaskCursor:
+    def __init__(self, tasks, before_execute=None):
+        self.tasks = tasks
+        self.before_execute = before_execute
+        self.rowcount = 0
+
+    def execute(self, sql, params):
+        if self.before_execute:
+            self.before_execute(self.tasks)
+        normalized = " ".join(sql.split()).upper()
+        if "WHERE TASK_ID=? AND STATUS=?" in normalized:
+            error, task_id, expected_status = params
+            task = self.tasks.get(task_id)
+            if task is None or task.get("status") != expected_status:
+                self.rowcount = 0
+                return
+        elif "WHERE TASK_ID=?" in normalized:
+            error, task_id = params
+            task = self.tasks.get(task_id)
+            if task is None:
+                self.rowcount = 0
+                return
+        else:
+            raise AssertionError(f"unexpected SQL: {sql}")
+        task["status"] = "failed"
+        task["error_message"] = error
+        task["completed_at"] = "now"
+        task["worker_id"] = None
+        self.rowcount = 1
+
+
+class FakeTaskCursorContext:
+    def __init__(self, tasks, before_execute=None):
+        self.cursor = FakeTaskCursor(tasks, before_execute=before_execute)
+
+    def __enter__(self):
+        return self.cursor
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+class FakeQuarantineTaskDB:
+    def __init__(self, tasks, before_execute=None):
+        self.tasks = tasks
+        self.before_execute = before_execute
+        self.update_calls = 0
+
+    def get_task(self, task_id):
+        task = self.tasks.get(task_id)
+        return dict(task) if task else None
+
+    def update_task_status(self, *_args, **_kwargs):
+        self.update_calls += 1
+        return False
+
+    def get_cursor(self):
+        return FakeTaskCursorContext(self.tasks, before_execute=self.before_execute)
+
+
+class FakeQuarantineRedis:
+    def __init__(self, *, fail_hset=False):
+        self.pause = None
+        self.maintenance = {}
+        self.fail_hset = fail_hset
+        self.queue = set()
+        self.processing = {}
+        self.data = set()
+        self.config = SimpleNamespace(
+            claim_pause_key="pause",
+            claim_maintenance_key="maintenance",
+            queue_key="queue",
+            processing_key="processing",
+            task_data_prefix="task:",
+        )
+        self.client = self
+
+    def get(self, key):
+        if key == self.config.claim_pause_key:
+            return self.pause
+        return None
+
+    def set(self, key, value, nx=False):
+        if key == self.config.claim_pause_key:
+            if nx and self.pause is not None:
+                return False
+            self.pause = value
+        return True
+
+    def hset(self, key, mapping):
+        if self.fail_hset:
+            raise RuntimeError("metadata write failed")
+        if key == self.config.claim_maintenance_key:
+            self.maintenance.update(mapping)
+        return len(mapping)
+
+    def delete(self, key):
+        if key == self.config.claim_pause_key:
+            existed = self.pause is not None
+            self.pause = None
+            return int(existed)
+        existed = key in self.data
+        self.data.discard(key)
+        return int(existed)
+
+    def zrem(self, _key, task_id):
+        existed = task_id in self.queue
+        self.queue.discard(task_id)
+        return int(existed)
+
+    def hdel(self, _key, task_id):
+        existed = task_id in self.processing
+        self.processing.pop(task_id, None)
+        return int(existed)
+
+    def set_claim_maintenance(self, reason):
+        self.set(self.config.claim_pause_key, reason)
+        self.hset(self.config.claim_maintenance_key, {"pause_reason": reason})
+        return True
+
+    def eval(self, _script, _key_count, key, token):
+        if key == self.config.claim_pause_key and self.pause == token:
+            self.pause = None
+            return 1
+        return 0
+
+
+def test_mark_task_db_failed_refuses_completed_and_cancelled_tasks():
+    sha = "a" * 64
+    for status in ("completed", "cancelled"):
+        task_id = f"task-{status}"
+        task_db = FakeQuarantineTaskDB(
+            {task_id: {"task_id": task_id, "status": status, "file_hash": sha, "error_message": None, "worker_id": "worker-a"}}
+        )
+
+        with pytest.raises(RuntimeError, match="refusing to quarantine terminal task"):
+            module.mark_task_db_failed(task_db, task_id, sha, "Quarantined: terminal refusal")
+
+        assert task_db.tasks[task_id]["status"] == status
+        assert task_db.tasks[task_id]["worker_id"] == "worker-a"
+
+
+def test_mark_task_db_failed_cas_race_does_not_overwrite_completed():
+    sha = "b" * 64
+    task_id = "task-race"
+
+    def complete_before_update(tasks):
+        tasks[task_id]["status"] = "completed"
+        tasks[task_id]["error_message"] = None
+
+    task_db = FakeQuarantineTaskDB(
+        {task_id: {"task_id": task_id, "status": "processing", "file_hash": sha, "error_message": None, "worker_id": "worker-a"}},
+        before_execute=complete_before_update,
+    )
+
+    with pytest.raises(RuntimeError, match="changed during quarantine"):
+        module.mark_task_db_failed(task_db, task_id, sha, "Quarantined: race")
+
+    assert task_db.tasks[task_id]["status"] == "completed"
+    assert task_db.tasks[task_id]["error_message"] is None
+    assert task_db.tasks[task_id]["worker_id"] == "worker-a"
+
+
+def test_mark_task_db_failed_clears_worker_id_and_allows_failed_rewrite():
+    sha = "c" * 64
+    task_id = "task-failed"
+    task_db = FakeQuarantineTaskDB(
+        {task_id: {"task_id": task_id, "status": "failed", "file_hash": sha, "error_message": "old", "worker_id": "worker-a"}}
+    )
+
+    result = module.mark_task_db_failed(task_db, task_id, sha, "Quarantined: replacement")
+
+    assert result == {"updated": True, "previous_status": "failed", "via": "direct_taskdb_cas"}
+    assert task_db.tasks[task_id]["status"] == "failed"
+    assert task_db.tasks[task_id]["error_message"] == "Quarantined: replacement"
+    assert task_db.tasks[task_id]["worker_id"] is None
+
+
+def test_mark_task_db_failed_race_to_same_quarantine_is_idempotent():
+    sha = "d" * 64
+    task_id = "task-same-race"
+    error = "Quarantined: same race"
+
+    def same_quarantine_before_update(tasks):
+        tasks[task_id]["status"] = "failed"
+        tasks[task_id]["error_message"] = error
+        tasks[task_id]["worker_id"] = None
+
+    task_db = FakeQuarantineTaskDB(
+        {task_id: {"task_id": task_id, "status": "processing", "file_hash": sha, "error_message": None, "worker_id": "worker-a"}},
+        before_execute=same_quarantine_before_update,
+    )
+
+    result = module.mark_task_db_failed(task_db, task_id, sha, error)
+
+    assert result == {"updated": False, "previous_status": "processing", "already_failed": True, "race_observed": True}
+
+
+def test_claim_maintenance_uses_unique_token_and_token_safe_release():
+    first = FakeQuarantineRedis()
+    first_acquired, first_previous, first_token = module.acquire_claim_maintenance(first, "first")
+    second_acquired, second_previous, second_token = module.acquire_claim_maintenance(first, "second")
+
+    assert first_acquired is True
+    assert first_previous is None
+    assert first_token.startswith("quarantine:")
+    assert second_acquired is False
+    assert second_previous == first_token
+    assert second_token is None
+    assert first.pause == first_token
+    assert first.maintenance["pause_token"] == first_token
+
+    assert module.release_claim_maintenance(first, "quarantine:not-owner") is False
+    assert first.pause == first_token
+    assert module.release_claim_maintenance(first, first_token) is True
+    assert first.pause is None
+
+
+
+
+def test_claim_maintenance_metadata_failure_removes_owned_pause():
+    redis = FakeQuarantineRedis(fail_hset=True)
+
+    with pytest.raises(RuntimeError, match="metadata write failed"):
+        module.acquire_claim_maintenance(redis, "metadata failure")
+
+    assert redis.pause is None
+    assert redis.maintenance == {}
+
+
+def test_quarantine_dry_run_resolves_target_without_side_effects(tmp_path, monkeypatch):
+    inventory = tmp_path / "inventory" / "oa.sqlite3"
+    legacy = tmp_path / "legacy.json"
+    source = tmp_path / "source"
+    conn = module.connect_inventory(inventory)
+    sha = "4" * 64
+    insert_document(conn, sha, make_source(source, sha), "queued", task_id=f"task-{sha[-8:]}", db_status="pending")
+    insert_batch(conn, "oa-g001-b00001", [sha], item_status="submitted")
+    monkeypatch.setattr(module, "load_task_db_api", lambda _args: (_ for _ in ()).throw(AssertionError("dry-run loaded live APIs")))
+
+    report = module.quarantine_document(
+        conn,
+        inventory,
+        legacy,
+        SimpleNamespace(sha256=sha.upper(), reason="operator review", apply=False),
+    )
+    doc = conn.execute("SELECT state,db_status,db_error FROM documents WHERE sha256=?", (sha,)).fetchone()
+    events = conn.execute("SELECT COUNT(*) AS count FROM events WHERE event_type='batch_item_quarantined'").fetchone()["count"]
+    conn.close()
+
+    assert report["dry_run"] is True
+    assert report["would_quarantine"] is True
+    assert report["target"]["batch_key"] == "oa-g001-b00001"
+    assert dict(doc) == {"state": "queued", "db_status": "pending", "db_error": None}
+    assert events == 0
+
+
+def test_quarantine_apply_preserves_files_removes_only_target_and_is_idempotent(tmp_path, monkeypatch):
+    inventory = tmp_path / "inventory" / "oa.sqlite3"
+    legacy = tmp_path / "legacy.json"
+    source = tmp_path / "source"
+    parsed = tmp_path / "parsed"
+    conn = module.connect_inventory(inventory)
+    target = "5" * 64
+    other = "6" * 64
+    target_source = make_source(source, target)
+    other_source = make_source(source, other)
+    target_result = make_result(parsed, target)
+    insert_document(conn, target, target_source, "queued", task_id=f"task-{target[-8:]}", db_status="pending")
+    insert_document(conn, other, other_source, "queued", task_id=f"task-{other[-8:]}", db_status="pending")
+    conn.execute("UPDATE documents SET parsed_path=? WHERE sha256=?", (str(target_result), target))
+    batch_id = insert_batch(conn, "oa-g001-b00001", [target, other], item_status="submitted")
+    task_id = f"task-{target[-8:]}"
+    other_task_id = f"task-{other[-8:]}"
+    task_db = FakeQuarantineTaskDB(
+        {
+            task_id: {"task_id": task_id, "status": "pending", "file_hash": target, "error_message": None},
+            other_task_id: {"task_id": other_task_id, "status": "pending", "file_hash": other, "error_message": None},
+        }
+    )
+    redis = FakeQuarantineRedis()
+    redis.queue.update({task_id, other_task_id})
+    redis.processing.update({task_id: "worker-a", other_task_id: "worker-b"})
+    redis.data.update({f"task:{task_id}", f"task:{other_task_id}"})
+    monkeypatch.setattr(module, "load_task_db_api", lambda _args: (task_db, redis))
+    args = SimpleNamespace(sha256=target, reason="manual audit hold", apply=True)
+
+    report = module.quarantine_document(conn, inventory, legacy, args)
+    second = module.quarantine_document(conn, inventory, legacy, args)
+    doc = conn.execute("SELECT state,db_status,db_error,db_task_id FROM documents WHERE sha256=?", (target,)).fetchone()
+    other_doc = conn.execute("SELECT state,db_status,db_error FROM documents WHERE sha256=?", (other,)).fetchone()
+    item = conn.execute("SELECT item_status,task_id,submit_error FROM batch_items WHERE sha256=?", (target,)).fetchone()
+    other_item = conn.execute("SELECT item_status,task_id,submit_error FROM batch_items WHERE sha256=?", (other,)).fetchone()
+    batch = conn.execute("SELECT status,submitted_count,completed_count,failed_count FROM batches WHERE batch_id=?", (batch_id,)).fetchone()
+    events = conn.execute("SELECT COUNT(*) AS count FROM events WHERE event_type='batch_item_quarantined'").fetchone()["count"]
+    conn.close()
+
+    assert report["quarantine"]["inventory_changed"] is True
+    assert report["quarantine"]["redis"] == {"queue_removed": 1, "processing_removed": 1, "task_data_removed": 1}
+    assert report["quarantine"]["claim_maintenance"]["acquired"] is True
+    assert report["quarantine"]["claim_maintenance"]["token"].startswith("quarantine:")
+    assert second["quarantine"]["idempotent_noop"] is True
+    assert second["quarantine"]["inventory_changed"] is False
+    assert second["quarantine"]["redis"] == {"queue_removed": 0, "processing_removed": 0, "task_data_removed": 0}
+    assert task_db.tasks[task_id]["status"] == "failed"
+    assert task_db.tasks[task_id]["error_message"] == "Quarantined: manual audit hold"
+    assert task_db.tasks[other_task_id]["status"] == "pending"
+    assert dict(doc) == {
+        "state": "failed_permanent",
+        "db_status": "failed",
+        "db_error": "Quarantined: manual audit hold",
+        "db_task_id": task_id,
+    }
+    assert dict(other_doc) == {"state": "queued", "db_status": "pending", "db_error": None}
+    assert dict(item) == {"item_status": "error", "task_id": task_id, "submit_error": "Quarantined: manual audit hold"}
+    assert dict(other_item) == {"item_status": "submitted", "task_id": other_task_id, "submit_error": None}
+    assert dict(batch) == {"status": "partial", "submitted_count": 1, "completed_count": 0, "failed_count": 1}
+    assert redis.pause is None
+    assert redis.queue == {other_task_id}
+    assert redis.processing == {other_task_id: "worker-b"}
+    assert redis.data == {f"task:{other_task_id}"}
+    assert target_source.is_file()
+    assert (target_result / "result.md").is_file()
+    assert events == 1
+
+
+def test_quarantine_apply_does_not_release_preexisting_pause(tmp_path, monkeypatch):
+    inventory = tmp_path / "inventory" / "oa.sqlite3"
+    source = tmp_path / "source"
+    conn = module.connect_inventory(inventory)
+    sha = "7" * 64
+    insert_document(conn, sha, make_source(source, sha), "active", task_id=f"task-{sha[-8:]}", db_status="processing")
+    insert_batch(conn, "oa-g001-b00001", [sha], item_status="submitted")
+    task_id = f"task-{sha[-8:]}"
+    task_db = FakeQuarantineTaskDB({task_id: {"task_id": task_id, "status": "processing", "file_hash": sha, "error_message": None}})
+    redis = FakeQuarantineRedis()
+    redis.pause = "existing maintenance"
+    monkeypatch.setattr(module, "load_task_db_api", lambda _args: (task_db, redis))
+
+    report = module.quarantine_document(
+        conn,
+        inventory,
+        tmp_path / "legacy.json",
+        SimpleNamespace(sha256=sha, reason="operator hold", apply=True),
+    )
+    conn.close()
+
+    assert report["quarantine"]["claim_maintenance"] == {"acquired": False, "previous": "existing maintenance", "token": None}
+    assert redis.pause == "existing maintenance"
+
+
+def test_quarantine_and_render_timeout_are_failed_permanent(tmp_path):
+    inventory = tmp_path / "inventory" / "oa.sqlite3"
+    conn = module.connect_inventory(inventory)
+    source = tmp_path / "source"
+    shas = ["8" * 64, "9" * 64]
+    insert_document(conn, shas[0], make_source(source, shas[0]), "failed_retryable", db_status="failed", db_error="PDF image rendering timeout after 300s")
+    insert_document(conn, shas[1], make_source(source, shas[1]), "failed_retryable", db_status="failed", db_error="Quarantined: manual hold")
+
+    states = module.classify_documents(conn, 1)
+    docs = {
+        row["sha256"]: row["state"]
+        for row in conn.execute("SELECT sha256,state FROM documents ORDER BY sha256")
+    }
+    conn.close()
+
+    assert states["failed_permanent"] == 2
+    assert docs == {shas[0]: "failed_permanent", shas[1]: "failed_permanent"}
+
+
 def test_batch_progress_treats_db_completed_as_terminal_with_permanent_errors(tmp_path):
     inventory = tmp_path / "inventory" / "oa.sqlite3"
     conn = module.connect_inventory(inventory)

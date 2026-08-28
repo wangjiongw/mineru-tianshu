@@ -17,6 +17,7 @@ import re
 import sqlite3
 import sys
 import time
+import uuid
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,6 +40,17 @@ SHA_PDF_RE = re.compile(r"^([0-9a-f]{64})\.pdf$")
 ELIGIBLE_STATES = ("unsubmitted", "failed_retryable")
 READY_STATES = ("complete_valid", "legacy_result_only")
 TERMINAL_BATCH_STATES = ("completed", "completed_with_errors", "completed_with_deferred")
+QUARANTINE_MUTABLE_TASK_STATUSES = ("pending", "processing", "merging", "failed", "timeout", "paused")
+QUARANTINE_TERMINAL_TASK_STATUSES = ("completed", "cancelled")
+PERMANENT_ERROR_PATTERNS = (
+    "%invalid pdf%",
+    "%pdfium%",
+    "%password%",
+    "%encrypted%",
+    "%cannot open%",
+    "%pdf image rendering timeout%",
+    "quarantined:%",
+)
 
 
 def utc_now() -> str:
@@ -106,6 +118,13 @@ def connect_inventory(path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
     initialize_schema(conn)
+    return conn
+
+
+def connect_inventory_read_only(path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=60.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
 
@@ -334,6 +353,10 @@ def load_task_state(conn: sqlite3.Connection, task_db: Path, source_shas: set[st
     return counts
 
 
+def permanent_error_sql() -> str:
+    return " OR ".join("lower(COALESCE(db_error,'')) LIKE ?" for _ in PERMANENT_ERROR_PATTERNS)
+
+
 def iter_result_dirs(parsed_root: Path) -> Iterator[tuple[str, Path]]:
     seen: set[str] = set()
     for shard_name in (f"{value:02x}" for value in range(256)):
@@ -401,7 +424,7 @@ def scan_results(conn: sqlite3.Connection, parsed_root: Path, source_shas: set[s
 def classify_documents(conn: sqlite3.Connection, generation: int) -> Counter:
     now = utc_now()
     conn.execute(
-        """
+        f"""
         UPDATE documents
         SET state = CASE
             WHEN seen_generation<>? THEN 'missing_source'
@@ -410,19 +433,13 @@ def classify_documents(conn: sqlite3.Connection, generation: int) -> Counter:
             WHEN db_status='completed' THEN 'completed_db_unsynced'
             WHEN db_status='pending' THEN 'queued'
             WHEN db_status IN ('processing','merging') THEN 'active'
-            WHEN db_status IN ('failed','timeout') AND (
-                lower(COALESCE(db_error,'')) LIKE '%invalid pdf%'
-                OR lower(COALESCE(db_error,'')) LIKE '%pdfium%'
-                OR lower(COALESCE(db_error,'')) LIKE '%password%'
-                OR lower(COALESCE(db_error,'')) LIKE '%encrypted%'
-                OR lower(COALESCE(db_error,'')) LIKE '%cannot open%'
-            ) THEN 'failed_permanent'
+            WHEN db_status IN ('failed','timeout') AND ({permanent_error_sql()}) THEN 'failed_permanent'
             WHEN db_status IN ('failed','timeout') THEN 'failed_retryable'
             ELSE 'unsubmitted'
         END,
         updated_at=?
         """,
-        (generation, now),
+        (generation, *PERMANENT_ERROR_PATTERNS, now),
     )
     conn.commit()
     refresh_batch_progress(conn)
@@ -436,7 +453,7 @@ def classify_documents(conn: sqlite3.Connection, generation: int) -> Counter:
 def classify_batch_documents(conn: sqlite3.Connection, batch_key: str) -> Counter:
     now = utc_now()
     conn.execute(
-        """
+        f"""
         UPDATE documents
         SET state = CASE
             WHEN parsed_complete=1 AND db_status='completed' THEN 'complete_valid'
@@ -444,20 +461,14 @@ def classify_batch_documents(conn: sqlite3.Connection, batch_key: str) -> Counte
             WHEN db_status='completed' THEN 'completed_db_unsynced'
             WHEN db_status='pending' THEN 'queued'
             WHEN db_status IN ('processing','merging') THEN 'active'
-            WHEN db_status IN ('failed','timeout') AND (
-                lower(COALESCE(db_error,'')) LIKE '%invalid pdf%'
-                OR lower(COALESCE(db_error,'')) LIKE '%pdfium%'
-                OR lower(COALESCE(db_error,'')) LIKE '%password%'
-                OR lower(COALESCE(db_error,'')) LIKE '%encrypted%'
-                OR lower(COALESCE(db_error,'')) LIKE '%cannot open%'
-            ) THEN 'failed_permanent'
+            WHEN db_status IN ('failed','timeout') AND ({permanent_error_sql()}) THEN 'failed_permanent'
             WHEN db_status IN ('failed','timeout') THEN 'failed_retryable'
             ELSE state
         END,
         updated_at=?
         WHERE current_batch_id=(SELECT batch_id FROM batches WHERE batch_key=?)
         """,
-        (now, batch_key),
+        (*PERMANENT_ERROR_PATTERNS, now, batch_key),
     )
     return Counter(
         {
@@ -1299,12 +1310,263 @@ def submit_batch(
     return write_progress_reports(conn, inventory_path, legacy_progress_path)
 
 
+def resolve_quarantine_target(conn: sqlite3.Connection, sha256: str) -> dict[str, object]:
+    sha256 = sha256.lower()
+    if not is_sha256(sha256):
+        raise ValueError(f"invalid sha256: {sha256!r}")
+    row = conn.execute(
+        """
+        SELECT d.*,b.batch_id,b.batch_key,bi.position,bi.item_status,bi.task_id AS batch_task_id,
+               bi.submit_error
+        FROM documents d
+        LEFT JOIN batches b ON d.current_batch_id=b.batch_id
+        LEFT JOIN batch_items bi ON bi.batch_id=b.batch_id AND bi.sha256=d.sha256
+        WHERE d.sha256=?
+        """,
+        (sha256,),
+    ).fetchone()
+    if not row:
+        raise RuntimeError(f"sha256 not found in inventory: {sha256}")
+    target = dict(row)
+    task_id = target.get("db_task_id") or target.get("batch_task_id")
+    if not task_id:
+        raise RuntimeError(f"sha256 has no task id to quarantine: {sha256}")
+    if not target.get("batch_id") or not target.get("batch_key"):
+        raise RuntimeError(f"sha256 is not assigned to a batch: {sha256}")
+    target["task_id"] = str(task_id)
+    return target
+
+
+def compare_delete_claim_pause(queue: object, token: str) -> bool:
+    script = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
+    return bool(queue.client.eval(script, 1, queue.config.claim_pause_key, token))
+
+
+def acquire_claim_maintenance(queue: object, reason: str) -> tuple[bool, object, str | None]:
+    token = f"quarantine:{uuid.uuid4()}"
+    acquired = bool(queue.client.set(queue.config.claim_pause_key, token, nx=True))
+    if not acquired:
+        return False, queue.client.get(queue.config.claim_pause_key), None
+    try:
+        queue.client.hset(
+            queue.config.claim_maintenance_key,
+            mapping={"paused_at": str(time.time()), "pause_reason": reason, "pause_token": token},
+        )
+    except Exception:
+        try:
+            compare_delete_claim_pause(queue, token)
+        except Exception:
+            pass
+        raise
+    return True, None, token
+
+
+def release_claim_maintenance(queue: object, token: str) -> bool:
+    released = compare_delete_claim_pause(queue, token)
+    if released:
+        queue.client.hset(queue.config.claim_maintenance_key, mapping={"resumed_at": str(time.time()), "pause_token_released": token})
+    return released
+
+
+def remove_task_from_redis(queue: object, task_id: str) -> dict[str, int]:
+    task_data_prefix = getattr(queue.config, "task_data_prefix", "tianshu:task:")
+    task_data_key = f"{task_data_prefix}{task_id}"
+    return {
+        "queue_removed": int(queue.client.zrem(queue.config.queue_key, task_id) or 0),
+        "processing_removed": int(queue.client.hdel(queue.config.processing_key, task_id) or 0),
+        "task_data_removed": int(queue.client.delete(task_data_key) or 0),
+    }
+
+
+def mark_task_db_failed(task_db: object, task_id: str, sha256: str, error: str) -> dict[str, object]:
+    task = task_db.get_task(task_id) if hasattr(task_db, "get_task") else None
+    if task is None:
+        raise RuntimeError(f"task not found in TaskDB: {task_id}")
+    task_hash = (task.get("file_hash") or "").lower() if isinstance(task, dict) else ""
+    if task_hash and task_hash != sha256:
+        raise RuntimeError(f"task {task_id} file_hash mismatch: {task_hash} != {sha256}")
+    original_status = task.get("status")
+    if original_status == "failed" and task.get("error_message") == error and not task.get("worker_id"):
+        return {"updated": False, "previous_status": original_status, "already_failed": True}
+    if original_status in QUARANTINE_TERMINAL_TASK_STATUSES:
+        raise RuntimeError(f"refusing to quarantine terminal task {task_id}: status={original_status}")
+    if original_status not in QUARANTINE_MUTABLE_TASK_STATUSES:
+        raise RuntimeError(f"refusing to quarantine task {task_id} with unsupported status: {original_status}")
+    if not hasattr(task_db, "get_cursor"):
+        raise RuntimeError("TaskDB does not expose get_cursor for quarantine update")
+    with task_db.get_cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE tasks
+            SET status='failed',completed_at=CURRENT_TIMESTAMP,error_message=?,worker_id=NULL
+            WHERE task_id=? AND status=?
+            """,
+            (error, task_id, original_status),
+        )
+        updated = cursor.rowcount > 0
+    if updated:
+        return {"updated": True, "previous_status": original_status, "via": "direct_taskdb_cas"}
+    reread = task_db.get_task(task_id) if hasattr(task_db, "get_task") else None
+    if reread and reread.get("status") == "failed" and reread.get("error_message") == error:
+        return {"updated": False, "previous_status": original_status, "already_failed": True, "race_observed": True}
+    current_status = reread.get("status") if reread else None
+    raise RuntimeError(
+        f"task {task_id} changed during quarantine; expected status={original_status}, current status={current_status}"
+    )
+
+
+def quarantine_document(
+    conn: sqlite3.Connection,
+    inventory_path: Path,
+    legacy_progress_path: Path,
+    args: argparse.Namespace,
+) -> dict[str, object]:
+    sha256 = args.sha256.lower()
+    reason = args.reason.strip()
+    if not is_sha256(sha256):
+        raise ValueError(f"invalid sha256: {args.sha256!r}")
+    if not reason:
+        raise ValueError("reason must be non-empty")
+    target = resolve_quarantine_target(conn, sha256)
+    task_id = str(target["task_id"])
+    quarantine_error = f"Quarantined: {reason}"
+    already_inventory_quarantined = (
+        target.get("state") == "failed_permanent"
+        and target.get("db_status") == "failed"
+        and target.get("db_error") == quarantine_error
+        and target.get("item_status") == "error"
+        and target.get("submit_error") == quarantine_error
+    )
+    target_payload = {
+        "sha256": sha256,
+        "task_id": task_id,
+        "batch_id": target["batch_id"],
+        "batch_key": target["batch_key"],
+        "position": target["position"],
+        "source_path": target["source_path"],
+        "parsed_path": target.get("parsed_path"),
+        "current_state": target.get("state"),
+        "current_db_status": target.get("db_status"),
+    }
+    if not args.apply:
+        return {
+            "dry_run": True,
+            "would_quarantine": not already_inventory_quarantined,
+            "reason": reason,
+            "target": target_payload,
+        }
+
+    task_db, queue = load_task_db_api(args)
+    maintenance_acquired = False
+    maintenance_previous = None
+    maintenance_token = None
+    redis_result: dict[str, int] = {}
+    task_db_result: dict[str, object] = {}
+    inventory_changed = False
+    try:
+        maintenance_acquired, maintenance_previous, maintenance_token = acquire_claim_maintenance(queue, f"quarantine {sha256}: {reason}")
+        task_db_result = mark_task_db_failed(task_db, task_id, sha256, quarantine_error)
+        redis_result = remove_task_from_redis(queue, task_id)
+        if not already_inventory_quarantined:
+            now = utc_now()
+            conn.execute(
+                """
+                UPDATE documents
+                SET db_task_id=?,db_status='failed',db_error=?,state='failed_permanent',updated_at=?
+                WHERE sha256=?
+                """,
+                (task_id, quarantine_error, now, sha256),
+            )
+            conn.execute(
+                """
+                UPDATE batch_items
+                SET item_status='error',task_id=?,submit_error=?,updated_at=?
+                WHERE batch_id=? AND sha256=?
+                """,
+                (task_id, quarantine_error, now, target["batch_id"], sha256),
+            )
+            conn.execute(
+                "INSERT INTO events(event_time,event_type,batch_id,sha256,detail_json) VALUES (?,?,?,?,?)",
+                (
+                    now,
+                    "batch_item_quarantined",
+                    target["batch_id"],
+                    sha256,
+                    json.dumps(
+                        {
+                            "reason": reason,
+                            "task_id": task_id,
+                            "previous_state": target.get("state"),
+                            "previous_db_status": target.get("db_status"),
+                            "task_db": task_db_result,
+                            "redis": redis_result,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                ),
+            )
+            conn.commit()
+            inventory_changed = True
+        refresh_one_batch_progress(conn, str(target["batch_key"]))
+        report = write_progress_reports(conn, inventory_path, legacy_progress_path)
+        report["quarantine"] = {
+            "dry_run": False,
+            "idempotent_noop": already_inventory_quarantined,
+            "inventory_changed": inventory_changed,
+            "reason": reason,
+            "target": target_payload,
+            "task_db": task_db_result,
+            "redis": redis_result,
+            "claim_maintenance": {
+                "acquired": maintenance_acquired,
+                "previous": maintenance_previous.decode() if isinstance(maintenance_previous, bytes) else maintenance_previous,
+                "token": maintenance_token,
+            },
+        }
+        return report
+    finally:
+        if maintenance_acquired and maintenance_token:
+            release_claim_maintenance(queue, maintenance_token)
+
+
 def add_common_paths(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--inventory", type=Path, default=DEFAULT_INVENTORY)
     parser.add_argument("--source-root", type=Path, default=DEFAULT_SOURCE_ROOT)
     parser.add_argument("--parsed-root", type=Path, default=DEFAULT_PARSED_ROOT)
     parser.add_argument("--task-db", type=Path, default=DEFAULT_TASK_DB)
     parser.add_argument("--legacy-progress", type=Path, default=DEFAULT_LEGACY_PROGRESS)
+
+
+def add_redis_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--redis-host", default=os.getenv("REDIS_HOST", "127.0.0.1"))
+    parser.add_argument("--redis-port", type=int, default=int(os.getenv("REDIS_PORT", "6379")))
+    parser.add_argument("--redis-db", type=int, default=int(os.getenv("REDIS_DB", "0")))
+    parser.add_argument("--redis-password", default=os.getenv("REDIS_PASSWORD", "redis123"))
+    parser.add_argument(
+        "--redis-queue-key",
+        default=os.getenv("REDIS_QUEUE_KEY", "tianshu:task_queue:mineru-runner-worker-0"),
+    )
+    parser.add_argument(
+        "--redis-processing-key",
+        default=os.getenv("REDIS_PROCESSING_KEY", "tianshu:processing:mineru-runner-worker-0"),
+    )
+    parser.add_argument(
+        "--redis-maintenance-key",
+        default=os.getenv(
+            "REDIS_CLAIM_MAINTENANCE_KEY",
+            "tianshu:claim_maintenance:mineru-runner-worker-0",
+        ),
+    )
+    parser.add_argument(
+        "--redis-pause-key",
+        default=os.getenv("REDIS_CLAIM_PAUSE_KEY", "tianshu:claim_pause:mineru-runner-worker-0"),
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1333,35 +1595,23 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--priority", type=int, default=0)
     submit.add_argument("--high-watermark", type=int, default=DEFAULT_HIGH_WATERMARK)
     submit.add_argument("--allow-live-claims", action="store_true")
-    submit.add_argument("--redis-host", default=os.getenv("REDIS_HOST", "127.0.0.1"))
-    submit.add_argument("--redis-port", type=int, default=int(os.getenv("REDIS_PORT", "6379")))
-    submit.add_argument("--redis-db", type=int, default=int(os.getenv("REDIS_DB", "0")))
-    submit.add_argument("--redis-password", default=os.getenv("REDIS_PASSWORD", "redis123"))
-    submit.add_argument(
-        "--redis-queue-key",
-        default=os.getenv("REDIS_QUEUE_KEY", "tianshu:task_queue:mineru-runner-worker-0"),
-    )
-    submit.add_argument(
-        "--redis-processing-key",
-        default=os.getenv("REDIS_PROCESSING_KEY", "tianshu:processing:mineru-runner-worker-0"),
-    )
-    submit.add_argument(
-        "--redis-maintenance-key",
-        default=os.getenv(
-            "REDIS_CLAIM_MAINTENANCE_KEY",
-            "tianshu:claim_maintenance:mineru-runner-worker-0",
-        ),
-    )
-    submit.add_argument(
-        "--redis-pause-key",
-        default=os.getenv("REDIS_CLAIM_PAUSE_KEY", "tianshu:claim_pause:mineru-runner-worker-0"),
-    )
+    add_redis_args(submit)
+
+    quarantine = subparsers.add_parser("quarantine", help="Mark one inventory task failed and remove only its Redis claim data")
+    add_common_paths(quarantine)
+    add_redis_args(quarantine)
+    quarantine.add_argument("--sha256", required=True)
+    quarantine.add_argument("--reason", required=True)
+    quarantine.add_argument("--apply", action="store_true")
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
-    conn = connect_inventory(args.inventory)
+    if args.command == "quarantine" and not args.apply:
+        conn = connect_inventory_read_only(args.inventory)
+    else:
+        conn = connect_inventory(args.inventory)
     try:
         if args.command == "refresh":
             report = refresh_inventory(
@@ -1394,6 +1644,13 @@ def main() -> int:
                 args.inventory,
                 args.legacy_progress,
                 args.source_root,
+                args,
+            )
+        elif args.command == "quarantine":
+            report = quarantine_document(
+                conn,
+                args.inventory,
+                args.legacy_progress,
                 args,
             )
         else:
