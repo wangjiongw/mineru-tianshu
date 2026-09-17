@@ -47,6 +47,7 @@ node_modules/
 # Logs
 *.log
 logs/
+nohup.out
 
 # Data directory
 data/

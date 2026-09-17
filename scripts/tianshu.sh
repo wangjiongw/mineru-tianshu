@@ -27,7 +27,7 @@ PROJECT_ROOT="/data/projects/mineru/mineru-tianshu"
 # VLLM 服务配置
 VLLM_MODEL_PATH="/share/wangjiong/model_zoo/modelscope/models/OpenDataLab/MinerU2___5-Pro-2605-1___2B"
 VLLM_BASE_PORT=30025
-VLLM_NUM_INSTANCES=8
+VLLM_NUM_INSTANCES="${VLLM_NUM_INSTANCES:-8}"
 VLLM_MAX_MODEL_LEN=8192
 VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.60}" # 实测 c8 峰值 HBM < 86%，为 8 个任务进程保留安全余量
 VLLM_PERFORMANCE_MODE="${VLLM_PERFORMANCE_MODE:-throughput}" # 吞吐模式实测比 balanced 提升约 11%；可用 NPU<n> 覆盖
@@ -52,7 +52,7 @@ PYTHON_BIN="${PYTHON_BIN:-/data/miniconda3/envs/mineru/bin/python}"
 
 # Worker 配置
 WORKER_BASE_PORT=8101
-WORKER_NUM_INSTANCES=8
+WORKER_NUM_INSTANCES="${WORKER_NUM_INSTANCES:-8}"
 WORKER_ACCELERATOR="cpu"
 MINERU_INTRA_OP_NUM_THREADS="${MINERU_INTRA_OP_NUM_THREADS:-4}"
 MINERU_INTER_OP_NUM_THREADS="${MINERU_INTER_OP_NUM_THREADS:-1}"
@@ -1255,6 +1255,37 @@ stop_worker_process_tree() {
             rm -f "$pid_file"
             return 1
         fi
+    else
+        # PID files can be lost or belong to another INSTANCE_ID (for example
+        # when sudo drops the caller environment). Fall back to the exact
+        # worker command + port match, never to a broad process-name kill.
+        descendant_pids="$(worker_matching_pids_for_port "$port")"
+        descendant_identities=""
+        for pid in $descendant_pids; do
+            start_time="$(pid_start_time "$pid")"
+            [ -n "$start_time" ] || continue
+            descendant_identities="$descendant_identities $pid:$start_time"
+        done
+        for identity in $descendant_identities; do
+            pid="${identity%%:*}"
+            start_time="${identity#*:}"
+            pid_identity_matches "$pid" "$start_time" && kill "$pid" 2>/dev/null || true
+        done
+        for _ in $(seq 1 "$timeout"); do
+            survivors=""
+            for identity in $descendant_identities; do
+                pid="${identity%%:*}"
+                start_time="${identity#*:}"
+                pid_identity_matches "$pid" "$start_time" && survivors="$survivors $pid"
+            done
+            [ -z "$survivors" ] && break
+            sleep 1
+        done
+        for identity in $descendant_identities; do
+            pid="${identity%%:*}"
+            start_time="${identity#*:}"
+            pid_identity_matches "$pid" "$start_time" && kill -9 "$pid" 2>/dev/null || true
+        done
     fi
 
     rm -f "$pid_file"

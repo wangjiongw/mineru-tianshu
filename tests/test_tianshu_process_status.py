@@ -179,7 +179,8 @@ class TianshuProcessStatusTests(unittest.TestCase):
             )
 
         self.assertEqual(result.returncode, 1)
-        self.assertNotIn("kill:", result.stdout)
+        self.assertIn("kill:301", result.stdout)
+        self.assertIn("kill:-9 301", result.stdout)
         self.assertFalse(pid_file.exists())
 
     def test_worker_candidate_scan_uses_pgrep_instead_of_all_processes(self) -> None:
