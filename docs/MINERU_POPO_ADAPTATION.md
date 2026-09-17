@@ -2,15 +2,18 @@
 
 **文档定位**：MinerU 生产端的数据契约与运行状态说明<br>
 **主要读者**：MinerU-Popo 适配开发者、批处理运维人员<br>
-**最后核对时间**：2026-08-25 15:28 UTC<br>
+**最后核对时间**：2026-09-16 UTC<br>
 **权威实现**：`mineru-tianshu` 的输出归一化器、OA inventory 与批次运行脚本
 
 > 本文中的任务数字是带时间戳的运行快照，不能作为程序常量。目录结构、文件语义和就绪检查才是后处理适配应依赖的契约。
 
 ## 1. 先看结论
 
-- 当前 OA PDF 批处理仍在运行，执行到 `oa-g001-b00012`；快照时本批完成 `3825/5000`，失败为 0。
-- 本机采用 8 个 Worker（8101–8108）和 8 个一一对应的 VLLM 服务（30025–30032）；快照时16个健康端口均返回 HTTP 200。
+- 本文同时描述单个 PDF 从上传到下载的服务内生命周期，以及 OA 结果从 `mineru_outputs` 归档到 `pdfs_parsed` 的批处理生命周期。
+- 默认模式为 `hybrid-auto-engine + effort=high`；本地 vLLM 可用时实际转换为 `hybrid-http-client`。
+- 上传 PDF 以 `UUID_原文件名` 落盘并计算 SHA256；MinerU 解析前还会用 PDFium 重建页面，因此 `*_origin.pdf` 通常不是上传文件的逐字节副本。
+- 一次解析模式运行只生成一个 `*_origin.pdf`。同一结果中两个 origin 位于不同解析模式目录，表示两次或两种模式的历史产物被共同保留。
+- 稳定消费文件是根目录的 `result.json`、`full.md`、`result.md`、`mineru_model.json` 和 `images/`；解析模式子目录属于诊断性原始产物。
 - Popo 的首选结构化输入是每篇结果根目录下的 `result.json`，它是当前 MinerU `content_list` 的规范化副本。
 - `mineru_model.json` 是低层模型输出，不应优先于 `result.json`。当前 Popo 的 MinerU Reader 正好相反，需要调整。
 - Popo 推理必须能打开原始 PDF。应通过 SHA256 直接定位源 PDF，不要依赖结果目录中带随机前缀的 PDF 文件名。
@@ -31,8 +34,8 @@ OA inventory + 5000 文件批次
 Redis 队列 + MinerU 任务数据库
                 │
                 ▼
-8 × Worker ───────────────► 8 × VLLM / NPU
-  8101–8108                    30025–30032
+Worker 池 ─────────────────► 本地 vLLM / NPU
+  8101–8108（按实例启停）       30025–30032（按实例启停）
                 │
                 ▼
 临时任务结果 mineru_outputs
@@ -48,6 +51,19 @@ sync_results_to_parsed.py
 MinerU-Popo 归一化、推理与文档树构建
 ```
 
+单个 PDF 在天枢服务内的生命周期：
+
+```text
+上传 → UUID 文件落盘、SHA256、数据库与 Redis
+  → 可选拆分/去水印
+  → PDFium 重建选定且可读的页面
+  → Hybrid layout/OCR/VLM/公式/表格处理
+  → MinerU 原始产物
+  → 天枢标准化
+  → 数据库 completed、API/前端下载
+  → 可选归档到 pdfs_parsed/{sha前2位}/{sha256}/
+```
+
 ### 2.1 关键路径
 
 | 用途 | 路径 |
@@ -61,6 +77,80 @@ MinerU-Popo 归一化、推理与文档树构建
 | MinerU 任务数据库 | `/share/wangjiong/databases/mineru_database/mineru-runner-worker-0/mineru_tianshu.db` |
 | MinerU 日志 | `/share/wangjiong/databases/mineru_database/mineru-runner-worker-0/mineru_logs` |
 | Popo 代码 | `/data/projects/mineru/MinerU-Popo` |
+
+### 2.2 上传、排队和预处理
+
+1. `/api/v1/tasks/submit` 将内容写入 `mineru_uploads/UUID_原文件名`，以 8 MiB 分块计算 SHA256，并把任务参数写入 SQLite、任务消息写入 Redis。
+2. 去重键为 `(file_hash, backend, lang, method)`；相同组合复用已有逻辑任务，失败或超时任务可重新入队。
+3. Worker 可选执行 Office 转 PDF 和去水印。当前超过 50 页的 PDF 按 50 页拆成子任务，分页 PDF 暂存在 `mineru_outputs/splits/{parent_task_id}/`。
+4. 子任务完成后，父任务按页序合并 Markdown 和 content-list。分页输入会删除，但子任务结果目录不会删除，其中的 JSON、图片和 origin PDF 可能继续保留。
+
+### 2.3 PDFium 重建与双 origin PDF
+
+进入 MinerU 前，`do_parse` 会用 PDFium 新建文档、导入指定或确认可读的页面，再重新保存。`*_origin.pdf` 保存的是重建后的字节，不是上传源文件的直接复制品。
+
+即使页面渲染完全一致，重建也可能改变 PDF Info、Producer/Creator、对象编号、xref、trailer、stream 压缩和文件大小。因此比较两个 origin 时，应同时检查文件 SHA256、页数、逐页渲染哈希和元信息。
+
+MinerU 每个解析模式目录只调用一次输出函数、生成一个 origin。两个 origin 位于不同模式目录，说明任务目录中同时保留了不同运行的产物。常见形成过程是：
+
+- 同一文档曾以不同 backend 或 parse method 处理，产生 `hybrid_auto/`、`hybrid_ocr/`、`vlm/` 或 `pipeline/` 等不同目录；
+- 重试不会统一清除其他模式目录；
+- `sync_results_to_parsed.py` 在目标已存在时采用 no-clobber 合并：旧条目优先，只补充缺失的顶层条目，因此两个模式目录会共同保留。
+
+### 2.4 默认 Hybrid 解析
+
+默认参数为 `backend=hybrid-auto-engine`、`method=auto`、`effort=high`、`lang=auto`，公式和表格识别开启。本地 vLLM 可用时后端转为 `hybrid-http-client`；当前引擎会把 `lang=auto` 转成 `en`。
+
+Hybrid 执行布局检测、OCR/VLM 块识别、公式与表格识别、段落重建，并形成模型输出和 middle JSON。API 虽默认 `draw_span_bbox=true`，Hybrid 内部会强制关闭 Span 绘制，因此默认 Hybrid 任务通常没有 `*_span.pdf`。
+
+### 2.5 MinerU 原始产物
+
+天枢把内部安全文件名固定为 `result.pdf`。典型原始目录如下：
+
+```text
+result.pdf/
+└── hybrid_auto/
+    ├── images/
+    ├── result.pdf.md
+    ├── result.pdf_content_list.json
+    ├── result.pdf_content_list_v2.json
+    ├── result.pdf_middle.json
+    ├── result.pdf_model.json
+    ├── result.pdf_origin.pdf
+    └── result.pdf_layout.pdf
+```
+
+- `*.md`：由最终 block 顺序生成的 Markdown。
+- `*_content_list.json`：扁平 block 列表，是 `result.json` 的首选来源。
+- `*_content_list_v2.json`：按页组织、语义更丰富的第二版内容列表。
+- `*_middle.json`：页面尺寸、嵌套 block、bbox、丢弃块等处理中间状态。
+- `*_model.json`：布局/VLM 等模型的低层输出。
+- `*_origin.pdf`：PDFium 重建后的实际解析输入。
+- `*_layout.pdf`：带版面框的诊断 PDF。
+- `images/`：MinerU 生成的全部图片裁剪；其中只有一部分会被 Markdown 或 content-list 引用。
+
+### 2.6 天枢标准化和保留规则
+
+| 标准产物 | 处理 |
+|---|---|
+| `full.md` | 从主 Markdown 复制，图片保持 `images/...` 相对路径 |
+| `result.md` | 同一 Markdown 的展示版；图片改成本地 API 或 RustFS URL |
+| `result.json` | 选择首个文件名含 `content_list`/`result` 的 JSON；当前生成顺序下通常是 v1 content-list |
+| `mineru_model.json` | 复制首个 `*_model.json` |
+| `images/` | 汇总 MinerU 生成的全部图片到根目录，不按 Markdown/content-list 引用过滤 |
+| 源 PDF 副本 | 标准化后由 Worker 从上传目录复制，供前端预览 |
+
+产物保留由任务参数 `preserve_all_artifacts` 控制。默认 `false` 为精简模式：不生成或清理 `*_layout.pdf`、`*_span.pdf`、`*_origin.pdf`、`*_middle.json` 和 `*_content_list_v2.json`，保留 Markdown、content-list、model、标准结果、根 `images/` 与源 PDF 副本。设为 `true` 时打开全部 MinerU dump/draw 开关，标准化器只复制标准文件，不移动或删除解析模式目录中的原始产物。两种策略属于不同的任务去重键。
+
+当前精简模式仍会保留根 `images/` 中未被 Markdown/content-list 引用的中间裁剪图；按引用过滤属于后续优化，不能把根 `images/` 文件数解释为最终正文图片数。
+
+### 2.7 下载边界
+
+前端以 `format=both` 获取结果：Markdown 和 JSON 下载由浏览器根据 API 内容重新生成；PDF 选择顺序为 layout、span、其他 PDF，默认 Hybrid 标准化后通常回落到根目录源 PDF 副本；图片通过 `/api/v1/files/output/.../images/...` 加载。
+
+已完成任务可通过带用户鉴权和任务归属校验的 `/api/v1/tasks/{task_id}/download` 下载服务端实际保留的完整结果 ZIP；批处理脚本默认使用该接口。
+
+通用 `files/output` 与 `files/upload` 接口能按已知相对路径读取目录内任意文件，因此原始 middle/model/content-list/origin 也可直接下载。接口有目录越界防护，但当前没有用户鉴权和任务归属校验。
 
 ## 3. 文档寻址规则
 
@@ -118,9 +208,13 @@ shard  = 01
 | `full.md` | 高 | 原始 Markdown，图片引用保持 `images/...` | 人工复核、文本回退 |
 | `result.md` | 高 | 展示版 Markdown；本机部署会把图片改写为 `/api/v1/files/output/...` | 不作为结构适配输入 |
 | `mineru_model.json` | 中 | 页面级低层模型/Layout 输出 | 诊断用途；禁止作为第一优先级 |
-| `images/` | 高 | `result.json` 中 `img_path` 指向的本地裁剪 | 完整性校验、后续图像处理 |
+| `images/` | 高 | 全部标准化图片裁剪；`result.json.img_path` 只引用其中一部分 | 按引用消费，未引用文件视为中间产物 |
+| `*_content_list.json` | 中/可选 | MinerU 原始扁平内容列表；标准化后通常与 `result.json` 等价 | 诊断标准化来源 |
 | `*_content_list_v2.json` | 低/可选 | 按页嵌套的较丰富语义结构 | 第二阶段增强，不作为首版强依赖 |
-| `*_middle.json` | 低/可选 | 含 `page_size`、嵌套 block 和 caption bbox 的中间表示 | 可增强图文关联 |
+| `*_middle.json` | 低/可选 | 含 `page_size`、嵌套 block、丢弃块和 caption bbox 的中间表示 | 可增强图文关联 |
+| `*_model.json` | 低/可选 | 当次解析模式的模型原始输出；标准化器复制为 `mineru_model.json` | 模型诊断 |
+| `*.md` | 低/可选 | MinerU 原始 Markdown；标准化器据此生成根目录两个 Markdown | 追踪标准化前文本 |
+| `*_origin.pdf` | 低/可选 | PDFium 重建后的实际解析输入 | 页面范围和坏页诊断，不当作权威源 PDF |
 
 已核对的代表性结果中：
 
@@ -179,6 +273,35 @@ popo_bbox = [x1 / 1000, y1 / 1000, x2 / 1000, y2 / 1000]
 ```
 
 使用 `middle.json` 时不能套用 `/1000`。其中 bbox 通常是 PDF 页面坐标，应使用对应 `pdf_info[].page_size` 的宽高分别归一化。
+
+### 4.5 两个 origin PDF 的核验方法
+
+先保留相对目录信息，再比较文件本身：
+
+```bash
+find <result_dir> -type f -name '*_origin.pdf' -print
+sha256sum <origin-a.pdf> <origin-b.pdf>
+pdfinfo <origin-a.pdf>
+pdfinfo <origin-b.pdf>
+```
+
+若 SHA256 或元信息不同，但需要确认页面视觉内容是否一致，可渲染后逐页比较：
+
+```bash
+mkdir -p /tmp/mineru-origin-a /tmp/mineru-origin-b
+pdftoppm -png -r 144 <origin-a.pdf> /tmp/mineru-origin-a/page
+pdftoppm -png -r 144 <origin-b.pdf> /tmp/mineru-origin-b/page
+diff \\
+  <(sha256sum /tmp/mineru-origin-a/page-*.png | awk '{print $1}') \\
+  <(sha256sum /tmp/mineru-origin-b/page-*.png | awk '{print $1}')
+```
+
+判定规则：
+
+- 相对目录不同：先按目录名识别 backend/parse method 或分片任务来源。
+- 页数、页面渲染哈希相同：可认为页面视觉内容一致。
+- PDF 文件 SHA256、元信息或内部对象结构不同：符合独立 PDFium 重建的预期。
+- 页面渲染哈希不同：继续检查页码范围、坏页跳过、去水印和大 PDF 分片参数。
 
 ## 5. Popo 适配契约
 
@@ -284,7 +407,7 @@ inventory 状态适合做候选筛选，不适合作为唯一文件门槛：
 - 单篇失败只记录错误并继续，不阻塞整个批次。
 - 后处理批次应独立于 MinerU 的5000文件提交批次，按自己的并发和 checkpoint 推进。
 
-## 6. 当前任务运行快照
+## 6. 历史任务运行快照
 
 ### 6.1 2026-08-25 15:27 UTC
 
@@ -315,7 +438,7 @@ Runner checkpoint：
 
 从第12批提交到快照的批次平均速度约为 27.6 份/分钟。同步日志最近五轮共搬运806份结果，约为 27.6 份/分钟，与计算吞吐基本一致。
 
-### 6.2 服务拓扑
+### 6.2 历史服务拓扑
 
 | NPU | Worker | VLLM |
 |---:|---:|---:|
@@ -334,7 +457,7 @@ Runner checkpoint：
 
 该状态的字面含义是“任务数据库已 completed，但 inventory 最近一次结果扫描未把目标目录标成严格完成”。它不等于永久提交失败，也不一定表示同步 daemon 当前停止。
 
-当前运行中：
+该历史快照中：
 
 - `sync_results_to_parsed.py` 持续成功搬运结果并更新任务数据库路径。
 - batch runner 的快速刷新主要更新当前批次数据库状态，不会每轮重新扫描全部458K结果目录。
@@ -415,3 +538,6 @@ done
 3. v1 content-list 中嵌套 caption 缺少独立 bbox；高质量图文关联需要从 middle/model 中补充几何信息或接受降级。
 4. Popo 的结构后处理作用于语义 block 和文档树，不修改原始 PDF，也不自动合并已经分离的图片文件。
 5. 本文的进度数字会持续变化；程序只依赖路径和文件契约。
+6. API 保存分页参数为 `start_page/end_page`，当前 MinerU wrapper 读取的是 `start_page_id/end_page_id`；在映射修复前，不能假定 API 分页参数已经生效。
+7. 标准化 JSON 选择条件同时匹配 `*_content_list.json` 和 `*_content_list_v2.json`，只取遍历到的第一个文件。当前 MinerU 先写 v1，代表性结果也为 v1，但代码尚未把这一点固化为显式优先级。
+8. `*_origin.pdf` 的清理 glob 与实际文件名不匹配，因此它属于当前会保留、但不应作为稳定下游契约的诊断产物。
