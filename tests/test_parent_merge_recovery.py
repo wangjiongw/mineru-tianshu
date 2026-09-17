@@ -11,7 +11,7 @@ for path in (BACKEND, SCRIPTS):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from parent_merge import merge_parent_task_results
+from parent_merge import ParentMergeInputError, merge_parent_task_results
 import task_db as task_db_module
 from task_db import TaskDB
 import reconcile_parent_merges
@@ -37,6 +37,7 @@ def _make_parent_with_children(tmp_path, child_count=2, db=None, stem="parent"):
         result_dir.mkdir()
         (result_dir / "result.md").write_text(f"markdown {idx}", encoding="utf-8")
         (result_dir / "result.json").write_text(json.dumps([{"page_idx": 0, "text": str(idx)}]), encoding="utf-8")
+        (result_dir / "mineru_model.json").write_text(json.dumps([[{"type": "text", "chunk": idx}]]), encoding="utf-8")
         with db.get_cursor() as cursor:
             cursor.execute(
                 """
@@ -243,6 +244,8 @@ def _create_legacy_parent_merge_db(db_path):
         result_dir = db_path.parent / f"legacy-result-{idx}"
         result_dir.mkdir()
         (result_dir / "result.md").write_text(f"legacy markdown {idx}", encoding="utf-8")
+        (result_dir / "result.json").write_text(json.dumps([{"page_idx": 0, "text": str(idx)}]), encoding="utf-8")
+        (result_dir / "mineru_model.json").write_text(json.dumps([[{"type": "text", "chunk": idx}]]), encoding="utf-8")
         result_dirs.append(result_dir)
     conn.execute(
         """
@@ -517,26 +520,29 @@ def test_parent_merge_rejects_extra_child_rows(tmp_path):
     assert not (tmp_path / "out" / "parent" / "result.md").exists()
 
 
-def test_retry_without_current_json_removes_stale_parent_result_json(tmp_path):
+def test_retry_without_required_json_keeps_existing_parent_output(tmp_path):
     db, parent_id, _child_ids = _make_parent_with_children(tmp_path)
     assert db.claim_parent_merge(parent_id, "worker-a")
     parent_out = tmp_path / "out" / "parent"
     parent_out.mkdir(parents=True)
     (parent_out / "result.json").write_text('{"stale": true}', encoding="utf-8")
     for child in db.get_child_tasks(parent_id):
-        for json_file in Path(child["result_path"]).glob("*.json"):
-            json_file.unlink()
+        (Path(child["result_path"]) / "result.json").unlink()
 
-    merge_parent_task_results(
-        task_db=db,
-        parent_task_id=parent_id,
-        output_dir=str(tmp_path / "out"),
-        merge_owner="worker-a",
-    )
+    try:
+        merge_parent_task_results(
+            task_db=db,
+            parent_task_id=parent_id,
+            output_dir=str(tmp_path / "out"),
+            merge_owner="worker-a",
+        )
+    except ParentMergeInputError as exc:
+        assert "content-list artifact" in str(exc)
+    else:
+        raise AssertionError("merge should reject missing MinerU content lists")
 
-    assert db.get_task(parent_id)["status"] == "completed"
-    assert (parent_out / "result.md").read_text(encoding="utf-8") == "markdown 0\n\n\n\nmarkdown 1"
-    assert not (parent_out / "result.json").exists()
+    assert db.get_task(parent_id)["status"] == "merging"
+    assert json.loads((parent_out / "result.json").read_text(encoding="utf-8")) == {"stale": True}
 
 
 def test_list_parent_merge_candidates_excludes_terminal_failed_and_cancelled(tmp_path):
@@ -1105,3 +1111,183 @@ def test_api_submit_returns_503_for_dedup_retry_enqueue_failure(tmp_path, monkey
         assert exc.detail["retry_info"]["mode"] == "split_children_requeued"
     else:
         raise AssertionError("dedup retry enqueue failure should surface as 503")
+
+
+def _prepare_artifact_merge(db, parent_id, preserve_all):
+    children = db.get_child_tasks(parent_id)
+    with db.get_cursor() as cursor:
+        cursor.execute(
+            "UPDATE tasks SET options = ? WHERE task_id = ?",
+            (json.dumps({"preserve_all_artifacts": preserve_all}), parent_id),
+        )
+    for idx, child in enumerate(children):
+        result_dir = Path(child["result_path"])
+        image_dir = result_dir / "images"
+        image_dir.mkdir()
+        (image_dir / "same.jpg").write_bytes(f"image-{idx}".encode())
+        (result_dir / "full.md").write_text(
+            f"chunk {idx} ![figure](images/same.jpg)", encoding="utf-8"
+        )
+        (result_dir / "result.md").write_text(
+            f"wrong child URL /api/v1/files/output/child-{idx}/images/same.jpg", encoding="utf-8"
+        )
+        (result_dir / "result.json").write_text(
+            json.dumps([{"page_idx": 0, "img_path": "images/same.jpg", "text": str(idx)}]),
+            encoding="utf-8",
+        )
+        (result_dir / "mineru_model.json").write_text(
+            json.dumps([[{"type": "image", "img_path": "images/same.jpg", "chunk": idx}]]),
+            encoding="utf-8",
+        )
+        diagnostic = result_dir / "raw" / "layout.pdf"
+        diagnostic.parent.mkdir()
+        diagnostic.write_text(f"layout-{idx}", encoding="utf-8")
+    return children
+
+
+def test_parent_merge_combines_core_artifacts_images_and_full_chunks(tmp_path):
+    db, parent_id, _child_ids = _make_parent_with_children(tmp_path)
+    _prepare_artifact_merge(db, parent_id, preserve_all=True)
+    assert db.claim_parent_merge(parent_id, "worker-a")
+
+    out = merge_parent_task_results(
+        task_db=db,
+        parent_task_id=parent_id,
+        output_dir=str(tmp_path / "out"),
+        merge_owner="worker-a",
+        cleanup_child_files=False,
+    )
+
+    full_markdown = (out / "full.md").read_text(encoding="utf-8")
+    result_markdown = (out / "result.md").read_text(encoding="utf-8")
+    assert "images/same.jpg" in full_markdown
+    assert "images/p2_same.jpg" in full_markdown
+    assert "/api/v1/files/output/parent/images/same.jpg" in result_markdown
+    assert "/api/v1/files/output/parent/images/p2_same.jpg" in result_markdown
+    assert (out / "images" / "same.jpg").read_bytes() == b"image-0"
+    assert (out / "images" / "p2_same.jpg").read_bytes() == b"image-1"
+
+    content = json.loads((out / "result.json").read_text(encoding="utf-8"))
+    assert content == json.loads((out / "content_list.json").read_text(encoding="utf-8"))
+    assert [item["page_idx"] for item in content] == [0, 1]
+    assert [item["img_path"] for item in content] == ["images/same.jpg", "images/p2_same.jpg"]
+
+    model = json.loads((out / "mineru_model.json").read_text(encoding="utf-8"))
+    assert len(model) == 2
+    assert model[1][0]["img_path"] == "images/p2_same.jpg"
+    assert (out / "chunks" / "0001_pages_1-1" / "raw" / "layout.pdf").exists()
+    assert (out / "chunks" / "0002_pages_2-2" / "raw" / "layout.pdf").exists()
+
+
+def test_compact_parent_merge_omits_full_chunk_trees(tmp_path):
+    db, parent_id, _child_ids = _make_parent_with_children(tmp_path)
+    _prepare_artifact_merge(db, parent_id, preserve_all=False)
+    assert db.claim_parent_merge(parent_id, "worker-a")
+
+    out = merge_parent_task_results(
+        task_db=db,
+        parent_task_id=parent_id,
+        output_dir=str(tmp_path / "out"),
+        merge_owner="worker-a",
+        cleanup_child_files=False,
+    )
+
+    assert (out / "mineru_model.json").exists()
+    assert (out / "content_list.json").exists()
+    assert (out / "images" / "same.jpg").exists()
+    assert not (out / "chunks").exists()
+
+
+def test_completed_parent_rebuild_is_dry_run_then_explicit_apply(tmp_path):
+    db, parent_id, _child_ids = _make_parent_with_children(tmp_path)
+    _prepare_artifact_merge(db, parent_id, preserve_all=False)
+    assert db.claim_parent_merge(parent_id, "worker-a")
+    out = merge_parent_task_results(
+        task_db=db,
+        parent_task_id=parent_id,
+        output_dir=str(tmp_path / "out"),
+        merge_owner="worker-a",
+        cleanup_child_files=False,
+    )
+    (out / "mineru_model.json").unlink()
+    (out / "content_list.json").unlink()
+
+    dry_args = reconcile_parent_merges.build_parser().parse_args([
+        "--db-path", str(tmp_path / "tasks.db"),
+        "--output-dir", str(tmp_path / "out"),
+        "--rebuild-completed",
+        "--task-id", parent_id,
+    ])
+    dry_report = reconcile_parent_merges.run_once(dry_args, "rebuild-test")
+    assert dry_report["summary"] == {"rebuildable": 1, "blocked": 0}
+    assert not (out / "mineru_model.json").exists()
+
+    apply_args = reconcile_parent_merges.build_parser().parse_args([
+        "--db-path", str(tmp_path / "tasks.db"),
+        "--output-dir", str(tmp_path / "out"),
+        "--rebuild-completed",
+        "--task-id", parent_id,
+        "--apply",
+    ])
+    apply_report = reconcile_parent_merges.run_once(apply_args, "rebuild-test")
+    assert apply_report["tasks"][0]["rebuilt"] is True
+    assert db.get_task(parent_id)["status"] == "completed"
+    assert (out / "mineru_model.json").exists()
+    assert (out / "content_list.json").exists()
+
+
+def test_parent_status_prefers_merged_root_files_over_full_mode_chunks(tmp_path, monkeypatch):
+    import api_server
+
+    result_dir = tmp_path / "parent-result"
+    result_dir.mkdir()
+    (result_dir / "result.md").write_text("PARENT MARKDOWN", encoding="utf-8")
+    (result_dir / "result.json").write_text('[{"scope":"parent"}]', encoding="utf-8")
+    (result_dir / "content_list.json").write_text('[{"scope":"parent"}]', encoding="utf-8")
+    (result_dir / "mineru_model.json").write_text('[{"scope":"parent-model"}]', encoding="utf-8")
+    (result_dir / "parent.pdf").write_text("parent pdf", encoding="utf-8")
+    chunk = result_dir / "chunks" / "0001_pages_1-1"
+    chunk.mkdir(parents=True)
+    (chunk / "result.md").write_text("CHILD MARKDOWN", encoding="utf-8")
+    (chunk / "result.json").write_text('[{"scope":"child"}]', encoding="utf-8")
+    (chunk / "mineru_model.json").write_text('[{"scope":"child-model"}]', encoding="utf-8")
+    (chunk / "child_layout.pdf").write_text("child layout", encoding="utf-8")
+
+    class FakeDB:
+        def get_task(self, task_id):
+            return {
+                "task_id": task_id,
+                "status": "completed",
+                "file_name": "parent.pdf",
+                "file_path": str(tmp_path / "parent.pdf"),
+                "backend": "hybrid-auto-engine",
+                "priority": 0,
+                "error_message": None,
+                "created_at": "now",
+                "started_at": "now",
+                "completed_at": "now",
+                "user_id": "user-1",
+                "shared_read": 0,
+                "is_parent": 1,
+                "child_count": 1,
+                "child_completed": 1,
+                "result_path": str(result_dir),
+            }
+
+        def get_child_tasks(self, task_id):
+            return []
+
+    class FakeUser:
+        user_id = "user-1"
+
+        def has_permission(self, permission):
+            return True
+
+    monkeypatch.setattr(api_server, "db", FakeDB())
+    monkeypatch.setattr(api_server, "OUTPUT_DIR", tmp_path)
+    response = api_server.get_task_status("parent-task", format="both", current_user=FakeUser())
+
+    assert response["data"]["content"] == "PARENT MARKDOWN"
+    assert response["data"]["json_content"] == [{"scope": "parent"}]
+    assert response["data"]["mineru_model_content"] == [{"scope": "parent-model"}]
+    assert response["data"]["pdf_path"] == "parent-result/parent.pdf"

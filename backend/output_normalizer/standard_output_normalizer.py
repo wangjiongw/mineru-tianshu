@@ -22,6 +22,13 @@ class StandardOutputNormalizer(BaseOutputNormalizer):
     - mineru_model.json: MinerU 模型输出（如果存在）
     """
 
+    def __init__(self, preserve_intermediate_files: bool = False):
+        super().__init__()
+        self.preserve_intermediate_files = preserve_intermediate_files
+
+    def _preserve_intermediate_files(self) -> bool:
+        return self.preserve_intermediate_files
+
     def _normalize_local_files(self, output_dir: Path) -> Dict[str, Any]:
         result = {
             "markdown_file": None,   # result.md，供 base 类做 URL 替换
@@ -100,8 +107,8 @@ class StandardOutputNormalizer(BaseOutputNormalizer):
             shutil.copy2(main_md, result_md)
             logger.info(f"   Copied -> result.md")
 
-        # 若原文件在根目录且不是标准名，删除原文件
-        if main_md.parent == output_dir:
+        # 兼容旧的节省空间模式；默认保留原始 Markdown。
+        if main_md.parent == output_dir and not self._preserve_intermediate_files():
             main_md.unlink()
             logger.info(f"   Removed original: {main_md.name}")
 
@@ -140,8 +147,12 @@ class StandardOutputNormalizer(BaseOutputNormalizer):
             for img_file in image_files:
                 if img_file.parent != standard_image_dir:
                     dest = standard_image_dir / img_file.name
-                    logger.debug(f"   Moving: {img_file.name}")
-                    shutil.move(str(img_file), str(dest))
+                    if self._preserve_intermediate_files():
+                        logger.debug(f"   Copying while preserving original: {img_file.name}")
+                        shutil.copy2(img_file, dest)
+                    else:
+                        logger.debug(f"   Moving: {img_file.name}")
+                        shutil.move(str(img_file), str(dest))
 
             return standard_image_dir, len(image_files)
 
@@ -170,15 +181,19 @@ class StandardOutputNormalizer(BaseOutputNormalizer):
                             dest = standard_image_dir / f"{stem}_{counter}{suffix}"
                             counter += 1
 
-                    shutil.move(str(img_file), str(dest))
+                    if self._preserve_intermediate_files():
+                        shutil.copy2(img_file, dest)
+                    else:
+                        shutil.move(str(img_file), str(dest))
                     total_images += 1
 
-            # 删除空目录
-            try:
-                img_dir.rmdir()
-                logger.debug(f"   Removed empty directory: {img_dir.name}/")
-            except OSError:
-                pass
+            # 仅旧的节省空间模式删除已搬空目录。
+            if not self._preserve_intermediate_files():
+                try:
+                    img_dir.rmdir()
+                    logger.debug(f"   Removed empty directory: {img_dir.name}/")
+                except OSError:
+                    pass
 
         return standard_image_dir, total_images
 
@@ -230,9 +245,12 @@ class StandardOutputNormalizer(BaseOutputNormalizer):
             logger.info("   Moving to root directory...")
             shutil.copy2(main_json, standard_json)
         else:
-            # 重命名
-            logger.info(f"   Renaming to {self.STANDARD_JSON_NAME}...")
-            main_json.rename(standard_json)
+            if self._preserve_intermediate_files():
+                logger.info(f"   Copying to {self.STANDARD_JSON_NAME} while preserving original...")
+                shutil.copy2(main_json, standard_json)
+            else:
+                logger.info(f"   Renaming to {self.STANDARD_JSON_NAME}...")
+                main_json.rename(standard_json)
 
         return standard_json
 
@@ -264,8 +282,12 @@ class StandardOutputNormalizer(BaseOutputNormalizer):
         """
         standard_image_dir = output_dir / self.STANDARD_IMAGE_DIR
 
-        # 删除 *_layout.pdf 和 *.origin.pdf
-        for pattern in ("*_layout.pdf", "*.origin.pdf"):
+        if self._preserve_intermediate_files():
+            logger.info("📦 Preserving MinerU intermediate files and original directory tree")
+            return
+
+        # 兼容旧的节省空间模式：删除诊断 PDF 和子目录图片。
+        for pattern in ("*_layout.pdf", "*_span.pdf", "*_origin.pdf", "*.origin.pdf", "*_middle.json", "*_content_list_v2.json"):
             for f in output_dir.rglob(pattern):
                 try:
                     f.unlink()

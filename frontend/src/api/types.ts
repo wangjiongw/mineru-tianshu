@@ -151,6 +151,7 @@ export interface TaskOptions {
   dump_model_output?: boolean
   dump_content_list?: boolean
   dump_orig_pdf?: boolean
+  preserve_all_artifacts?: boolean
   
   // 旧字段兼容
   force_ocr?: boolean
@@ -203,6 +204,7 @@ export interface SubmitTaskRequest {
   dump_model_output?: boolean
   dump_content_list?: boolean
   dump_orig_pdf?: boolean
+  preserve_all_artifacts?: boolean
 
   // 兼容旧字段 (即将废弃)
   draw_layout?: boolean 

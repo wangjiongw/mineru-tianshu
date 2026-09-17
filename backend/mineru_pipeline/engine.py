@@ -291,13 +291,16 @@ class MinerUPipelineEngine:
             formula_enable = options.get("formula_enable", True)
             table_enable = options.get("table_enable", True)
             
-            f_draw_layout_bbox = options.get("draw_layout_bbox", True)      
-            f_draw_span_bbox = options.get("draw_span_bbox", False)          
-            f_dump_md = options.get("dump_markdown", True)                  
-            f_dump_middle_json = options.get("dump_middle_json", True)      
-            f_dump_model_output = options.get("dump_model_output", False)    
-            f_dump_content_list = options.get("dump_content_list", True)    
-            f_dump_orig_pdf = options.get("dump_orig_pdf", True)            
+            preserve_all_artifacts = bool(options.get("preserve_all_artifacts", False))
+            # The policy flag is authoritative. Compact mode keeps the
+            # reproducible consumer inputs; full mode requests every artifact.
+            f_draw_layout_bbox = preserve_all_artifacts
+            f_draw_span_bbox = preserve_all_artifacts
+            f_dump_md = True
+            f_dump_middle_json = preserve_all_artifacts
+            f_dump_model_output = True
+            f_dump_content_list = True
+            f_dump_orig_pdf = preserve_all_artifacts
 
             start_page_id = options.get("start_page_id", 0)
             end_page_id = options.get("end_page_id", None)

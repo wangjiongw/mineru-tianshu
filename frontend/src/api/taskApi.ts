@@ -51,6 +51,7 @@ export async function submitTask(request: SubmitTaskRequest): Promise<SubmitTask
   if (request.dump_model_output !== undefined) formData.append('dump_model_output', String(request.dump_model_output))
   if (request.dump_content_list !== undefined) formData.append('dump_content_list', String(request.dump_content_list))
   if (request.dump_orig_pdf !== undefined) formData.append('dump_orig_pdf', String(request.dump_orig_pdf))
+  if (request.preserve_all_artifacts !== undefined) formData.append('preserve_all_artifacts', String(request.preserve_all_artifacts))
   
   // 兼容旧参数
   if (request.draw_layout !== undefined) formData.append('draw_layout', String(request.draw_layout))
@@ -100,6 +101,18 @@ export async function getTaskStatus(
     }
   )
   return response.data
+}
+
+/** 下载任务的全部标准结果和解析中间产物 */
+export async function downloadTaskArtifacts(taskId: string): Promise<{ blob: Blob; fileName: string }> {
+  const response = await apiClient.get<Blob>('/api/v1/tasks/' + taskId + '/download', { responseType: 'blob', timeout: 0 })
+  const disposition = response.headers['content-disposition'] || ''
+  const encoded = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1]
+  const plain = disposition.match(/filename="?([^";]+)"?/i)?.[1]
+  let fileName = taskId + '_mineru_results.zip'
+  if (encoded) { try { fileName = decodeURIComponent(encoded) } catch { fileName = encoded } }
+  else if (plain) fileName = plain
+  return { blob: response.data, fileName }
 }
 
 /**

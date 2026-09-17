@@ -17,7 +17,7 @@ parallel_batch_parse.py — 并行批量解析 PDF(复用 batch_parse_pdfs.py �
     --base-url http://localhost:8000 \\
     --input-root /data/projects/research_background/AI_Scientist,/data/projects/research_background/LLM-benchmark \\
     --output-root /data/projects/research_background/parsed \\
-    --backend auto --recursive --download-images --concurrency 8 \\
+    --backend auto --recursive --concurrency 8 \\
     --username admin --password admin123
 """
 
@@ -42,7 +42,7 @@ def safe_name(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9._-]", "_", name)
 
 
-def submit_one(base_url, token, rel_key, pdf_path, backend, lang, method):
+def submit_one(base_url, token, rel_key, pdf_path, backend, lang, method, preserve_all_artifacts=False):
     """提交单个 PDF(用 safe filename 上传),返回 (rel_key, task_id|None, error|None)。"""
     try:
         url = f"{base_url}/api/v1/tasks/submit"
@@ -50,7 +50,12 @@ def submit_one(base_url, token, rel_key, pdf_path, backend, lang, method):
         safe_fname = safe_name(pdf_path.name)
         with pdf_path.open("rb") as f:
             files = {"file": (safe_fname, f, "application/pdf")}
-            data = {"backend": backend, "lang": lang, "method": method}
+            data = {
+                "backend": backend,
+                "lang": lang,
+                "method": method,
+                "preserve_all_artifacts": str(preserve_all_artifacts).lower(),
+            }
             resp = requests.post(url, headers=headers, files=files, data=data, timeout=600)
         resp.raise_for_status()
         return rel_key, resp.json()["task_id"], None
@@ -97,7 +102,8 @@ def main():
     ap.add_argument("--concurrency", type=int, default=8)
     ap.add_argument("--poll-interval", type=int, default=5)
     ap.add_argument("--timeout", type=int, default=3600)
-    ap.add_argument("--download-images", action="store_true")
+    ap.add_argument("--download-images", action="store_true", help="Deprecated; images are downloaded by default")
+    ap.add_argument("--download-all-artifacts", action="store_true", help="Use full server artifact policy")
     ap.add_argument("--tasks-file", default=None)
     ap.add_argument("--summary-json", default=None)
     ap.add_argument("--summary-csv", default=None)
@@ -134,7 +140,8 @@ def main():
     bp.log(f"  找到 {len(pdf_list)} 个 PDF, concurrency={args.concurrency}")
 
     resume = not args.no_resume
-    require_images = args.download_images
+    preserve_all_artifacts = args.download_all_artifacts
+    download_results = True
     tasks: Dict[str, dict] = {} if not resume else bp.load_tasks(tasks_file)
 
     # 初始化任务记录(rel_key = root_name/rel,唯一)
@@ -154,9 +161,20 @@ def main():
                 "output_dir": str(out_dir),
                 "error": None,
                 "last_update": datetime.now().isoformat(),
+                "preserve_all_artifacts": preserve_all_artifacts,
             }
-        if bp.is_output_complete(Path(tasks[rel_key]["output_dir"]), require_images):
+        previous_policy = bool(tasks[rel_key].get("preserve_all_artifacts", False))
+        policy_changed = previous_policy != preserve_all_artifacts
+        if policy_changed:
+            tasks[rel_key]["task_id"] = None
+            tasks[rel_key]["status"] = "pending"
+            tasks[rel_key]["completed_at"] = None
+            tasks[rel_key]["duration_sec"] = None
+            tasks[rel_key]["preserve_all_artifacts"] = preserve_all_artifacts
+        if not policy_changed and bp.is_output_complete(Path(tasks[rel_key]["output_dir"]), download_results):
             tasks[rel_key]["status"] = "completed"
+        elif download_results and tasks[rel_key].get("status") == "completed" and tasks[rel_key].get("task_id"):
+            tasks[rel_key]["status"] = "processing"
 
     # ---- 并发提交全部 ----
     to_submit = [k for k, t in tasks.items() if t["status"] != "completed" and not t.get("task_id")]
@@ -164,7 +182,7 @@ def main():
     with ThreadPoolExecutor(max_workers=min(args.concurrency, max(1, len(to_submit))) if to_submit else 1) as ex:
         futs = {
             ex.submit(
-                submit_one, base_url, token, k, Path(tasks[k]["pdf_path"]), args.backend, args.lang, args.method
+                submit_one, base_url, token, k, Path(tasks[k]["pdf_path"]), args.backend, args.lang, args.method, preserve_all_artifacts
             ): k
             for k in to_submit
         }
@@ -189,7 +207,7 @@ def main():
     workers = min(args.concurrency, max(1, total)) if total else 1
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = {
-            ex.submit(poll_and_save, base_url, token, k, tasks[k], args.poll_interval, args.timeout, require_images): k
+            ex.submit(poll_and_save, base_url, token, k, tasks[k], args.poll_interval, args.timeout, download_results): k
             for k in to_poll
         }
         for fut in as_completed(futs):

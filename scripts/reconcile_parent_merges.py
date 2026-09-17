@@ -16,7 +16,7 @@ BACKEND = ROOT / "backend"
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
-from parent_merge import merge_parent_task_results, validate_parent_merge_inputs
+from parent_merge import rebuild_completed_parent_artifacts, merge_parent_task_results, validate_parent_merge_inputs
 from task_db import TaskDB
 
 INSTANCE_ID = os.environ.get("INSTANCE_ID") or socket.gethostname()
@@ -37,6 +37,11 @@ def build_parser():
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--task-id")
     parser.add_argument("--force", action="store_true", help="allow claiming currently merging parents")
+    parser.add_argument(
+        "--rebuild-completed",
+        action="store_true",
+        help="rebuild artifacts for completed split parents without changing task status",
+    )
     parser.add_argument("--report-json", action="store_true")
     return parser
 
@@ -48,8 +53,49 @@ def summarize(candidates):
     return summary
 
 
+def run_completed_rebuild(args, db):
+    candidates = db.list_completed_parent_tasks(limit=args.limit, task_id=args.task_id)
+    report = {
+        "summary": {"rebuildable": 0, "blocked": 0},
+        "tasks": [],
+        "applied": args.apply,
+        "rebuild_completed": True,
+    }
+    for item in candidates:
+        parent = db.get_task_with_children(item["task_id"])
+        _children, blocked_reasons = validate_parent_merge_inputs(parent or {})
+        classification = "blocked" if blocked_reasons else "rebuildable"
+        entry = {
+            "task_id": item["task_id"],
+            "status": item["status"],
+            "classification": classification,
+            "child_count": item["child_count"],
+            "real_child_completed": item.get("real_child_completed") or 0,
+        }
+        if blocked_reasons:
+            entry["blocked_reasons"] = blocked_reasons
+        elif args.apply:
+            try:
+                out = rebuild_completed_parent_artifacts(
+                    task_db=db,
+                    parent_task_id=item["task_id"],
+                    output_dir=args.output_dir,
+                )
+                entry["rebuilt"] = True
+                entry["result_path"] = str(out)
+            except Exception as exc:
+                entry["classification"] = "blocked"
+                entry["rebuilt"] = False
+                entry["error"] = f"{type(exc).__name__}: {exc}"
+        report["tasks"].append(entry)
+        report["summary"][entry["classification"]] += 1
+    return report
+
+
 def run_once(args, owner):
     db = TaskDB(args.db_path, initialize=args.apply, read_only=not args.apply)
+    if args.rebuild_completed:
+        return run_completed_rebuild(args, db)
     candidates = db.list_parent_merge_candidates(
         stale_seconds=args.stale_seconds,
         max_attempts=args.max_attempts,
@@ -133,6 +179,18 @@ def emit(report, as_json):
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return
     summary = report["summary"]
+    if report.get("rebuild_completed"):
+        mode = "apply" if report["applied"] else "dry-run"
+        print(f"mode={mode} rebuildable={summary.get('rebuildable', 0)} blocked={summary.get('blocked', 0)}")
+        for item in report["tasks"]:
+            suffix = f" rebuilt result_path={item.get('result_path')}" if item.get("rebuilt") else ""
+            if item.get("error"):
+                suffix = f" error={item['error']}"
+            print(
+                f"{item['classification']} {item['task_id']} status={item['status']} "
+                f"children={item['real_child_completed']}/{item['child_count']}{suffix}"
+            )
+        return
     mode = "apply" if report["applied"] else "dry-run"
     print(f"mode={mode} finalizable={summary.get('finalizable', 0)} remergeable={summary.get('remergeable', 0)} blocked={summary.get('blocked', 0)}")
     for item in report["tasks"]:
@@ -150,6 +208,8 @@ def emit(report, as_json):
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.rebuild_completed and args.watch:
+        parser.error("--rebuild-completed cannot be combined with --watch")
     owner = f"reconcile-parent-merges:{os.getpid()}"
     while True:
         report = run_once(args, owner)

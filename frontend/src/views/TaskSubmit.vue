@@ -348,34 +348,15 @@
                   <div class="pt-2 border-t border-dashed border-gray-200 mt-2">
                     <label class="block text-xs font-bold text-gray-400 uppercase tracking-wide mb-2">{{ $t('task.outputSettings') }}</label>
                     <div class="grid grid-cols-2 gap-3 bg-white p-3 rounded border border-gray-200">
-                       <label class="flex items-center cursor-pointer text-xs text-gray-600 hover:text-gray-900">
-                          <input v-model="config.draw_layout_bbox" type="checkbox" class="mr-2 rounded border-gray-300" />
-                          {{ $t('task.drawLayout') }}
+                       <label class="col-span-2 flex items-center cursor-pointer text-xs font-semibold text-primary-700">
+                          <input v-model="config.preserve_all_artifacts" type="checkbox" class="mr-2 rounded border-gray-300" />
+                          {{ $t('task.preserveAllArtifacts') }}
                        </label>
-                       <label class="flex items-center cursor-pointer text-xs text-gray-600 hover:text-gray-900">
-                          <input v-model="config.draw_span_bbox" type="checkbox" class="mr-2 rounded border-gray-300" />
-                          {{ $t('task.drawSpan') }}
-                       </label>
-                       <label class="flex items-center cursor-pointer text-xs text-gray-600 hover:text-gray-900">
-                          <input v-model="config.dump_markdown" type="checkbox" class="mr-2 rounded border-gray-300" />
-                          {{ $t('task.dumpMarkdown') }}
-                       </label>
-                       <label class="flex items-center cursor-pointer text-xs text-gray-600 hover:text-gray-900">
-                          <input v-model="config.dump_middle_json" type="checkbox" class="mr-2 rounded border-gray-300" />
-                          {{ $t('task.dumpMiddleJson') }}
-                       </label>
-                       <label class="flex items-center cursor-pointer text-xs text-gray-600 hover:text-gray-900">
-                          <input v-model="config.dump_model_output" type="checkbox" class="mr-2 rounded border-gray-300" />
-                          {{ $t('task.dumpModelOutput') }}
-                       </label>
-                       <label class="flex items-center cursor-pointer text-xs text-gray-600 hover:text-gray-900">
-                          <input v-model="config.dump_content_list" type="checkbox" class="mr-2 rounded border-gray-300" />
-                          {{ $t('task.dumpContentList') }}
-                       </label>
-                       <label class="flex items-center cursor-pointer text-xs text-gray-600 hover:text-gray-900">
-                          <input v-model="config.dump_orig_pdf" type="checkbox" class="mr-2 rounded border-gray-300" />
-                          {{ $t('task.dumpOrigPdf') }}
-                       </label>
+                       <p class="col-span-2 text-xs text-gray-500 leading-relaxed">
+                          {{ config.preserve_all_artifacts
+                            ? '完整模式：保留 layout/span/origin/middle 等全部 MinerU 原始与诊断产物。'
+                            : '精简模式：保留 Markdown、content-list、model、images、标准结果和源 PDF。' }}
+                       </p>
                     </div>
                   </div>
                 </div>
@@ -519,13 +500,14 @@ const defaultConfig = {
   markdownIgnoreLabels: 'header,header_image,footer,footer_image,number,footnote,aside_text',
 
   // Mineru Debug Options (Default: True as per source code)
-  draw_layout_bbox: true, 
-  draw_span_bbox: true,   
+  preserve_all_artifacts: false,
+  draw_layout_bbox: false,
+  draw_span_bbox: false,
   dump_markdown: true,    
-  dump_middle_json: true, 
+  dump_middle_json: false,
   dump_model_output: true,
   dump_content_list: true,
-  dump_orig_pdf: true     
+  dump_orig_pdf: false
 }
 
 const config = reactive({ ...defaultConfig })

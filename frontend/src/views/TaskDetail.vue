@@ -12,6 +12,9 @@
 
       <div class="flex items-center gap-3">
         <template v-if="task">
+            <button v-if="task.status === 'completed' && task.result_path !== 'CLEARED'" @click="downloadAllArtifacts" :disabled="downloadLoading" class="btn btn-white text-primary-600 btn-sm flex items-center">
+              <Download class="w-4 h-4 mr-1.5" /><span>{{ downloadLoading ? '正在打包...' : '下载全部结果' }}</span>
+            </button>
             <button v-if="task.status === 'failed'" @click="initiateAction('retry')" :disabled="actionLoading" class="btn btn-white text-blue-600 border-gray-200 hover:bg-blue-50 btn-sm flex items-center shadow-sm transition-all disabled:opacity-50">
               <RotateCw :class="{'animate-spin': actionLoading && currentAction === 'retry'}" class="w-4 h-4 mr-1.5" />
               <span>重试任务</span>
@@ -147,6 +150,7 @@ import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { useTaskStore } from '@/stores'
+import { downloadTaskArtifacts } from '@/api/taskApi'
 import { ArrowLeft, AlertCircle, RefreshCw, FileText, Columns, Download, RotateCw, Eraser, Pause, Image, Table, Trash2 } from 'lucide-vue-next'
 import StatusBadge from '@/components/StatusBadge.vue'
 import LoadingSpinner from '@/components/LoadingSpinner.vue'
@@ -164,6 +168,7 @@ const taskId = computed(() => route.params.id as string)
 const task = computed(() => taskStore.currentTask)
 const loading = ref(false)
 const actionLoading = ref(false)
+const downloadLoading = ref(false)
 const error = ref('')
 
 const activeTab = ref<'markdown' | 'sync' | 'json'>('markdown')
@@ -295,6 +300,17 @@ const downloadMarkdown = () => {
   a.download = task.value.data.markdown_file || `${taskId.value}.md`
   a.click()
   URL.revokeObjectURL(url)
+}
+
+async function downloadAllArtifacts() {
+  downloadLoading.value = true; error.value = ''
+  try {
+    const { blob, fileName } = await downloadTaskArtifacts(taskId.value)
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a'); link.href = url; link.download = fileName
+    document.body.appendChild(link); link.click(); link.remove(); URL.revokeObjectURL(url)
+  } catch (err: any) { error.value = err.message || '下载全部结果失败' }
+  finally { downloadLoading.value = false }
 }
 
 const showConfirm = ref(false)

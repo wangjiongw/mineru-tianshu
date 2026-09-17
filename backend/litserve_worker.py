@@ -847,7 +847,10 @@ class MinerUWorkerAPI(ls.LitAPI):
         result = self.mineru_pipeline_engine.parse(file_path, output_path=str(output_dir), options=options)
         
         actual_output = Path(result["result_path"])
-        normalize_output(actual_output)
+        normalize_output(
+            actual_output,
+            preserve_intermediate_files=bool(options.get("preserve_all_artifacts", False)),
+        )
 
         # 扁平化目录结构
         if actual_output.resolve() != output_dir.resolve():

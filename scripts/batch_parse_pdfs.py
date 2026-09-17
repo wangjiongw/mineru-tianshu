@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 import argparse
 import csv
+import io
 import json
 import re
+import zipfile
 import sys
 import time
 from datetime import datetime
@@ -42,13 +44,19 @@ def submit_task(
     backend: str,
     lang: str,
     method: str,
+    preserve_all_artifacts: bool = False,
 ) -> str:
     """Submit a single PDF task and return task_id."""
     url = f"{base_url}/api/v1/tasks/submit"
     headers = {"Authorization": f"Bearer {token}"}
     with pdf_path.open("rb") as f:
         files = {"file": (pdf_path.name, f, "application/pdf")}
-        data = {"backend": backend, "lang": lang, "method": method}
+        data = {
+            "backend": backend,
+            "lang": lang,
+            "method": method,
+            "preserve_all_artifacts": str(preserve_all_artifacts).lower(),
+        }
         resp = requests.post(url, headers=headers, files=files, data=data, timeout=600)
     resp.raise_for_status()
     result = resp.json()
@@ -144,12 +152,40 @@ def download_images(
             continue
 
 
+def download_task_results(base_url: str, token: str, task_id: str, out_dir: Path) -> None:
+    """Download and safely extract every retained task artifact."""
+    url = f"{base_url}/api/v1/tasks/{task_id}/download"
+    headers = {"Authorization": f"Bearer {token}"}
+    resp = requests.get(url, headers=headers, timeout=3600)
+    resp.raise_for_status()
+
+    safe_mkdir(out_dir)
+    with zipfile.ZipFile(io.BytesIO(resp.content)) as archive:
+        files = [info for info in archive.infolist() if not info.is_dir()]
+        roots = {Path(info.filename).parts[0] for info in files if Path(info.filename).parts}
+        strip_root = len(roots) == 1
+        for info in files:
+            parts = Path(info.filename).parts
+            relative = Path(*parts[1:]) if strip_root else Path(*parts)
+            if not relative.parts or relative.is_absolute() or ".." in relative.parts:
+                continue
+            destination = (out_dir / relative).resolve()
+            if not destination.is_relative_to(out_dir.resolve()):
+                continue
+            safe_mkdir(destination.parent)
+            with archive.open(info) as source, destination.open("wb") as target:
+                while chunk := source.read(1024 * 1024):
+                    target.write(chunk)
+
+    (out_dir / ".mineru_artifacts_complete").write_text(task_id, encoding="utf-8")
+
+
 def save_result(
     out_dir: Path,
     task_result: dict,
     base_url: str,
     token: str,
-    download_imgs: bool,
+    download_results: bool,
 ) -> None:
     """Save task result files into output directory."""
     safe_mkdir(out_dir)
@@ -160,8 +196,6 @@ def save_result(
     md_content = data.get("content")
     if md_content:
         (out_dir / "result.md").write_text(md_content, encoding="utf-8")
-        if download_imgs:
-            download_images(base_url, token, md_content, out_dir / "images")
 
     json_content = data.get("json_content")
     if json_content is not None:
@@ -175,6 +209,16 @@ def save_result(
             json.dumps(mineru_model_content, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
+    if download_results:
+        try:
+            download_task_results(base_url, token, task_result["task_id"], out_dir)
+        except requests.HTTPError as exc:
+            if exc.response is None or exc.response.status_code not in (404, 405):
+                raise
+            log(f"Full artifact endpoint unavailable; falling back to image download: {exc}")
+            if md_content:
+                download_images(base_url, token, md_content, out_dir / "images")
+
 
 def build_output_path(input_root: Path, output_root: Path, pdf_path: Path) -> Path:
     """Mirror input directory structure under output root."""
@@ -182,14 +226,14 @@ def build_output_path(input_root: Path, output_root: Path, pdf_path: Path) -> Pa
     return output_root / rel.parent / rel.stem
 
 
-def is_output_complete(output_dir: Path, require_images: bool) -> bool:
+def is_output_complete(output_dir: Path, require_artifacts: bool) -> bool:
     if not output_dir.exists():
         return False
     if not (output_dir / "result.md").exists():
         return False
     if not (output_dir / "mineru_model.json").exists():
         return False
-    if require_images and not (output_dir / "images").exists():
+    if require_artifacts and not (output_dir / ".mineru_artifacts_complete").exists():
         return False
     return True
 
@@ -273,7 +317,16 @@ def main() -> None:
     parser.add_argument("--method", default="auto", help="Method: auto/txt/ocr")
     parser.add_argument("--poll-interval", type=int, default=5, help="Polling interval (sec)")
     parser.add_argument("--timeout", type=int, default=3600, help="Task timeout (sec)")
-    parser.add_argument("--download-images", action="store_true", help="Download images to output folder")
+    parser.add_argument(
+        "--download-images",
+        action="store_true",
+        help="Deprecated compatibility flag; images are downloaded by default",
+    )
+    parser.add_argument(
+        "--download-all-artifacts",
+        action="store_true",
+        help="Submit in full artifact mode and download every retained result file",
+    )
     parser.add_argument("--batch-size", type=int, default=100, help="Max PDFs per submit batch")
     parser.add_argument("--max-retries", type=int, default=0, help="Max retries per task (failed/timeout)")
     parser.add_argument("--tasks-file", help="Tasks state JSON file")
@@ -310,7 +363,8 @@ def main() -> None:
     log(f"Found {len(pdfs)} PDFs")
 
     resume = not args.no_resume
-    require_images = args.download_images
+    preserve_all_artifacts = args.download_all_artifacts
+    download_results = True
 
     tasks: Dict[str, dict] = {} if not resume else load_tasks(tasks_file)
 
@@ -330,14 +384,30 @@ def main() -> None:
                 "output_dir": str(out_dir),
                 "error": None,
                 "last_update": datetime.now().isoformat(),
+                "preserve_all_artifacts": preserve_all_artifacts,
             }
 
     for rel, item in tasks.items():
+        # Compact and full parses are different logical tasks. A policy change
+        # must submit a new task even when this batch state file already exists.
+        previous_policy = bool(item.get("preserve_all_artifacts", False))
+        policy_changed = previous_policy != preserve_all_artifacts
+        if policy_changed:
+            item["task_id"] = None
+            item["status"] = "pending"
+            item["completed_at"] = None
+            item["duration_sec"] = None
+            item["preserve_all_artifacts"] = preserve_all_artifacts
         out_dir = Path(item["output_dir"])
-        if is_output_complete(out_dir, require_images):
+        if not policy_changed and is_output_complete(out_dir, download_results):
             item["status"] = "completed"
             item["completed_at"] = item.get("completed_at") or datetime.now().isoformat()
             item["duration_sec"] = item.get("duration_sec") or 0
+            item["last_update"] = datetime.now().isoformat()
+        elif download_results and item.get("status") == "completed" and item.get("task_id"):
+            # A previous run downloaded only the API summary/images. Revisit the
+            # already-completed server task and fetch its complete artifact archive.
+            item["status"] = "processing"
             item["last_update"] = datetime.now().isoformat()
 
     save_tasks(tasks_file, tasks)
@@ -365,7 +435,7 @@ def main() -> None:
                 continue
 
             out_dir = Path(item["output_dir"])
-            if is_output_complete(out_dir, require_images):
+            if item.get("task_id") and is_output_complete(out_dir, download_results):
                 item["status"] = "completed"
                 item["completed_at"] = item.get("completed_at") or datetime.now().isoformat()
                 item["duration_sec"] = item.get("duration_sec") or 0
@@ -373,7 +443,15 @@ def main() -> None:
                 continue
 
             try:
-                task_id = submit_task(base_url, token, pdf_path, args.backend, args.lang, args.method)
+                task_id = submit_task(
+                    base_url,
+                    token,
+                    pdf_path,
+                    args.backend,
+                    args.lang,
+                    args.method,
+                    preserve_all_artifacts=preserve_all_artifacts,
+                )
                 item["task_id"] = task_id
                 item["status"] = "pending"
                 item["submitted_at"] = datetime.now().isoformat()
@@ -404,7 +482,7 @@ def main() -> None:
                     status = result.get("status")
                     item["status"] = status
                     if status == "completed":
-                        save_result(Path(item["output_dir"]), result, base_url, token, args.download_images)
+                        save_result(Path(item["output_dir"]), result, base_url, token, download_results)
                         item["completed_at"] = datetime.now().isoformat()
                         item["duration_sec"] = time.time() - start_time
                         item["last_update"] = datetime.now().isoformat()

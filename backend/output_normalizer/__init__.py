@@ -25,11 +25,14 @@ from .standard_output_normalizer import StandardOutputNormalizer
 from .paddleocr_output_normalizer import PaddleOCROutputNormalizer
 
 # 全局单例实例
-_standard_normalizer = StandardOutputNormalizer()
 _paddleocr_normalizer = PaddleOCROutputNormalizer()
 
 
-def normalize_output(output_dir: Path, handle_method="standard") -> Dict[str, Any]:
+def normalize_output(
+    output_dir: Path,
+    handle_method="standard",
+    preserve_intermediate_files: bool = False,
+) -> Dict[str, Any]:
     """
     便捷函数：规范化输出目录
 
@@ -53,7 +56,7 @@ def normalize_output(output_dir: Path, handle_method="standard") -> Dict[str, An
     ## 基于handle_method选择规范化器
     if handle_method == "standard":
         logger.info("🤖 Using standard output normalize method")
-        return _standard_normalizer.normalize(output_dir)
+        return StandardOutputNormalizer(preserve_intermediate_files).normalize(output_dir)
     elif handle_method == "paddleocr-vl":
         logger.info("🤖 Using PaddleOCR-VL output normalize method")
         return _paddleocr_normalizer.normalize(output_dir)

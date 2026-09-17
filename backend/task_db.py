@@ -261,6 +261,7 @@ class TaskDB:
                     file_hash TEXT,
                     lang TEXT,
                     method TEXT,
+                    preserve_all_artifacts INTEGER DEFAULT 0,
                     retry_count INTEGER DEFAULT 0
                 )
             """)
@@ -325,6 +326,15 @@ class TaskDB:
                 cursor.execute("ALTER TABLE tasks ADD COLUMN method TEXT")
                 logger.info("✅ method field added")
 
+            try:
+                cursor.execute("SELECT preserve_all_artifacts FROM tasks LIMIT 1")
+            except sqlite3.OperationalError:
+                logger.info("📊 Migrating database schema: adding artifact policy field")
+                cursor.execute(
+                    "ALTER TABLE tasks ADD COLUMN preserve_all_artifacts INTEGER DEFAULT 0"
+                )
+                logger.info("✅ Artifact policy field added")
+
             # 迁移：添加 data 字段（如果不存在）
             try:
                 cursor.execute("SELECT data FROM tasks LIMIT 1")
@@ -349,8 +359,25 @@ class TaskDB:
                     logger.info(f"📊 Migrating database schema: adding {column_name} field")
                     cursor.execute(f"ALTER TABLE tasks ADD COLUMN {column_name} {definition}")
 
+            # Artifact policy changes the physical result set and must be part
+            # of logical-task deduplication. Rebuild only the legacy index so
+            # concurrent API/worker startup does not perform repeated DDL.
+            cursor.execute("PRAGMA index_info(idx_task_dedup)")
+            dedup_columns = [row["name"] for row in cursor.fetchall()]
+            expected_dedup_columns = [
+                "file_hash",
+                "backend",
+                "lang",
+                "method",
+                "preserve_all_artifacts",
+            ]
+            if dedup_columns and dedup_columns != expected_dedup_columns:
+                cursor.execute("DROP INDEX idx_task_dedup")
             cursor.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_task_dedup ON tasks(file_hash, backend, lang, method)"
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_task_dedup
+                ON tasks(file_hash, backend, lang, method, preserve_all_artifacts)
+                """
             )
 
             if os.getenv("MINERU_AUTO_CREATE_QUEUE_INDEXES", "false").lower() in {"1", "true", "yes", "on"}:
@@ -394,16 +421,17 @@ class TaskDB:
             for statement in statements:
                 locked_cursor.execute(statement)
 
-    def get_task_by_dedup(self, file_hash: str, backend: str, lang: str, method: str) -> Optional[Dict]:
+    def get_task_by_dedup(self, file_hash: str, backend: str, lang: str, method: str, preserve_all_artifacts: bool = False) -> Optional[Dict]:
         with self.get_cursor() as cursor:
             cursor.execute(
                 """
                 SELECT * FROM tasks
                 WHERE file_hash = ? AND backend = ? AND lang = ? AND method = ?
+                  AND preserve_all_artifacts = ?
                 ORDER BY created_at DESC
                 LIMIT 1
             """,
-                (file_hash, backend, lang, method),
+                (file_hash, backend, lang, method, int(preserve_all_artifacts)),
             )
             row = cursor.fetchone()
             return dict(row) if row else None
@@ -428,12 +456,16 @@ class TaskDB:
         创建新任务（含去重）
         """
         task_id = str(uuid.uuid4())
+        preserve_all_artifacts = bool((options or {}).get("preserve_all_artifacts", False))
         try:
             with self.get_cursor() as cursor:
                 cursor.execute(
                     """
-                    INSERT INTO tasks (task_id, file_name, file_path, backend, options, priority, user_id, file_hash, lang, method)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO tasks (
+                        task_id, file_name, file_path, backend, options, priority,
+                        user_id, file_hash, lang, method, preserve_all_artifacts
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                     (
                         task_id,
@@ -446,10 +478,11 @@ class TaskDB:
                         file_hash,
                         lang,
                         method,
+                        int(preserve_all_artifacts),
                     ),
                 )
         except sqlite3.IntegrityError:
-            existing = self.get_task_by_dedup(file_hash, backend, lang, method)
+            existing = self.get_task_by_dedup(file_hash, backend, lang, method, preserve_all_artifacts)
             if not existing:
                 raise
 
@@ -1418,6 +1451,29 @@ class TaskDB:
                 item["child_failed"] = int(item.get("child_failed") or 0)
                 rows.append(item)
             return rows
+
+    def list_completed_parent_tasks(self, limit: int = 100, task_id: str = None) -> List[Dict]:
+        """List completed split parents eligible for an explicit artifact rebuild."""
+        with self.get_cursor() as cursor:
+            where = "WHERE p.is_parent = 1 AND p.child_count > 0 AND p.status = 'completed'"
+            params = []
+            if task_id:
+                where += " AND p.task_id = ?"
+                params.append(task_id)
+            cursor.execute(
+                f"""
+                SELECT p.*,
+                       SUM(CASE WHEN c.status = 'completed' THEN 1 ELSE 0 END) AS real_child_completed
+                FROM tasks p
+                LEFT JOIN tasks c ON c.parent_task_id = p.task_id
+                {where}
+                GROUP BY p.task_id
+                ORDER BY p.completed_at DESC, p.created_at DESC
+                LIMIT ?
+                """,
+                (*params, limit),
+            )
+            return [dict(row) for row in cursor.fetchall()]
 
     def on_child_task_completed(self, child_task_id: str, merge_owner: str = None) -> Optional[str]:
         """子任务完成回调。返回 parent_task_id 表示当前 owner 赢得合并权。"""

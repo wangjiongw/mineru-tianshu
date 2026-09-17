@@ -25,6 +25,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Depen
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from loguru import logger
+from starlette.background import BackgroundTask
 from starlette.types import ASGIApp, Receive, Scope, Send  # ✅ 用于底层中间件
 
 # 导入认证模块
@@ -36,6 +37,7 @@ from auth import (
 )
 from auth.auth_db import AuthDB
 from auth.routes import router as auth_router
+from artifact_archive import create_task_artifact_archive
 from task_db import TaskDB
 
 # ✅ [优化] 预注册 MIME 类型，防止精简环境识别失败导致浏览器强制下载
@@ -235,6 +237,10 @@ def submit_task(
     dump_model_output: bool = Form(True, description="输出模型原始数据"),
     dump_content_list: bool = Form(True, description="输出内容列表"),
     dump_orig_pdf: bool = Form(True, description="保存原始/截取 PDF"),
+    preserve_all_artifacts: bool = Form(
+        False,
+        description="保留全部 MinerU 原始/诊断产物；默认仅保留必要结果",
+    ),
     draw_layout: bool = Form(True, description="[兼容旧版] 是否绘制布局边框"),
     draw_span: bool = Form(True, description="[兼容旧版] 是否绘制文本Span边框"),
     
@@ -303,6 +309,7 @@ def submit_task(
             "dump_model_output": dump_model_output,
             "dump_content_list": dump_content_list,
             "dump_orig_pdf": dump_orig_pdf,
+            "preserve_all_artifacts": preserve_all_artifacts,
             "draw_layout": draw_layout,
             "draw_span": draw_span,
             "keep_audio": keep_audio,
@@ -475,13 +482,25 @@ def get_task_status(
 
         result_dir = Path(task["result_path"])
         if result_dir.exists():
-            md_files = list(result_dir.rglob("*.md"))
-            json_files = [
-                f for f in result_dir.rglob("*.json")
-                if not f.parent.name.startswith("page_")
-                and (f.name in ["content.json", "result.json", "mineru_model.json"] or "_content_list.json" in f.name)
-            ]
-            mineru_model_file = next((f for f in result_dir.rglob("*.json") if f.name == "mineru_model.json"), None)
+            md_files = sorted(
+                result_dir.rglob("*.md"),
+                key=lambda f: (f.parent != result_dir, f.name != "result.md", str(f)),
+            )
+            json_files = sorted(
+                (
+                    f for f in result_dir.rglob("*.json")
+                    if not f.parent.name.startswith("page_")
+                    and (
+                        f.name in ["content.json", "content_list.json", "result.json", "mineru_model.json"]
+                        or "_content_list.json" in f.name
+                    )
+                ),
+                key=lambda f: (f.parent != result_dir, f.name != "result.json", str(f)),
+            )
+            root_model_file = result_dir / "mineru_model.json"
+            mineru_model_file = root_model_file if root_model_file.is_file() else next(
+                (f for f in json_files if f.name == "mineru_model.json"), None
+            )
             
             if md_files or json_files:
                 try:
@@ -489,8 +508,13 @@ def get_task_status(
                     response["data"]["json_available"] = len(json_files) > 0
                     
                     pdf_files = list(result_dir.rglob("*.pdf"))
-                    preview_pdf = None
+                    preview_pdf = next(
+                        (pdf for pdf in sorted(result_dir.glob("*.pdf")) if not pdf.name.startswith("page_")),
+                        None,
+                    )
                     for pdf in pdf_files:
+                        if preview_pdf:
+                            break
                         if "_layout.pdf" in pdf.name:
                             preview_pdf = pdf
                             break
@@ -514,8 +538,11 @@ def get_task_status(
                              pass
 
                     if format in ["markdown", "both"] and md_files:
-                        md_file = next((f for f in md_files if f.name == "result.md"),
-                                       max(md_files, key=lambda f: f.stat().st_size))
+                        root_markdown = result_dir / "result.md"
+                        md_file = root_markdown if root_markdown.is_file() else next(
+                            (f for f in md_files if f.name == "result.md"),
+                            max(md_files, key=lambda f: f.stat().st_size),
+                        )
                         image_dir = md_file.parent / "images"
                         with open(md_file, "r", encoding="utf-8") as f:
                             md_content = f.read()
@@ -529,7 +556,13 @@ def get_task_status(
 
                     if format in ["json", "both"] and json_files:
                         import json as json_lib
-                        json_file = json_files[0]
+                        root_result_json = result_dir / "result.json"
+                        root_content_list = result_dir / "content_list.json"
+                        json_file = (
+                            root_result_json if root_result_json.is_file()
+                            else root_content_list if root_content_list.is_file()
+                            else json_files[0]
+                        )
                         try:
                             with open(json_file, "r", encoding="utf-8") as f:
                                 json_content = json_lib.load(f)
@@ -557,6 +590,41 @@ def get_task_status(
             logger.error(f"❌ Result directory does not exist: {result_dir}")
 
     return response
+
+
+@router.get("/tasks/{task_id}/download", tags=["任务管理"])
+def download_task_artifacts(task_id: str, current_user: User = Depends(get_current_active_user)):
+    task = db.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if (
+        not current_user.has_permission(Permission.TASK_VIEW_ALL)
+        and task.get("user_id") != current_user.user_id
+        and not task.get("shared_read")
+    ):
+        raise HTTPException(status_code=403, detail="Permission denied")
+    if task.get("status") != "completed":
+        raise HTTPException(status_code=409, detail="Task is not completed")
+    result_path = task.get("result_path")
+    if not result_path or result_path == "CLEARED":
+        raise HTTPException(
+            status_code=404,
+            detail="Task result files have been cleaned up",
+        )
+    try:
+        path, name = create_task_artifact_archive(
+            Path(result_path),
+            task_id,
+            task.get("file_name"),
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return FileResponse(
+        str(path),
+        media_type="application/zip",
+        filename=name,
+        background=BackgroundTask(path.unlink, missing_ok=True),
+    )
 
 
 # ========================================================================

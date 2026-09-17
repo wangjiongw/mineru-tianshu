@@ -293,6 +293,7 @@ export default {
     
     // [新增] Debug Output
     outputSettings: '输出与调试设置',
+    preserveAllArtifacts: '保留并允许下载全部 MinerU 原始与诊断产物',
     debugOutput: 'DEBUG OUTPUT',
     dumpMarkdown: '输出 Markdown',
     dumpMiddleJson: '输出中间结果 JSON',
