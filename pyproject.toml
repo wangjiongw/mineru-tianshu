@@ -3,7 +3,7 @@
 
 [project]
 name = "mineru-server"
-version = "1.0.0"
+version = "2.1.0"
 description = "MinerU Tianshu - Enterprise AI Data Processing Platform"
 requires-python = ">=3.12"
 

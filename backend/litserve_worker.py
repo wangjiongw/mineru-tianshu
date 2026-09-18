@@ -85,6 +85,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 # Local imports
 from task_db import TaskDB
+from version_info import get_version_info
 from parent_merge import build_completion_payload, count_result_pages, merge_parent_task_results
 from utils import parse_list_arg
 import importlib.util
@@ -1206,7 +1207,11 @@ class MinerUWorkerAPI(ls.LitAPI):
     def decode_request(self, request): return request.get("action", "health")
     def predict(self, action):
         if action == "health":
-            return {"status": "healthy", "worker_id": self.worker_id}
+            return {
+                "status": "healthy",
+                "worker_id": self.worker_id,
+                "version": get_version_info(),
+            }
         elif action == "poll":
             if self.enable_worker_loop:
                 return {"status": "skipped", "message": "Auto-loop active"}

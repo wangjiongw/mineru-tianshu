@@ -1067,5 +1067,52 @@ class TianshuProcessStatusTests(unittest.TestCase):
         self.assertLess(lines.index("stop_worker_3"), lines.index("start_api"))
         self.assertIn("strict_--strict", lines)
 
+    def test_extract_build_id_handles_api_and_worker_payloads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_bash(
+                "printf '%s\\n%s\\n' "
+                "'{\"build_id\":\"api-build\"}' "
+                "'{\"output\":{\"version\":{\"build_id\":\"worker-build\"}}}' "
+                "| while IFS= read -r payload; do printf '%s' \"$payload\" | extract_build_id; done",
+                Path(tmp),
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ["api-build", "worker-build"])
+
+    def test_status_versions_accepts_matching_api_and_workers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_bash(
+                'TIANSHU_BUILD_ID="2.0.0+abcdef123456"; '
+                'get_api_build_id() { echo "2.0.0+abcdef123456"; }; '
+                'get_worker_build_id() { echo "2.0.0+abcdef123456"; }; '
+                'status_versions',
+                Path(tmp),
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("API: 2.0.0+abcdef123456", result.stdout)
+        self.assertIn("Worker #3: 2.0.0+abcdef123456", result.stdout)
+
+    def test_status_versions_rejects_mixed_worker_builds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_bash(
+                'TIANSHU_BUILD_ID="2.0.0+abcdef123456"; '
+                'get_api_build_id() { echo "2.0.0+abcdef123456"; }; '
+                'get_worker_build_id() { '
+                '  if [ "$1" = "2" ]; then echo "2.0.0+oldoldoldold"; '
+                '  else echo "2.0.0+abcdef123456"; fi; '
+                '}; status_versions',
+                Path(tmp),
+            )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Worker #2: 2.0.0+oldoldoldold", result.stdout)
+        self.assertIn("期望 2.0.0+abcdef123456", result.stdout)
+
+    def test_status_strict_includes_version_consistency(self) -> None:
+        text = SCRIPT.read_text(encoding="utf-8")
+        cmd_status = text[text.index("cmd_status()"):text.index("cmd_logs()")]
+        self.assertIn("status_versions || failed=1", cmd_status)
+
 if __name__ == "__main__":
     unittest.main()

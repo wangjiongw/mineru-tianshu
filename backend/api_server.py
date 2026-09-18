@@ -39,6 +39,7 @@ from auth.auth_db import AuthDB
 from auth.routes import router as auth_router
 from artifact_archive import create_task_artifact_archive
 from task_db import TaskDB
+from version_info import API_VERSION, RELEASE_VERSION, get_version_info
 
 # ✅ [优化] 预注册 MIME 类型，防止精简环境识别失败导致浏览器强制下载
 mimetypes.add_type('application/pdf', '.pdf')
@@ -52,7 +53,7 @@ mimetypes.add_type('application/json', '.json')
 app = FastAPI(
     title="MinerU Tianshu API",
     description="天枢 - 企业级 AI 数据预处理平台 | 支持文档、图片、音频、视频等多模态数据处理 | 企业级认证授权",
-    version="2.0.0",
+    version=RELEASE_VERSION,
     # 不设置 servers，让 FastAPI 自动根据请求的 Host 生成
 )
 
@@ -199,7 +200,9 @@ async def root():
     """API根路径"""
     return {
         "service": "MinerU Tianshu",
-        "version": "2.0.0",
+        "version": RELEASE_VERSION,
+        "api_version": API_VERSION,
+        "build": get_version_info(),
         "description": "天枢 - 企业级 AI 数据预处理平台",
         "features": "文档、图片、音频、视频等多模态数据处理",
         "docs": "/docs",
@@ -1037,6 +1040,12 @@ def list_engines():
     }
 
 
+@router.get("/version", tags=["系统信息"])
+def version_info():
+    """Public deployment fingerprint for client compatibility checks."""
+    return get_version_info()
+
+
 @router.get("/health", tags=["系统信息"])
 def health_check():
     try:
@@ -1045,6 +1054,7 @@ def health_check():
             "status": "healthy",
             "timestamp": datetime.now().isoformat(),
             "database": "connected",
+            "version": get_version_info(),
             "queue_stats": stats,
         }
     except Exception as e:

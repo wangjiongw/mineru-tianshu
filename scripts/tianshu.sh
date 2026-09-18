@@ -24,6 +24,26 @@ set -o pipefail
 # ============================================================================
 
 PROJECT_ROOT="/data/projects/mineru/mineru-tianshu"
+VERSION_FILE="${PROJECT_ROOT}/VERSION"
+TIANSHU_API_VERSION="${TIANSHU_API_VERSION:-2.0.0}"
+if [ -z "${TIANSHU_RELEASE_VERSION:-}" ]; then
+    TIANSHU_RELEASE_VERSION="$(tr -d '[:space:]' < "$VERSION_FILE" 2>/dev/null || true)"
+fi
+TIANSHU_RELEASE_VERSION="${TIANSHU_RELEASE_VERSION:-0.0.0+unknown}"
+TIANSHU_GIT_COMMIT="${TIANSHU_GIT_COMMIT:-$(git -C "$PROJECT_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)}"
+if [ -z "${TIANSHU_GIT_DIRTY:-}" ]; then
+    if git -C "$PROJECT_ROOT" status --porcelain --untracked-files=normal 2>/dev/null | grep -q .; then
+        TIANSHU_GIT_DIRTY=true
+    elif git -C "$PROJECT_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        TIANSHU_GIT_DIRTY=false
+    else
+        TIANSHU_GIT_DIRTY=unknown
+    fi
+fi
+TIANSHU_BUILD_TIME="${TIANSHU_BUILD_TIME:-$(git -C "$PROJECT_ROOT" show -s --format=%cI HEAD 2>/dev/null || true)}"
+TIANSHU_BUILD_ID="${TIANSHU_RELEASE_VERSION}+${TIANSHU_GIT_COMMIT:0:12}"
+[ "$TIANSHU_GIT_DIRTY" != "true" ] || TIANSHU_BUILD_ID="${TIANSHU_BUILD_ID}.dirty"
+export TIANSHU_API_VERSION TIANSHU_RELEASE_VERSION TIANSHU_GIT_COMMIT TIANSHU_GIT_DIRTY TIANSHU_BUILD_TIME TIANSHU_BUILD_ID
 
 # VLLM 服务配置
 VLLM_MODEL_PATH="/share/wangjiong/model_zoo/modelscope/models/OpenDataLab/MinerU2___5-Pro-2605-1___2B"
@@ -1642,6 +1662,67 @@ status_workers() {
     return "$failed"
 }
 
+extract_build_id() {
+    "$PYTHON_BIN" -c 'import json, sys
+def find(value):
+    if isinstance(value, dict):
+        if isinstance(value.get("build_id"), str):
+            return value["build_id"]
+        for key in ("version", "build", "output", "result"):
+            found = find(value.get(key))
+            if found:
+                return found
+    if isinstance(value, list):
+        for item in value:
+            found = find(item)
+            if found:
+                return found
+    return None
+try:
+    print(find(json.load(sys.stdin)) or "")
+except Exception:
+    print("")'
+}
+
+get_api_build_id() {
+    curl -fsS --max-time 5 "http://localhost:${API_PORT}/api/v1/version" 2>/dev/null | extract_build_id
+}
+
+get_worker_build_id() {
+    local index="$1" port
+    worker_index_valid "$index" || return 1
+    port=$((WORKER_BASE_PORT + index))
+    curl -fsS --max-time 5 -X POST "http://localhost:${port}/predict" \
+        -H 'Content-Type: application/json' -d '{"action":"health"}' 2>/dev/null | extract_build_id
+}
+
+status_versions() {
+    echo -e "${CYAN}Build Version${NC}"
+    local expected="$TIANSHU_BUILD_ID" actual i failed=0
+    echo "  期望: ${expected} (commit=${TIANSHU_GIT_COMMIT}, dirty=${TIANSHU_GIT_DIRTY})"
+
+    actual="$(get_api_build_id)"
+    if [ "$actual" = "$expected" ]; then
+        echo "  ✅ API: ${actual}"
+    elif [ -n "$actual" ]; then
+        echo "  ❌ API: ${actual} (期望 ${expected})"; failed=1
+    else
+        echo "  ❌ API: 无法读取版本信号"; failed=1
+    fi
+
+    for i in $(active_instance_indices); do
+        actual="$(get_worker_build_id "$i")"
+        if [ "$actual" = "$expected" ]; then
+            echo "  ✅ Worker #${i}: ${actual}"
+        elif [ -n "$actual" ]; then
+            echo "  ❌ Worker #${i}: ${actual} (期望 ${expected})"; failed=1
+        else
+            echo "  ❌ Worker #${i}: 无法读取版本信号"; failed=1
+        fi
+    done
+    return "$failed"
+}
+
 # ============================================================================
 # Watchdog（Worker 单实例补齐 + API 端口探活自动恢复）
 # ============================================================================
@@ -2566,6 +2647,7 @@ cmd_status() {
     echo ""; status_api || failed=1
     echo ""; status_mcp || true
     echo ""; status_workers || failed=1
+    echo ""; status_versions || failed=1
     echo ""; status_watchdog || failed=1
     echo ""; status_scheduler || failed=1
     echo ""; status_parent_merge_reconciler || failed=1
