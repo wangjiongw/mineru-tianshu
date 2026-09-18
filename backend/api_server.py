@@ -278,6 +278,12 @@ def submit_task(
     current_user: User = Depends(require_permission(Permission.TASK_SUBMIT)),
 ):
     try:
+        if start_page is not None and start_page < 0:
+            raise HTTPException(status_code=422, detail="start_page must be zero or greater")
+        if end_page is not None and end_page < 0:
+            raise HTTPException(status_code=422, detail="end_page must be zero or greater")
+        if start_page is not None and end_page is not None and end_page < start_page:
+            raise HTTPException(status_code=422, detail="end_page is inclusive and must be >= start_page")
         unique_filename = f"{uuid.uuid4().hex}_{file.filename}"
         temp_file_path = UPLOAD_DIR / unique_filename
 
@@ -408,7 +414,7 @@ def submit_task(
 def get_task_status(
     task_id: str,
     upload_images: bool = Query(False, description="【已废弃】图片已自动上传到 RustFS"),
-    format: str = Query("markdown", description="返回格式: markdown(默认)/json/both"),
+    format: str = Query("markdown", description="返回格式: status/markdown(默认)/json/both"),
     current_user: User = Depends(get_current_active_user),
 ):
     task = db.get_task(task_id)
@@ -461,18 +467,35 @@ def get_task_status(
             "percentage": round(child_completed / child_count * 100, 1) if child_count > 0 else 0,
         }
         try:
-            children = db.get_child_tasks(task_id)
-            response["subtasks"] = [
-                {
-                    "task_id": child["task_id"],
-                    "status": child["status"],
-                    "chunk_info": json.loads(child.get("options", "{}")).get("chunk_info"),
-                    "error_message": child.get("error_message"),
-                }
-                for child in children
-            ]
-        except Exception as e:
+            children = [] if format == "status" else db.get_child_tasks(task_id)
+            if children:
+                response["subtasks"] = [
+                    {
+                        "task_id": child["task_id"],
+                        "status": child["status"],
+                        "chunk_info": json.loads(child.get("options", "{}")).get("chunk_info"),
+                        "error_message": child.get("error_message"),
+                    }
+                    for child in children
+                ]
+        except Exception:
             pass
+        if task.get("status") == "completed" and task.get("result_path") not in (None, "", "CLEARED"):
+            manifest_path = Path(task["result_path"]) / "merge_manifest.json"
+            if manifest_path.is_file():
+                try:
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    response["merge"] = {
+                        "validation": manifest.get("validation"),
+                        "totals": manifest.get("totals"),
+                        "processed_start_page": manifest.get("source", {}).get("processed_start_page"),
+                        "processed_end_page": manifest.get("source", {}).get("processed_end_page"),
+                    }
+                except Exception as exc:
+                    logger.warning(f"Failed to read merge manifest for {task_id}: {exc}")
+
+    if format == "status":
+        return response
 
     if task["status"] == "completed":
         if not task["result_path"] or task["result_path"] == "CLEARED":
@@ -593,7 +616,11 @@ def get_task_status(
 
 
 @router.get("/tasks/{task_id}/download", tags=["任务管理"])
-def download_task_artifacts(task_id: str, current_user: User = Depends(get_current_active_user)):
+def download_task_artifacts(
+    task_id: str,
+    profile: str = Query("canonical", description="Artifact profile: canonical (default) or all"),
+    current_user: User = Depends(get_current_active_user),
+):
     task = db.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -611,11 +638,14 @@ def download_task_artifacts(task_id: str, current_user: User = Depends(get_curre
             status_code=404,
             detail="Task result files have been cleaned up",
         )
+    if profile not in {"all", "canonical"}:
+        raise HTTPException(status_code=422, detail="profile must be all or canonical")
     try:
         path, name = create_task_artifact_archive(
             Path(result_path),
             task_id,
             task.get("file_name"),
+            profile=profile,
         )
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
