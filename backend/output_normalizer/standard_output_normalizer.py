@@ -19,12 +19,14 @@ class StandardOutputNormalizer(BaseOutputNormalizer):
     - result.md:       处理版，图片路径替换为 RustFS URL 或本地 API 路径
     - images/:         图片目录（统一名称）
     - result.json:     结构化数据（content_list）
+    - content_list.json: result.json 的兼容别名
     - mineru_model.json: MinerU 模型输出（如果存在）
     """
 
-    def __init__(self, preserve_intermediate_files: bool = False):
+    def __init__(self, preserve_intermediate_files: bool = False, artifact_family: Optional[str] = None):
         super().__init__()
         self.preserve_intermediate_files = preserve_intermediate_files
+        self.artifact_family = artifact_family
 
     def _preserve_intermediate_files(self) -> bool:
         return self.preserve_intermediate_files
@@ -44,22 +46,55 @@ class StandardOutputNormalizer(BaseOutputNormalizer):
         # 2. 规范化图片目录
         result["image_dir"], result["image_count"] = self._normalize_images(output_dir)
 
-        # 3. 规范化 JSON 文件
-        result["json_file"] = self._normalize_json(output_dir)
+        # 3. Preserve MinerU's public content-list artifacts before creating
+        # the cross-backend result.json compatibility view.
+        if self.artifact_family == "mineru":
+            self._preserve_mineru_content_lists(output_dir)
 
-        # 4. 复制 MinerU model JSON
+        # 4. 规范化 JSON 文件
+        result["json_file"] = self._normalize_json(output_dir)
+        self._ensure_content_list_alias(output_dir)
+
+        # 5. 复制 MinerU model JSON
         self._copy_model_json(output_dir)
 
-        # 5. 两个 md 文件都先统一为 images/xxx.jpg（base 类后续只修改 result.md）
+        # 6. 两个 md 文件都先统一为 images/xxx.jpg（base 类后续只修改 result.md）
         if result["image_dir"]:
             for md in [result["full_md_file"], result["markdown_file"]]:
                 if md:
                     self._update_markdown_image_refs(md)
 
-        # 6. 清理 MinerU 原始输出中不再需要的文件
+        # 7. Compact mode only keeps images referenced by canonical outputs.
+        if not self._preserve_intermediate_files():
+            result["image_count"] = self._prune_unreferenced_images(output_dir)
+
+        # 8. 清理 MinerU 原始输出中不再需要的文件
         self._cleanup_original_files(output_dir)
 
         return result
+
+    def _preserve_mineru_content_lists(self, output_dir: Path) -> None:
+        """Promote MinerU v1/v2 content lists without changing their names."""
+        candidates = sorted({
+            path
+            for pattern in ("*_content_list.json", "*_content_list_v2.json")
+            for path in output_dir.rglob(pattern)
+            if path.is_file()
+        })
+        for source in candidates:
+            destination = output_dir / source.name
+            if source == destination:
+                continue
+            if destination.exists():
+                if destination.read_bytes() != source.read_bytes():
+                    raise ValueError(
+                        f"Conflicting MinerU content-list artifacts: {source} and {destination}"
+                    )
+                continue
+            shutil.copy2(source, destination)
+            logger.info(f"📄 Preserved MinerU artifact: {destination.name}")
+            if not self._preserve_intermediate_files():
+                source.unlink()
 
     def _normalize_markdown(self, output_dir: Path) -> Tuple[Optional[Path], Optional[Path]]:
         """
@@ -204,12 +239,13 @@ class StandardOutputNormalizer(BaseOutputNormalizer):
         查找并重命名为标准名称：result.json
         """
         # 查找所有 .json 文件（排除子目录中的临时文件）
-        json_files = [
+        json_files = sorted(
             f
             for f in output_dir.rglob("*.json")
             if not f.parent.name.startswith("page_")  # 排除 PaddleOCR-VL 的分页文件
             and f.name != "mineru_model.json"          # 排除已生成的 model json
-        ]
+            and "_content_list_v2" not in f.name
+        )
 
         if not json_files:
             logger.info("ℹ️  No JSON files found")
@@ -242,10 +278,12 @@ class StandardOutputNormalizer(BaseOutputNormalizer):
 
         # 如果不在根目录，移动到根目录
         if main_json.parent != output_dir:
-            logger.info("   Moving to root directory...")
+            logger.info("   Copying canonical JSON to root directory...")
             shutil.copy2(main_json, standard_json)
+            if not self._preserve_intermediate_files():
+                main_json.unlink()
         else:
-            if self._preserve_intermediate_files():
+            if self._preserve_intermediate_files() or "content_list" in main_json.name:
                 logger.info(f"   Copying to {self.STANDARD_JSON_NAME} while preserving original...")
                 shutil.copy2(main_json, standard_json)
             else:
@@ -253,6 +291,17 @@ class StandardOutputNormalizer(BaseOutputNormalizer):
                 main_json.rename(standard_json)
 
         return standard_json
+
+    def _ensure_content_list_alias(self, output_dir: Path) -> None:
+        result_json = output_dir / self.STANDARD_JSON_NAME
+        content_list = output_dir / "content_list.json"
+        if not result_json.is_file() or content_list.exists():
+            return
+        try:
+            content_list.hardlink_to(result_json)
+        except OSError:
+            shutil.copy2(result_json, content_list)
+        logger.info("📄 Created content_list.json compatibility alias")
 
     def _copy_model_json(self, output_dir: Path):
         """
@@ -263,15 +312,72 @@ class StandardOutputNormalizer(BaseOutputNormalizer):
             logger.info("✅ mineru_model.json already exists")
             return
 
-        model_jsons = [
+        model_jsons = sorted(
             f for f in output_dir.rglob("*_model.json")
             if f.name != "mineru_model.json"
-        ]
+        )
         if model_jsons:
-            shutil.copy2(model_jsons[0], dest)
-            logger.info(f"📄 Copied model JSON: {model_jsons[0].name} -> mineru_model.json")
+            source = model_jsons[0]
+            shutil.copy2(source, dest)
+            if not self._preserve_intermediate_files():
+                source.unlink()
+            logger.info(f"📄 Copied model JSON: {source.name} -> mineru_model.json")
         else:
             logger.debug("ℹ️  No *_model.json found, skipping")
+
+    def _prune_unreferenced_images(self, output_dir: Path) -> int:
+        image_dir = output_dir / self.STANDARD_IMAGE_DIR
+        if not image_dir.is_dir():
+            return 0
+        referenced = set()
+
+        def add_reference(value):
+            if not isinstance(value, str):
+                return
+            if "images/" in value or "/images/" in value:
+                name = Path(value.split("?", 1)[0]).name
+                if name:
+                    referenced.add(name)
+
+        for md_name in ("full.md", "result.md"):
+            md = output_dir / md_name
+            if not md.is_file():
+                continue
+            content = md.read_text(encoding="utf-8")
+            for left, right in re.findall(
+                r"!\[[^\]]*\]\(([^)]+)\)|<img[^>]+src=[\"']([^\"']+)", content
+            ):
+                add_reference(left or right)
+
+        def walk(value):
+            if isinstance(value, dict):
+                for item in value.values():
+                    walk(item)
+            elif isinstance(value, list):
+                for item in value:
+                    walk(item)
+            else:
+                add_reference(value)
+
+        json_paths = {
+            output_dir / "result.json",
+            output_dir / "mineru_model.json",
+            *output_dir.glob("*_content_list.json"),
+            *output_dir.glob("*_content_list_v2.json"),
+        }
+        for path in sorted(json_paths):
+            if not path.is_file():
+                continue
+            try:
+                import json
+                walk(json.loads(path.read_text(encoding="utf-8")))
+            except Exception as exc:
+                logger.warning(f"Could not inspect {path.name} image references: {exc}")
+
+        for image in list(image_dir.iterdir()):
+            if image.is_file() and image.name not in referenced:
+                image.unlink()
+        return sum(1 for image in image_dir.iterdir() if image.is_file())
 
     def _cleanup_original_files(self, output_dir: Path):
         """
@@ -287,7 +393,7 @@ class StandardOutputNormalizer(BaseOutputNormalizer):
             return
 
         # 兼容旧的节省空间模式：删除诊断 PDF 和子目录图片。
-        for pattern in ("*_layout.pdf", "*_span.pdf", "*_origin.pdf", "*.origin.pdf", "*_middle.json", "*_content_list_v2.json"):
+        for pattern in ("*_layout.pdf", "*_span.pdf", "*_origin.pdf", "*.origin.pdf", "*_middle.json"):
             for f in output_dir.rglob(pattern):
                 try:
                     f.unlink()

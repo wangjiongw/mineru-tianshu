@@ -84,7 +84,7 @@ def poll_task(
     start = time.time()
     last_status = None
     while True:
-        resp = requests.get(url, headers=headers, params={"format": "both"}, timeout=30)
+        resp = requests.get(url, headers=headers, params={"format": "status"}, timeout=30)
         resp.raise_for_status()
         data = resp.json()
         status = data.get("status")

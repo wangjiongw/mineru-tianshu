@@ -42,7 +42,7 @@ def normalize_output(
 
     Args:
         output_dir: 输出目录路径
-        handle_method: 处理方法，默认为 "standard"。支持 "standard" 或 "paddleocr-vl"
+        handle_method: 处理方法，默认为 "standard"。支持 "standard"、"mineru" 或 "paddleocr-vl"
 
     Returns:
         Dict[str, Any]: 规范化后的文件信息
@@ -54,9 +54,12 @@ def normalize_output(
         logger.info("🤖 Detected PaddleOCR-VL output format")
         handle_method = "paddleocr-vl"
     ## 基于handle_method选择规范化器
-    if handle_method == "standard":
-        logger.info("🤖 Using standard output normalize method")
-        return StandardOutputNormalizer(preserve_intermediate_files).normalize(output_dir)
+    if handle_method in ("standard", "mineru"):
+        logger.info(f"🤖 Using {handle_method} output normalize method")
+        return StandardOutputNormalizer(
+            preserve_intermediate_files,
+            artifact_family="mineru" if handle_method == "mineru" else None,
+        ).normalize(output_dir)
     elif handle_method == "paddleocr-vl":
         logger.info("🤖 Using PaddleOCR-VL output normalize method")
         return _paddleocr_normalizer.normalize(output_dir)

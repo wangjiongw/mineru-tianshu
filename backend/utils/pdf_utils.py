@@ -117,7 +117,12 @@ def get_pdf_page_count(pdf_path: Path) -> int:
 
 
 def split_pdf_file(
-    pdf_path: Path, output_dir: Path, chunk_size: int = 500, parent_task_id: str = None
+    pdf_path: Path,
+    output_dir: Path,
+    chunk_size: int = 500,
+    parent_task_id: str = None,
+    start_page: int = 0,
+    end_page: int = None,
 ) -> List[Dict[str, any]]:
     """
     拆分 PDF 文件为多个分片（使用 pikepdf 实现，性能优化）
@@ -153,6 +158,16 @@ def split_pdf_file(
         # 打开 PDF（只加载元数据，不加载页面内容）
         pdf = pikepdf.open(pdf_path)
         total_pages = len(pdf.pages)
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be greater than zero")
+        if start_page < 0:
+            raise ValueError("start_page must be zero or greater")
+        if end_page is None:
+            end_page = total_pages - 1
+        if end_page < start_page or end_page >= total_pages:
+            raise ValueError(
+                f"invalid inclusive page range {start_page}-{end_page} for {total_pages} pages"
+            )
 
         logger.info(f"✂️  Splitting PDF: {pdf_path.name} ({total_pages} pages)")
         logger.info(f"   Chunk size: {chunk_size} pages")
@@ -161,34 +176,44 @@ def split_pdf_file(
         chunks = []
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        for i in range(0, total_pages, chunk_size):
-            end_page = min(i + chunk_size, total_pages)
-            chunk_page_count = end_page - i
+        for i in range(start_page, end_page + 1, chunk_size):
+            chunk_end_exclusive = min(i + chunk_size, end_page + 1)
+            chunk_page_count = chunk_end_exclusive - i
 
             # 创建分片 PDF（引用复制，不是深拷贝）
             chunk_pdf = pikepdf.new()
-            chunk_pdf.pages.extend(pdf.pages[i:end_page])
+            chunk_pdf.pages.extend(pdf.pages[i:chunk_end_exclusive])
 
             # 生成分片文件名
             if parent_task_id:
-                chunk_filename = f"{parent_task_id}_chunk_{i+1}_{end_page}.pdf"
+                chunk_filename = f"{parent_task_id}_chunk_{i+1}_{chunk_end_exclusive}.pdf"
             else:
-                chunk_filename = f"{pdf_path.stem}_chunk_{i+1}_{end_page}.pdf"
+                chunk_filename = f"{pdf_path.stem}_chunk_{i+1}_{chunk_end_exclusive}.pdf"
 
             chunk_path = output_dir / chunk_filename
 
             # 保存分片文件（自动压缩优化）
             chunk_pdf.save(chunk_path)
+            chunk_pdf.close()
+
+            # Re-open every chunk: existence alone does not prove validity.
+            with pikepdf.open(chunk_path) as verified:
+                actual_pages = len(verified.pages)
+            if actual_pages != chunk_page_count:
+                raise RuntimeError(
+                    f"chunk validation failed for {chunk_path}: "
+                    f"pages={actual_pages} expected={chunk_page_count}"
+                )
 
             chunk_info = {
                 "path": str(chunk_path),
                 "start_page": i + 1,  # 1-based
-                "end_page": end_page,  # 1-based
+                "end_page": chunk_end_exclusive,  # 1-based inclusive
                 "page_count": chunk_page_count,
             }
             chunks.append(chunk_info)
 
-            logger.info(f"   ✅ Created chunk {len(chunks)}: pages {i+1}-{end_page} ({chunk_page_count} pages)")
+            logger.info(f"   ✅ Created chunk {len(chunks)}: pages {i+1}-{chunk_end_exclusive} ({chunk_page_count} pages)")
 
         pdf.close()
         logger.info(f"✅ Split into {len(chunks)} chunks")

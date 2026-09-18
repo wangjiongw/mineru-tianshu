@@ -1169,14 +1169,20 @@ class TaskDB:
     def convert_to_parent_task(self, task_id: str, child_count: int = 0):
         """将普通任务转换为父任务
 
-        child_count=0 表示初始化父任务（拆分开始）：此时同步重置 child_completed=0，
-        并清除上一轮残留的子任务（防止重试场景下旧子任务成为孤儿）。
+        child_count=0 只允许初始化尚无子任务的父任务；若已有子任务则拒绝，
+        防止重试或恢复流程静默丢失历史子任务记录。
         """
         with self.get_cursor() as cursor:
             if child_count == 0:
-                # 初置：清除上一轮残留子任务 + 清零完成计数，防止重试场景下旧值残留导致合并提前触发
-                cursor.execute("DELETE FROM tasks WHERE parent_task_id = ?", (task_id,))
-                deleted = cursor.rowcount
+                cursor.execute(
+                    "SELECT COUNT(*) AS count FROM tasks WHERE parent_task_id = ?",
+                    (task_id,),
+                )
+                existing_count = int(cursor.fetchone()["count"])
+                if existing_count:
+                    raise RuntimeError(
+                        f"refusing to discard {existing_count} existing children for {task_id}"
+                    )
                 cursor.execute(
                     """
                     UPDATE tasks
@@ -1192,8 +1198,6 @@ class TaskDB:
                     """,
                     (task_id,),
                 )
-                if deleted:
-                    logger.info(f"🧹 Cleared {deleted} stale children from previous split of {task_id}")
             else:
                 cursor.execute(
                     """
@@ -1210,6 +1214,93 @@ class TaskDB:
                     (child_count, task_id),
                 )
         logger.info(f"🔄 Converted task {task_id} to parent task with {child_count} children")
+
+    def create_split_children_atomic(
+        self,
+        parent_task_id: str,
+        chunks: List[Dict],
+        *,
+        backend: str,
+        parent_options: dict,
+        priority: int = 0,
+        user_id: str = None,
+    ) -> List[str]:
+        """Create all validated split children in one database transaction."""
+        child_ids = [str(uuid.uuid4()) for _ in chunks]
+        with self.get_cursor() as cursor:
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute(
+                "SELECT COUNT(*) AS count FROM tasks WHERE parent_task_id = ?",
+                (parent_task_id,),
+            )
+            existing_count = int(cursor.fetchone()["count"])
+            if existing_count:
+                raise RuntimeError(
+                    f"refusing to replace {existing_count} existing children for {parent_task_id}"
+                )
+            cursor.execute("SELECT task_id FROM tasks WHERE task_id = ?", (parent_task_id,))
+            if cursor.fetchone() is None:
+                raise ValueError(f"parent task not found: {parent_task_id}")
+            cursor.execute(
+                """
+                UPDATE tasks
+                SET is_parent = 1,
+                    child_count = ?,
+                    child_completed = 0,
+                    status = 'processing',
+                    options = ?,
+                    merge_owner = NULL,
+                    merge_claimed_at = NULL,
+                    merge_attempts = 0,
+                    merge_error = NULL,
+                    error_message = NULL
+                WHERE task_id = ?
+                """,
+                (len(chunks), json.dumps(parent_options or {}), parent_task_id),
+            )
+            for child_id, chunk in zip(child_ids, chunks):
+                child_options = dict(parent_options or {})
+                child_options.pop("start_page", None)
+                child_options.pop("end_page", None)
+                child_options["start_page_id"] = 0
+                child_options["end_page_id"] = None
+                child_options["chunk_info"] = {
+                    "index": int(chunk["index"]),
+                    "start_page": int(chunk["start_page"]),
+                    "end_page": int(chunk["end_page"]),
+                    "page_count": int(chunk["page_count"]),
+                }
+                cursor.execute(
+                    """
+                    INSERT INTO tasks (
+                        task_id, parent_task_id, file_name, file_path,
+                        backend, options, status, priority, user_id,
+                        preserve_all_artifacts
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                    """,
+                    (
+                        child_id, parent_task_id, chunk["file_name"], chunk["path"],
+                        backend, json.dumps(child_options), priority, user_id,
+                        int(bool(child_options.get("preserve_all_artifacts", False))),
+                    ),
+                )
+
+        failed = []
+        for child_id, chunk in zip(child_ids, chunks):
+            accepted = self._enqueue_to_redis(
+                child_id, priority,
+                {"file_name": chunk["file_name"], "backend": backend, "parent_task_id": parent_task_id},
+            )
+            if REDIS_QUEUE_AVAILABLE and not accepted and not _sqlite_queue_fallback_enabled():
+                failed.append(child_id)
+        if failed:
+            with self.get_cursor() as cursor:
+                cursor.execute(
+                    "UPDATE tasks SET status = 'failed', error_message = ? WHERE task_id = ?",
+                    (f"Child enqueue failed: {', '.join(failed)}", parent_task_id),
+                )
+            raise RuntimeError(f"Redis did not accept split children: {', '.join(failed)}")
+        return child_ids
 
     def create_child_task(
         self,
@@ -1327,6 +1418,18 @@ class TaskDB:
                     max_attempts,
                     max_attempts,
                 ),
+            )
+            return cursor.rowcount > 0
+
+    def refresh_parent_merge_lease(self, parent_task_id: str, merge_owner: str) -> bool:
+        """Refresh an owned merge lease so a long merge cannot be stolen."""
+        with self.get_cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE tasks SET merge_claimed_at = CURRENT_TIMESTAMP
+                WHERE task_id = ? AND status = 'merging' AND merge_owner = ?
+                """,
+                (parent_task_id, merge_owner),
             )
             return cursor.rowcount > 0
 
@@ -1475,6 +1578,18 @@ class TaskDB:
             )
             return [dict(row) for row in cursor.fetchall()]
 
+    def publish_completed_parent_result_path(self, task_id: str, result_path: str) -> bool:
+        """Publish rebuilt artifacts without changing completed task state."""
+        with self.get_cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE tasks SET result_path = ?
+                WHERE task_id = ? AND status = 'completed' AND is_parent = 1
+                """,
+                (result_path, task_id),
+            )
+            return cursor.rowcount > 0
+
     def on_child_task_completed(self, child_task_id: str, merge_owner: str = None) -> Optional[str]:
         """子任务完成回调。返回 parent_task_id 表示当前 owner 赢得合并权。"""
         merge_owner = merge_owner or "unknown-merge-owner"
@@ -1556,6 +1671,37 @@ class TaskDB:
 
             if cursor.rowcount > 0:
                 logger.error(f"❌ Parent task {parent_task_id} marked as failed due to subtask failure")
+
+    def list_expired_completed_children(self, retention_hours: float = 24.0, limit: int = 500) -> List[Dict]:
+        """List child working artifacts whose completed parent passed retention."""
+        with self.get_cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT c.task_id, c.file_path, c.result_path, c.parent_task_id
+                FROM tasks c
+                JOIN tasks p ON p.task_id = c.parent_task_id
+                WHERE c.status = 'completed'
+                  AND p.status = 'completed'
+                  AND p.completed_at IS NOT NULL
+                  AND p.completed_at <= datetime('now', '-' || ? || ' hours')
+                  AND COALESCE(c.result_path, '') NOT IN ('', 'CLEARED')
+                ORDER BY p.completed_at, c.task_id
+                LIMIT ?
+                """,
+                (max(float(retention_hours), 0.0), max(int(limit), 1)),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def mark_child_artifacts_cleared(self, task_id: str) -> bool:
+        with self.get_cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE tasks SET result_path = 'CLEARED'
+                WHERE task_id = ? AND parent_task_id IS NOT NULL AND status = 'completed'
+                """,
+                (task_id,),
+            )
+            return cursor.rowcount > 0
 
     def get_task_with_children(self, task_id: str) -> Optional[Dict]:
         """获取任务及其所有子任务"""
@@ -1795,6 +1941,83 @@ class TaskDB:
             "requeued_task_ids": [item["task_id"] for item in successful_requeued_tasks],
             "requeued_child_count": sum(1 for item in successful_requeued_tasks if item.get("parent_task_id") == task_id),
             "enqueue_failed_task_ids": enqueue_failed_task_ids,
+        }
+
+    def requeue_completed_parent_children(self, parent_task_id: str) -> Dict:
+        """Reparse every child of an explicitly selected completed split parent."""
+        with self.get_cursor() as cursor:
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute("SELECT * FROM tasks WHERE task_id = ?", (parent_task_id,))
+            parent = cursor.fetchone()
+            if not parent or not parent["is_parent"] or int(parent["child_count"] or 0) <= 0:
+                raise ValueError(f"completed split parent not found: {parent_task_id}")
+            if parent["status"] != "completed":
+                raise ValueError(
+                    f"parent {parent_task_id} must be completed before artifact reparse"
+                )
+            cursor.execute(
+                """
+                SELECT task_id, priority, file_name, backend, parent_task_id, file_path
+                FROM tasks
+                WHERE parent_task_id = ?
+                ORDER BY created_at, task_id
+                """,
+                (parent_task_id,),
+            )
+            children = [dict(row) for row in cursor.fetchall()]
+            if len(children) != int(parent["child_count"]):
+                raise ValueError(
+                    f"child row count mismatch for {parent_task_id}: "
+                    f"rows={len(children)} expected={parent['child_count']}"
+                )
+            missing_inputs = [item["task_id"] for item in children if not Path(item["file_path"]).is_file()]
+            if missing_inputs:
+                raise ValueError(
+                    "child PDF inputs must be regenerated before requeue: "
+                    + ", ".join(missing_inputs)
+                )
+            child_ids = [item["task_id"] for item in children]
+            placeholders = ",".join("?" for _ in child_ids)
+            cursor.execute(
+                f"""
+                UPDATE tasks
+                SET status = 'pending', result_path = NULL, error_message = NULL,
+                    started_at = NULL, completed_at = NULL, worker_id = NULL,
+                    retry_count = retry_count + 1
+                WHERE task_id IN ({placeholders})
+                """,
+                child_ids,
+            )
+            cursor.execute(
+                """
+                UPDATE tasks
+                SET status = 'processing', child_completed = 0, completed_at = NULL,
+                    error_message = NULL, worker_id = NULL, merge_owner = NULL,
+                    merge_claimed_at = NULL, merge_attempts = 0, merge_error = NULL
+                WHERE task_id = ?
+                """,
+                (parent_task_id,),
+            )
+
+        enqueue_failed = []
+        accepted = []
+        for item in children:
+            payload = {
+                "file_name": item["file_name"],
+                "backend": item["backend"],
+                "parent_task_id": parent_task_id,
+            }
+            enqueued = self._enqueue_to_redis(item["task_id"], item["priority"], payload)
+            if REDIS_QUEUE_AVAILABLE and not enqueued and not _sqlite_queue_fallback_enabled():
+                enqueue_failed.append(item["task_id"])
+            else:
+                accepted.append(item["task_id"])
+        if enqueue_failed:
+            self._mark_retry_enqueue_failed(enqueue_failed, parent_task_id=parent_task_id)
+        return {
+            "task_id": parent_task_id,
+            "requeued_task_ids": accepted,
+            "enqueue_failed_task_ids": enqueue_failed,
         }
 
     def pause_task(self, task_id: str) -> bool:

@@ -29,6 +29,7 @@ import requests
 import warnings
 import subprocess
 import tempfile
+import uuid
 from pathlib import Path
 from typing import Optional
 from contextlib import asynccontextmanager
@@ -849,6 +850,7 @@ class MinerUWorkerAPI(ls.LitAPI):
         actual_output = Path(result["result_path"])
         normalize_output(
             actual_output,
+            handle_method="mineru",
             preserve_intermediate_files=bool(options.get("preserve_all_artifacts", False)),
         )
 
@@ -865,15 +867,38 @@ class MinerUWorkerAPI(ls.LitAPI):
             except Exception as e:
                 logger.warning(f"Flattening warning: {e}")
         
-        # [修复] 确保 PDF 存在并返回路径
-        pdf_path = self._ensure_pdf_in_output(file_path, output_dir)
+        # Split PDFs are ephemeral inputs. Compact child results do not need a
+        # second copy; the parent publishes the authoritative source PDF.
+        is_compact_child = bool(options.get("chunk_info")) and not bool(
+            options.get("preserve_all_artifacts", False)
+        )
+        pdf_path = None if is_compact_child else self._ensure_pdf_in_output(file_path, output_dir)
+
+        canonical_markdown = output_dir / "full.md"
+        canonical_json = output_dir / "result.json"
+        canonical_model = output_dir / "mineru_model.json"
+        markdown_content = (
+            canonical_markdown.read_text(encoding="utf-8")
+            if canonical_markdown.is_file() else result.get("markdown", "")
+        )
+        json_content = result.get("json_content")
+        model_content = None
+        try:
+            if canonical_json.is_file():
+                json_content = json.loads(canonical_json.read_text(encoding="utf-8"))
+            if canonical_model.is_file():
+                model_content = json.loads(canonical_model.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning(f"Could not reload canonical MinerU JSON outputs: {exc}")
 
         return {
             "result_path": str(output_dir),
-            "content": result.get("markdown", ""),
-            "json_content": result.get("json_content"),
-            "pdf_path": pdf_path, # 返回给前端
-            "markdown_file": result.get("markdown_file")
+            "content": markdown_content,
+            "json_content": json_content,
+            "mineru_model_content": model_content,
+            "total_pages": len(model_content) if isinstance(model_content, list) else None,
+            "pdf_path": pdf_path,
+            "markdown_file": str(canonical_markdown) if canonical_markdown.is_file() else result.get("markdown_file"),
         }
 
     def _process_with_paddleocr_vl(self, file_path: str, options: dict) -> dict:
@@ -1063,49 +1088,98 @@ class MinerUWorkerAPI(ls.LitAPI):
         return self.watermark_handler.remove_watermark(input_path=file_path, output_path=str(output_file), **kwargs)
 
     def _should_split_pdf(self, task_id, file_path, task, options):
-        if os.getenv("PDF_SPLIT_ENABLED", "true").lower() != "true": return False
-        if task.get("is_parent") and int(task.get("child_count") or 0) > 0:
-            logger.warning(f"⚠️ Refusing to re-split existing parent task {task_id}; leaving it for merge reconciliation")
-            return True
-        current_task = self.task_db.get_task(task_id) if hasattr(self.task_db, "get_task") else None
-        if current_task and current_task.get("is_parent") and int(current_task.get("child_count") or 0) > 0:
-            logger.warning(f"⚠️ Refusing to re-split existing parent task {task_id}; leaving it for merge reconciliation")
-            return True
-        
-        from utils.pdf_utils import get_pdf_page_count, split_pdf_file
-        threshold = int(os.getenv("PDF_SPLIT_THRESHOLD_PAGES", "500"))
-        chunk_size = int(os.getenv("PDF_SPLIT_CHUNK_SIZE", "500"))
-        
-        try:
-            pages = get_pdf_page_count(Path(file_path))
-            if pages <= threshold: return False
-            
-            logger.info(f"🔀 Splitting PDF ({pages} pages)...")
-            self.task_db.convert_to_parent_task(task_id, child_count=0)
-            split_dir = Path(self.output_dir) / "splits" / task_id
-            split_dir.mkdir(parents=True, exist_ok=True)
-            
-            chunks = split_pdf_file(Path(file_path), split_dir, chunk_size, task_id)
-            
-            for chunk in chunks:
-                c_ops = options.copy()
-                c_ops["chunk_info"] = {k: chunk[k] for k in ["start_page", "end_page", "page_count"]}
-                self.task_db.create_child_task(
-                    parent_task_id=task_id,
-                    file_name=f"{Path(file_path).stem}_p{chunk['start_page']}-{chunk['end_page']}.pdf",
-                    file_path=chunk["path"],
-                    backend=task.get("backend", "auto"),
-                    options=c_ops,
-                    priority=task.get("priority", 0),
-                    user_id=task.get("user_id")
-                )
-            
-            self.task_db.convert_to_parent_task(task_id, child_count=len(chunks))
-            logger.info(f"✂️  Split into {len(chunks)} subtasks")
-            return True
-        except Exception as e:
-            logger.error(f"❌ PDF split failed: {e}")
+        """Prepare a split task atomically; raise instead of parsing a half-parent."""
+        if os.getenv("PDF_SPLIT_ENABLED", "true").lower() != "true":
+            options["start_page_id"] = options.get("start_page") or 0
+            options["end_page_id"] = options.get("end_page")
             return False
+
+        if task.get("is_parent") and int(task.get("child_count") or 0) > 0:
+            logger.warning(
+                f"⚠️ Existing split parent {task_id} will be handled by child/merge reconciliation"
+            )
+            return True
+        current_task = self.task_db.get_task(task_id) if hasattr(self.task_db, "get_task") else task
+        if current_task and current_task.get("is_parent") and int(current_task.get("child_count") or 0) > 0:
+            logger.warning(
+                f"⚠️ Existing split parent {task_id} will be handled by child/merge reconciliation"
+            )
+            return True
+
+        from utils.pdf_utils import get_pdf_page_count, split_pdf_file
+
+        threshold = int(os.getenv("PDF_SPLIT_THRESHOLD_PAGES", "50"))
+        chunk_size = int(os.getenv("PDF_SPLIT_CHUNK_SIZE", "50"))
+        total_pages = get_pdf_page_count(Path(file_path))
+        start_page = options.get("start_page")
+        end_page = options.get("end_page")
+        start_page = 0 if start_page is None else int(start_page)
+        end_page = total_pages - 1 if end_page is None else int(end_page)
+        if start_page < 0 or end_page < start_page or end_page >= total_pages:
+            raise ValueError(
+                f"invalid inclusive page range {start_page}-{end_page} for {total_pages} pages"
+            )
+
+        effective_pages = end_page - start_page + 1
+        if effective_pages <= threshold:
+            options["start_page_id"] = start_page
+            options["end_page_id"] = end_page
+            return False
+
+        split_root = Path(self.output_dir) / "splits"
+        split_root.mkdir(parents=True, exist_ok=True)
+        split_dir = split_root / task_id
+        staging_dir = split_root / f".{task_id}.split-{os.getpid()}-{uuid.uuid4().hex}"
+        logger.info(
+            f"🔀 Splitting PDF range {start_page + 1}-{end_page + 1} "
+            f"({effective_pages}/{total_pages} pages)"
+        )
+        try:
+            chunks = split_pdf_file(
+                Path(file_path), staging_dir, chunk_size, task_id,
+                start_page=start_page, end_page=end_page,
+            )
+            if not chunks:
+                raise RuntimeError("PDF split produced no chunks")
+            for index, chunk in enumerate(chunks):
+                chunk["index"] = index
+                chunk["file_name"] = (
+                    f"{Path(file_path).stem}_p{chunk['start_page']}-{chunk['end_page']}.pdf"
+                )
+
+            # Publish the fully validated file set before committing task rows.
+            # Preserve an orphaned pre-DB directory for operator inspection.
+            if split_dir.exists():
+                orphan = split_root / f".{task_id}.orphan-{uuid.uuid4().hex}"
+                os.replace(split_dir, orphan)
+                logger.warning(f"Preserved orphaned split directory at {orphan}")
+            os.replace(staging_dir, split_dir)
+            for chunk in chunks:
+                chunk["path"] = str(split_dir / Path(chunk["path"]).name)
+
+            parent_options = dict(options)
+            parent_options["split_info"] = {
+                "schema_version": 1,
+                "source_total_pages": total_pages,
+                "start_page": start_page,
+                "end_page": end_page,
+                "processed_pages": effective_pages,
+                "chunk_size": chunk_size,
+                "child_count": len(chunks),
+            }
+            self.task_db.create_split_children_atomic(
+                task_id,
+                chunks,
+                backend=task.get("backend", "auto"),
+                parent_options=parent_options,
+                priority=task.get("priority", 0),
+                user_id=task.get("user_id"),
+            )
+            logger.info(f"✂️ Split into {len(chunks)} validated subtasks")
+            return True
+        except Exception:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            raise
 
     def _merge_parent_task_results(self, parent_task_id):
         return merge_parent_task_results(
@@ -1114,7 +1188,7 @@ class MinerUWorkerAPI(ls.LitAPI):
             output_dir=self.output_dir,
             merge_owner=self.worker_id,
             ensure_pdf_in_output=self._ensure_pdf_in_output,
-            cleanup_child_files=True,
+            cleanup_child_files=False,
         )
 
     def _cleanup_child_task_files(self, children):
