@@ -14,7 +14,8 @@ def run_bash(script: str, tmp_path: Path) -> subprocess.CompletedProcess[str]:
         {
             "TIANSHU_SH_SOURCE_ONLY": "1",
             "TIANSHU_PROC_ROOT": str(tmp_path / "proc"),
-            "INSTANCE_ID": "pytest-instance",
+            "INSTANCE_ID": "ignored-instance",
+            "TIANSHU_INSTANCE_ID": "pytest-instance",
         }
     )
     return subprocess.run(
@@ -33,6 +34,18 @@ def fake_proc(tmp_path: Path, pid: int, state: str, argv: list[str]) -> None:
     proc_dir.mkdir(parents=True)
     (proc_dir / "status").write_text(f"Name:\ttest\nState:\t{state} (test)\n")
     (proc_dir / "cmdline").write_bytes(b"\0".join(arg.encode() for arg in argv) + b"\0")
+    instance_dir = "/share/wangjiong/databases/mineru_database/pytest-instance"
+    environ = {
+        "INSTANCE_ID": "pytest-instance",
+        "DATABASE_PATH": f"{instance_dir}/mineru_tianshu.db",
+        "OUTPUT_PATH": f"{instance_dir}/mineru_outputs",
+        "UPLOAD_PATH": f"{instance_dir}/mineru_uploads",
+        "API_PORT": "8000",
+        "MCP_PORT": "8002",
+    }
+    (proc_dir / "environ").write_bytes(
+        b"\0".join(f"{key}={value}".encode() for key, value in environ.items()) + b"\0"
+    )
     (proc_dir / "stat").write_text(
         f"{pid} (test) {state} " + " ".join(["0"] * 18) + f" {pid * 100}\n"
     )
@@ -272,7 +285,7 @@ class TianshuProcessStatusTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), '["http://localhost:30027/v1"]')
 
-    def test_worker_vllm_api_list_ring3_uses_all_local_endpoints(self) -> None:
+    def test_worker_vllm_api_list_ring3_uses_all_active_local_endpoints(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             result = run_bash(
@@ -283,7 +296,7 @@ class TianshuProcessStatusTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             result.stdout.strip(),
-            '["http://localhost:30025/v1","http://localhost:30026/v1","http://localhost:30027/v1","http://localhost:30028/v1","http://localhost:30029/v1","http://localhost:30030/v1","http://localhost:30031/v1","http://localhost:30032/v1"]',
+            '["http://localhost:30025/v1","http://localhost:30026/v1","http://localhost:30027/v1","http://localhost:30028/v1"]',
         )
 
 
@@ -403,7 +416,7 @@ class TianshuProcessStatusTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(), ["throughput", "balanced"])
-        self.assertEqual(SCRIPT.read_text().count('--performance-mode ${performance_mode}'), 2)
+        self.assertEqual(SCRIPT.read_text().count('--performance-mode ${performance_mode}'), 1)
 
     def test_vllm_max_batched_tokens_uses_per_npu_override(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -418,7 +431,7 @@ class TianshuProcessStatusTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(), ["8192", "4096"])
-        self.assertEqual(SCRIPT.read_text().count('--max-num-batched-tokens ${max_num_batched_tokens}'), 2)
+        self.assertEqual(SCRIPT.read_text().count('--max-num-batched-tokens ${max_num_batched_tokens}'), 1)
 
     def test_restart_compute_refuses_ring3_without_stopping_services(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -429,7 +442,7 @@ class TianshuProcessStatusTests(unittest.TestCase):
                 'stop_vllm_instance() { echo stop_vllm; }; '
                 'start_vllm_instance() { echo start_vllm; }; '
                 'start_worker_instance() { echo start_worker; }; '
-                'VLLM_ENDPOINT_STRATEGY=ring3 restart_compute_instance 4',
+                'VLLM_ENDPOINT_STRATEGY=ring3 restart_compute_instance 3',
                 tmp_path,
             )
 
@@ -450,7 +463,7 @@ class TianshuProcessStatusTests(unittest.TestCase):
                 'stop_vllm_instance() { echo stop_vllm; }; '
                 'start_vllm_instance() { echo start_vllm; }; '
                 'start_worker_instance() { echo start_worker; }; '
-                'VLLM_ENDPOINT_STRATEGY=local restart_compute_instance 4',
+                'VLLM_ENDPOINT_STRATEGY=local restart_compute_instance 3',
                 tmp_path,
             )
 
@@ -471,7 +484,7 @@ class TianshuProcessStatusTests(unittest.TestCase):
                 'stop_vllm_instance() { echo stop_vllm; }; '
                 'start_vllm_instance() { echo start_vllm; }; '
                 'start_worker_instance() { echo start_worker; }; '
-                'VLLM_ENDPOINT_STRATEGY=local restart_compute_instance 4',
+                'VLLM_ENDPOINT_STRATEGY=local restart_compute_instance 3',
                 tmp_path,
             )
 
@@ -680,7 +693,7 @@ class TianshuProcessStatusTests(unittest.TestCase):
             implementation.index('stop_vllm_instance "$i"'),
         )
 
-    def test_node_supervisor_owns_control_and_all_compute_supervisors(self) -> None:
+    def test_node_supervisor_owns_control_and_active_compute_supervisors(self) -> None:
         text = SCRIPT.read_text()
         start = text.index("supervise_node()")
         end = text.index("supervise_compute_instance()", start)
@@ -690,7 +703,7 @@ class TianshuProcessStatusTests(unittest.TestCase):
         self.assertIn('start_api', implementation)
         self.assertIn('cmd_supervise control &', implementation)
         self.assertIn('supervise_compute_instance "$i" &', implementation)
-        self.assertIn('while [ "$i" -lt "$VLLM_NUM_INSTANCES" ]', implementation)
+        self.assertIn('for i in $(active_instance_indices)', implementation)
         self.assertIn('wait -n', implementation)
         self.assertIn('cleanup_node_supervisor', implementation)
 
@@ -968,9 +981,9 @@ class TianshuProcessStatusTests(unittest.TestCase):
             implementation.index('if ! pid_matches "$worker_pid"'),
         )
 
-    def test_reconciler_hook_is_valid_and_limited_to_control_supervise(self) -> None:
+    def test_reconciler_is_a_managed_persistent_service(self) -> None:
         text = SCRIPT.read_text()
-        start = text.index("run_parent_merge_reconciler()")
+        start = text.index("start_parent_merge_reconciler()")
         end = text.index("cmd_configure()", start)
         implementation = text[start:end]
         cmd_start = text[text.index("cmd_start()"):text.index("cmd_stop()")]
@@ -979,16 +992,80 @@ class TianshuProcessStatusTests(unittest.TestCase):
         cmd_supervise = text[text.index("cmd_supervise()"):text.index("cmd_status()")]
 
         self.assertIn('reconcile_parent_merges.py', implementation)
-        self.assertIn('args=(--report-json)', implementation)
-        self.assertIn('args+=(--apply)', implementation)
-        self.assertIn('PARENT_MERGE_RECONCILE_APPLY:-false', implementation)
-        self.assertNotIn('--lifecycle', implementation)
-        self.assertNotIn('--apply "$apply"', implementation)
-        self.assertNotIn('run_parent_merge_reconciler', cmd_start)
-        self.assertNotIn('run_parent_merge_reconciler', cmd_stop)
-        self.assertNotIn('run_parent_merge_reconciler', cmd_status)
-        self.assertIn('run_parent_merge_reconciler', cmd_supervise)
+        self.assertIn('--apply --watch --report-json', implementation)
+        self.assertIn('--child-retention-hours', implementation)
+        self.assertIn('start_parent_merge_reconciler', cmd_start)
+        self.assertIn('stop_parent_merge_reconciler', cmd_stop)
+        self.assertIn('status_parent_merge_reconciler', cmd_status)
+        self.assertIn('start_parent_merge_reconciler', cmd_supervise)
 
+
+    def test_instance_defaults_to_fixed_production_id_and_ignores_generic_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_bash('printf "%s\n%s\n" "$INSTANCE_ID" "$INSTANCE_DATA_DIR"', Path(tmp))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.splitlines(),
+            [
+                "pytest-instance",
+                "/share/wangjiong/databases/mineru_database/pytest-instance",
+            ],
+        )
+
+    def test_default_active_instances_are_zero_through_three(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_bash('active_instance_indices', Path(tmp))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "0 1 2 3")
+
+    def test_api_status_rejects_healthy_http_when_pid_identity_is_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            api_dir = tmp_path / "api"
+            api_dir.mkdir()
+            (api_dir / "api.pid").write_text("999")
+            result = run_bash(
+                f'API_LOG_DIR="{api_dir}"; curl() {{ return 0; }}; port_listener_pids() {{ :; }}; status_api',
+                tmp_path,
+            )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("未运行", result.stdout)
+
+    def test_api_status_reports_owned_listener_with_stale_pid_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            fake_proc(tmp_path, 801, "S", ["/env/bin/python", "api_server.py"])
+            api_dir = tmp_path / "api"
+            api_dir.mkdir()
+            (api_dir / "api.pid").write_text("999")
+            result = run_bash(
+                f'API_LOG_DIR="{api_dir}"; port_listener_pids() {{ echo 801; }}; status_api',
+                tmp_path,
+            )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("PID 文件缺失/失效", result.stdout)
+
+    def test_restart_core_stops_controllers_before_api_and_workers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            result = run_bash(
+                'init_dirs() { :; }; source_ascend_env() { :; }; validate_active_instance_indices() { :; }; '
+                'check_instance_conflict() { :; }; status_redis() { :; }; vllm_is_running() { :; }; vllm_http_ready() { :; }; '
+                'stop_watchdog() { echo stop_watchdog; }; stop_scheduler() { echo stop_scheduler; }; '
+                'stop_parent_merge_reconciler() { echo stop_reconciler; }; stop_api() { echo stop_api; }; '
+                'mark_worker_drain() { echo mark_$1; }; wait_worker_drain() { echo wait_$1; }; '
+                'stop_worker_instance() { echo stop_worker_$1; }; start_api() { echo start_api; }; '
+                'start_worker_instance() { echo start_worker_$1; }; wait_worker_instance_ready() { :; }; '
+                'start_parent_merge_reconciler() { echo start_reconciler; }; start_scheduler() { echo start_scheduler; }; '
+                'start_watchdog() { echo start_watchdog; }; cmd_status() { echo strict_$1; }; restart_core',
+                tmp_path,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = result.stdout.splitlines()
+        self.assertLess(lines.index("stop_watchdog"), lines.index("stop_api"))
+        self.assertLess(lines.index("stop_api"), lines.index("mark_0"))
+        self.assertLess(lines.index("stop_worker_3"), lines.index("start_api"))
+        self.assertIn("strict_--strict", lines)
 
 if __name__ == "__main__":
     unittest.main()

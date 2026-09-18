@@ -3,14 +3,15 @@
 # MinerU Tianshu - 统一启动脚本
 # ============================================================================
 #
-# 8卡NPU裸机部署完整生命周期管理
-# 启动顺序: VLLM(8实例) → API Server → Workers(8个) → Frontend
+# NPU 裸机部署完整生命周期管理（默认只激活 NPU/Worker 0-3）
+# 启动顺序: VLLM(active) → API Server → Workers(active) → Controllers → Frontend
 #
 # 使用方式:
 #   bash scripts/tianshu.sh start [vllm|api|worker|frontend]  # 启动服务
 #   bash scripts/tianshu.sh stop  [vllm|api|worker|frontend]  # 停止服务
 #   bash scripts/tianshu.sh restart [vllm|api|worker|frontend|mcp|all]  # 重启服务
-#   bash scripts/tianshu.sh status                            # 查看状态
+#   bash scripts/tianshu.sh restart core                      # 安全重启 API/Workers/控制器
+#   bash scripts/tianshu.sh status --strict                   # 严格检查核心服务
 #   bash scripts/tianshu.sh logs  [vllm|worker|api|frontend]  # 查看日志
 #   bash scripts/tianshu.sh test                              # 端到端验证
 #
@@ -28,6 +29,7 @@ PROJECT_ROOT="/data/projects/mineru/mineru-tianshu"
 VLLM_MODEL_PATH="/share/wangjiong/model_zoo/modelscope/models/OpenDataLab/MinerU2___5-Pro-2605-1___2B"
 VLLM_BASE_PORT=30025
 VLLM_NUM_INSTANCES="${VLLM_NUM_INSTANCES:-8}"
+MINERU_ACTIVE_INSTANCE_INDICES="${MINERU_ACTIVE_INSTANCE_INDICES:-0,1,2,3}"
 VLLM_MAX_MODEL_LEN=8192
 VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.60}" # 实测 c8 峰值 HBM < 86%，为 8 个任务进程保留安全余量
 VLLM_PERFORMANCE_MODE="${VLLM_PERFORMANCE_MODE:-throughput}" # 吞吐模式实测比 balanced 提升约 11%；可用 NPU<n> 覆盖
@@ -72,7 +74,10 @@ FRONTEND_PORT=3000
 
 # 路径配置 —— 按实例隔离(集群多实例共享 /share 时,各实例在 DATA_ROOT/<实例名>/ 下独立存放)
 DATA_ROOT="/share/wangjiong/databases/mineru_database"
-INSTANCE_ID="${INSTANCE_ID:-$(hostname)}"               # 实例标识,默认主机名/pod 名;可 export 覆盖
+# 生产数据目录必须稳定，不能随 Pod hostname 或调用方遗留的 INSTANCE_ID 漂移。
+# 如确需部署隔离环境，只允许通过专用变量显式覆盖。
+INSTANCE_ID="${TIANSHU_INSTANCE_ID:-mineru-runner-worker-0}"
+export INSTANCE_ID
 INSTANCE_DATA_DIR="${DATA_ROOT}/${INSTANCE_ID}"         # 本实例的独立数据目录
 
 # 可写数据路径(按实例隔离)
@@ -80,6 +85,7 @@ DATABASE_PATH="${INSTANCE_DATA_DIR}/mineru_tianshu.db"
 OUTPUT_PATH="${INSTANCE_DATA_DIR}/mineru_outputs"
 UPLOAD_PATH="${INSTANCE_DATA_DIR}/mineru_uploads"
 LOG_DIR="${INSTANCE_DATA_DIR}/mineru_logs"
+export INSTANCE_DATA_DIR DATABASE_PATH OUTPUT_PATH UPLOAD_PATH LOG_DIR
 RUNTIME_CONFIG_DIR="${RUNTIME_CONFIG_DIR:-${INSTANCE_DATA_DIR}/runtime_config}"
 # Triton kernel JIT 编译缓存根目录(按实例隔离)。
 # 每个 vLLM 实例分配独立子目录(npu0, npu1, ...)，避免多实例并发编译同一 kernel 时
@@ -107,6 +113,7 @@ VLLM_LOG_DIR="${LOG_DIR}/vllm"
 WORKER_LOG_DIR="${LOG_DIR}/worker"
 API_LOG_DIR="${LOG_DIR}/api"
 SCHEDULER_LOG_DIR="${LOG_DIR}/scheduler"
+MERGE_LOG_DIR="${LOG_DIR}/parent_merge"
 WORKER_RUNTIME_DIR="${WORKER_RUNTIME_DIR:-/tmp/mineru_tianshu/${INSTANCE_ID}}"
 SUPERVISED_WORKER_RESTART_TIMEOUT_SECONDS="${SUPERVISED_WORKER_RESTART_TIMEOUT_SECONDS:-600}"
 
@@ -175,6 +182,54 @@ pid_cmdline() {
     local cmdline_file="${proc_root}/${pid}/cmdline"
     [ -r "$cmdline_file" ] || return 1
     { tr '\0' ' ' < "$cmdline_file"; } 2>/dev/null
+}
+
+pid_env_value() {
+    local pid="$1"
+    local key="$2"
+    local proc_root="${TIANSHU_PROC_ROOT:-/proc}"
+    local environ_file="${proc_root}/${pid}/environ"
+    [ -r "$environ_file" ] || return 1
+    tr '\0' '\n' < "$environ_file" 2>/dev/null | sed -n "s/^${key}=//p" | head -1
+}
+
+pid_env_matches() {
+    [ "$(pid_env_value "$1" "$2")" = "$3" ]
+}
+
+pid_owns_instance_data() {
+    local pid="$1"
+    pid_env_matches "$pid" INSTANCE_ID "$INSTANCE_ID" &&
+        pid_env_matches "$pid" DATABASE_PATH "$DATABASE_PATH" &&
+        pid_env_matches "$pid" OUTPUT_PATH "$OUTPUT_PATH"
+}
+pid_file_owns_instance() {
+    local pid_file="$1" expected="$2" expected_port="${3:-}" pid
+    pid="$(cat "$pid_file" 2>/dev/null)"
+    pid_matches "$pid" "$expected" "$expected_port" && pid_owns_instance_data "$pid"
+}
+
+
+instance_index_active() {
+    local wanted="$1"
+    case ",${MINERU_ACTIVE_INSTANCE_INDICES}," in
+        *",${wanted},"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+active_instance_indices() {
+    printf '%s\n' "$MINERU_ACTIVE_INSTANCE_INDICES" | tr ',' ' '
+}
+
+validate_active_instance_indices() {
+    local i
+    for i in $(active_instance_indices); do
+        worker_index_valid "$i" && vllm_index_valid "$i" || {
+            log_error "MINERU_ACTIVE_INSTANCE_INDICES 包含无效编号: $i"
+            return 1
+        }
+    done
 }
 
 pid_state() {
@@ -262,7 +317,7 @@ terminate_pid_file() {
 # ============================================================================
 
 init_dirs() {
-    mkdir -p "$VLLM_LOG_DIR" "$WORKER_LOG_DIR" "$API_LOG_DIR" "$SCHEDULER_LOG_DIR" \
+    mkdir -p "$VLLM_LOG_DIR" "$WORKER_LOG_DIR" "$API_LOG_DIR" "$SCHEDULER_LOG_DIR" "$MERGE_LOG_DIR" \
              "$RUNTIME_CONFIG_DIR" "$OUTPUT_PATH" "$UPLOAD_PATH" \
              "${PROJECT_ROOT}/data/db" "${PROJECT_ROOT}/models"
 }
@@ -274,28 +329,36 @@ init_dirs() {
 check_instance_conflict() {
     local dir="$INSTANCE_DATA_DIR"
     local lockfile="${dir}/.instance.lock"
+    local current_host current_boot owner_instance owner_host owner_boot
+    current_host="$(hostname)"
+    current_boot="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)"
     mkdir -p "$dir"
     if [ -f "$lockfile" ]; then
-        local owner
-        owner=$(head -1 "$lockfile" 2>/dev/null)
-        if [ -n "$owner" ] && [ "$owner" != "$INSTANCE_ID" ]; then
-            log_error "数据目录已被其他实例占用,中止启动"
-            log_error "  目录:       $dir"
-            log_error "  占用实例:   $owner"
-            log_error "  本实例:     $INSTANCE_ID"
-            log_error "解决方法:"
-            log_error "  1) 本实例使用唯一 INSTANCE_ID(默认即 hostname),无需额外设置"
-            log_error "  2) 若 '$owner' 已确认停止,删除残留锁:  rm $lockfile"
+        owner_instance="$(sed -n 's/^instance_id=//p' "$lockfile" | head -1)"
+        owner_host="$(sed -n 's/^host=//p' "$lockfile" | head -1)"
+        owner_boot="$(sed -n 's/^boot_id=//p' "$lockfile" | head -1)"
+        # 兼容升级前只有一行 INSTANCE_ID 的锁；本次成功启动会升级格式。
+        [ -n "$owner_instance" ] || owner_instance="$(head -1 "$lockfile" 2>/dev/null)"
+        if [ -n "$owner_instance" ] && { [ "$owner_instance" != "$INSTANCE_ID" ] ||
+           { [ -n "$owner_host" ] && { [ "$owner_host" != "$current_host" ] || [ "$owner_boot" != "$current_boot" ]; }; }; }; then
+            log_error "数据目录已被另一服务节点占用,中止启动"
+            log_error "  目录: ${dir}"
+            log_error "  所有者: ${owner_instance}@${owner_host:-legacy} (boot=${owner_boot:-unknown})"
+            log_error "  当前端: ${INSTANCE_ID}@${current_host} (boot=${current_boot})"
+            log_error "仅在确认原服务节点已经停止后，才可删除残留锁: $lockfile"
             return 1
         fi
     fi
-    echo "$INSTANCE_ID" > "$lockfile"     # 写入/更新本实例锁
-    return 0
+    printf 'instance_id=%s\nhost=%s\nboot_id=%s\n' "$INSTANCE_ID" "$current_host" "$current_boot" > "$lockfile"
 }
 
 release_instance_lock() {
     local lockfile="${INSTANCE_DATA_DIR}/.instance.lock"
-    if [ -f "$lockfile" ] && [ "$(head -1 "$lockfile" 2>/dev/null)" = "$INSTANCE_ID" ]; then
+    local current_host owner_instance owner_host
+    current_host="$(hostname)"
+    owner_instance="$(sed -n 's/^instance_id=//p' "$lockfile" 2>/dev/null | head -1)"
+    owner_host="$(sed -n 's/^host=//p' "$lockfile" 2>/dev/null | head -1)"
+    if [ "$owner_instance" = "$INSTANCE_ID" ] && [ "$owner_host" = "$current_host" ]; then
         rm -f "$lockfile"
     fi
 }
@@ -550,6 +613,7 @@ wait_vllm_instance_ready() {
 start_vllm_instance() {
     local i="$1"
     vllm_index_valid "$i" || { log_error "无效 VLLM 编号: $i"; return 1; }
+    instance_index_active "$i" || { log_error "VLLM #${i} 未包含在 MINERU_ACTIVE_INSTANCE_INDICES=${MINERU_ACTIVE_INSTANCE_INDICES}"; return 1; }
 
     local port=$((VLLM_BASE_PORT + i))
     local log_file="${VLLM_LOG_DIR}/vllm_npu${i}_port${port}.log"
@@ -718,116 +782,15 @@ stop_vllm_instance() {
 # ============================================================================
 
 start_vllm() {
-    log_step "启动 VLLM 服务 (${VLLM_NUM_INSTANCES} 个实例)"
-
-    local started=0
-    for i in $(seq 0 $((VLLM_NUM_INSTANCES - 1))); do
-        local port=$((VLLM_BASE_PORT + i))
-        local log_file="${VLLM_LOG_DIR}/vllm_npu${i}_port${port}.log"
-        local pid_file="${VLLM_LOG_DIR}/vllm_npu${i}.pid"
-        local gpu_memory_utilization
-        local performance_mode
-        local max_num_batched_tokens
-        gpu_memory_utilization="$(vllm_gpu_memory_utilization_for "$i")"
-        performance_mode="$(vllm_performance_mode_for "$i")"
-        max_num_batched_tokens="$(vllm_max_num_batched_tokens_for "$i")"
-
-        # 跳过已运行的实例(端口检测优先:实例隔离使 pid 文件分目录存放,
-        # 仅靠 pid 文件会误判"未运行"而重复启动 vllm;端口已就绪即视为在运行)
-        if curl -s "http://localhost:${port}/v1/models" > /dev/null 2>&1; then
-            log_info "VLLM #${i} (NPU=${i}, Port=${port}) 已在运行"
-            started=$((started + 1))
-            continue
-        fi
-        if pid_file_matches "$pid_file" "vllm.*serve.*${VLLM_MODEL_PATH}" "$port"; then
-            log_info "VLLM #${i} (NPU=${i}, Port=${port}) 进程存在但端口未就绪,等待中"
-            started=$((started + 1))
-            continue
-        fi
-        rm -f "$pid_file"
-
-        log_info "启动 VLLM #${i}: NPU=${i}, Port=${port}"
-
-        local triton_cache_dir="${TRITON_CACHE_ROOT}/npu${i}"
-        mkdir -p "$triton_cache_dir"
-        local vllm_tmp_dir="/tmp/vllm_tmp_npu${i}"
-        mkdir -p "$vllm_tmp_dir"
-        # vLLM AOT 编译缓存:per-NPU 子目录,避免 8 实例并发写同一 hash 目录
-        local vllm_cache_dir="${VLLM_CACHE_ROOT}/npu${i}"
-        mkdir -p "$vllm_cache_dir"
-
-        nohup bash -lc "
-            # 兜底:显式 source CANN 环境(防 bash -lc 新开登录 shell 时 profile 没配)
-            [ -f '${ASCEND_SET_ENV}' ] && source '${ASCEND_SET_ENV}' >/dev/null 2>&1 || true
-            [ -f '${ASCEND_ATB_SET_ENV}' ] && source '${ASCEND_ATB_SET_ENV}' >/dev/null 2>&1 || true
-            # 兜底:vllm-ascend custom 算子库(让 LD_LIBRARY_PATH 找到 libcust_opapi.so)
-            if [ -d '${VLLM_ASCEND_VENDOR_DIR}/op_api/lib' ]; then
-                case \":\$LD_LIBRARY_PATH:\" in
-                    *\":${VLLM_ASCEND_VENDOR_DIR}/op_api/lib:\"*) ;;
-                    *) export LD_LIBRARY_PATH='${VLLM_ASCEND_VENDOR_DIR}/op_api/lib':\$LD_LIBRARY_PATH ;;
-                esac
-                case \":\$ASCEND_CUSTOM_OPP_PATH:\" in
-                    *\":${VLLM_ASCEND_VENDOR_DIR}:\"*) ;;
-                    *) export ASCEND_CUSTOM_OPP_PATH='${VLLM_ASCEND_VENDOR_DIR}':\$ASCEND_CUSTOM_OPP_PATH ;;
-                esac
-            fi
-            export ASCEND_VISIBLE_DEVICES='${i}'
-            export ASCEND_RT_VISIBLE_DEVICES='${i}'
-            export DEVICE_ID=0
-            export ASCEND_DEVICE_ID=0
-            export TRITON_CACHE_DIR='${triton_cache_dir}'
-            export VLLM_CACHE_ROOT='${vllm_cache_dir}'
-            export TMPDIR='${vllm_tmp_dir}'
-            exec ${VLLM_BIN} serve '${VLLM_MODEL_PATH}' \
-                --host 0.0.0.0 \
-                --tensor-parallel-size 1 \
-                --port ${port} \
-                --max-model-len ${VLLM_MAX_MODEL_LEN} \
-                --gpu-memory-utilization ${gpu_memory_utilization} \
-                --performance-mode ${performance_mode} \
-                --max-num-batched-tokens ${max_num_batched_tokens} \
-                --dtype float16 \
-                --trust-remote-code
-        " > "$log_file" 2>&1 &
-
-        local pid=$!
-        echo "$pid" > "$pid_file"
-        sleep 2
-
-        if pid_matches "$pid" "vllm.*serve.*${VLLM_MODEL_PATH}" "$port"; then
-            log_info "VLLM #${i} 已启动 (PID: $pid)"
-            started=$((started + 1))
-        else
-            log_error "VLLM #${i} 启动失败，查看: $log_file"
-        fi
+    validate_active_instance_indices || return 1
+    log_step "启动 VLLM 服务 (激活实例: ${MINERU_ACTIVE_INSTANCE_INDICES})"
+    local i started=0 failed=0 expected=0
+    for i in $(active_instance_indices); do
+        expected=$((expected + 1))
+        if start_vllm_instance "$i"; then started=$((started + 1)); else failed=$((failed + 1)); fi
     done
-
-    log_info "VLLM 启动完成: ${started}/${VLLM_NUM_INSTANCES}"
-
-    if [ "$started" -lt "$VLLM_NUM_INSTANCES" ]; then
-        log_warn "部分 VLLM 实例未启动成功，等待初始化..."
-    fi
-
-    # 健康检查
-    log_info "等待 VLLM 健康检查..."
-    local healthy=0
-    for round in $(seq 1 $((VLLM_READY_TIMEOUT / 10))); do
-        healthy=0
-        for i in $(seq 0 $((VLLM_NUM_INSTANCES - 1))); do
-            local port=$((VLLM_BASE_PORT + i))
-            if curl -s "http://localhost:${port}/v1/models" > /dev/null 2>&1; then
-                healthy=$((healthy + 1))
-            fi
-        done
-        if [ "$healthy" -eq "$VLLM_NUM_INSTANCES" ]; then
-            log_info "所有 ${VLLM_NUM_INSTANCES} 个 VLLM 实例就绪"
-            return 0
-        fi
-        echo -n "."
-        sleep 10
-    done
-    echo ""
-    log_warn "VLLM 健康检查超时(${VLLM_READY_TIMEOUT}s): ${healthy}/${VLLM_NUM_INSTANCES} 就绪 (部分可能仍在初始化;可调大 VLLM_READY_TIMEOUT)"
+    log_info "VLLM 启动完成: ${started}/${expected}"
+    [ "$failed" -eq 0 ]
 }
 
 stop_vllm() {
@@ -846,23 +809,65 @@ stop_vllm() {
 }
 
 status_vllm() {
-    echo -e "${CYAN}VLLM 服务 (${VLLM_NUM_INSTANCES} 个实例)${NC}"
-    local running=0
+    echo -e "${CYAN}VLLM 服务 (激活: ${MINERU_ACTIVE_INSTANCE_INDICES})${NC}"
+    local i port pid_file running=0 required=0 failed=0
     for i in $(seq 0 $((VLLM_NUM_INSTANCES - 1))); do
-        local port=$((VLLM_BASE_PORT + i))
-        local pid_file="${VLLM_LOG_DIR}/vllm_npu${i}.pid"
-        if pid_file_matches "$pid_file" "vllm.*serve.*${VLLM_MODEL_PATH}" "$port"; then
-            if curl -s "http://localhost:${port}/v1/models" > /dev/null 2>&1; then
-                echo "  ✅ NPU ${i} (Port ${port}) - 运行中"
-                running=$((running + 1))
+        port=$((VLLM_BASE_PORT + i)); pid_file="${VLLM_LOG_DIR}/vllm_npu${i}.pid"
+        if ! instance_index_active "$i"; then
+            echo "  ⏹️  NPU ${i} (Port ${port}) - 未配置"
+        elif pid_file_matches "$pid_file" "vllm.*serve.*${VLLM_MODEL_PATH}" "$port"; then
+            required=$((required + 1))
+            if vllm_http_ready "$i"; then
+                echo "  ✅ NPU ${i} (Port ${port}) - 运行中"; running=$((running + 1))
             else
-                echo "  ⏳ NPU ${i} (Port ${port}) - 初始化中"
+                echo "  ⏳ NPU ${i} (Port ${port}) - 初始化中"; failed=1
             fi
         else
-            echo "  ❌ NPU ${i} (Port ${port}) - 已停止"
+            required=$((required + 1)); failed=1
+            echo "  ❌ NPU ${i} (Port ${port}) - 已停止或 PID 身份不匹配"
         fi
     done
-    echo "  运行中: ${running}/${VLLM_NUM_INSTANCES}"
+    echo "  运行中: ${running}/${required} 个激活实例"
+    return "$failed"
+}
+
+port_listener_pids() {
+    local port="$1"
+    if command -v ss >/dev/null 2>&1; then
+        ss -ltnp 2>/dev/null | awk -v p=":${port}" '$4 ~ (p "$") {print}' | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | sort -u
+    elif command -v lsof >/dev/null 2>&1; then
+        lsof -nP -t -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | sort -u
+    fi
+}
+
+api_process_matches() {
+    local pid="$1"
+    pid_matches "$pid" "python.*api_server.py" && pid_owns_instance_data "$pid" &&
+        pid_env_matches "$pid" UPLOAD_PATH "$UPLOAD_PATH" && pid_env_matches "$pid" API_PORT "$API_PORT"
+}
+
+mcp_process_matches() {
+    local pid="$1"
+    pid_matches "$pid" "python.*mcp_server.py" && pid_owns_instance_data "$pid" &&
+        pid_env_matches "$pid" MCP_PORT "$MCP_PORT"
+}
+
+find_owned_listener() {
+    local port="$1" matcher="$2" pid
+    for pid in $(port_listener_pids "$port"); do
+        "$matcher" "$pid" && { echo "$pid"; return 0; }
+    done
+    return 1
+}
+
+terminate_owned_listener() {
+    local port="$1" matcher="$2" label="$3" pid elapsed
+    pid="$(find_owned_listener "$port" "$matcher")" || return 0
+    kill "$pid" 2>/dev/null || return 1
+    elapsed=0
+    while "$matcher" "$pid" && [ "$elapsed" -lt 10 ]; do sleep 1; elapsed=$((elapsed + 1)); done
+    if "$matcher" "$pid"; then kill -9 "$pid" 2>/dev/null || true; fi
+    if "$matcher" "$pid"; then log_error "${label} PID ${pid} 停止失败"; return 1; fi
 }
 
 # ============================================================================
@@ -871,71 +876,67 @@ status_vllm() {
 
 start_api() {
     log_step "启动 API Server (端口 ${API_PORT})"
-
-    local pid_file="${API_LOG_DIR}/api.pid"
-    local log_file="${API_LOG_DIR}/api.log"
-
-    # 跳过已运行的实例
-    if pid_file_matches "$pid_file" "python.*api_server.py"; then
-        log_info "API Server 已在运行 (PID: $(cat "$pid_file"))"
-        return 0
+    local pid_file="${API_LOG_DIR}/api.pid" log_file="${API_LOG_DIR}/api.log" pid
+    if [ -f "$pid_file" ] && api_process_matches "$(cat "$pid_file" 2>/dev/null)"; then
+        log_info "API Server 已在运行 (PID: $(cat "$pid_file"))"; return 0
     fi
-
-    cd "$BACKEND_DIR"
-
-    DATABASE_PATH="$DATABASE_PATH" \
-    OUTPUT_PATH="$OUTPUT_PATH" \
-    UPLOAD_PATH="$UPLOAD_PATH" \
-    API_PORT="$API_PORT" \
-    JWT_EXPIRE_MINUTES="$JWT_EXPIRE_MINUTES" \
-    REDIS_QUEUE_ENABLED="$REDIS_QUEUE_ENABLED" \
-    REDIS_HOST="$REDIS_HOST" \
-    REDIS_PORT="$REDIS_PORT" \
-    REDIS_DB="$REDIS_DB" \
-    REDIS_PASSWORD="$REDIS_PASSWORD" \
-    REDIS_QUEUE_KEY="$REDIS_QUEUE_KEY" \
-    REDIS_PROCESSING_KEY="$REDIS_PROCESSING_KEY" \
-    REDIS_CLAIM_MAINTENANCE_KEY="$REDIS_CLAIM_MAINTENANCE_KEY" \
-    REDIS_CLAIM_PAUSE_KEY="$REDIS_CLAIM_PAUSE_KEY" \
-    SQLITE_QUEUE_FALLBACK="$SQLITE_QUEUE_FALLBACK" \
-    REDIS_TASK_TIMEOUT="$REDIS_TASK_TIMEOUT" \
-    nohup ${PYTHON_BIN} api_server.py > "$log_file" 2>&1 &
-
-    local pid=$!
-    echo "$pid" > "$pid_file"
-    log_info "API Server 启动中 (PID: $pid)..."
-
-    # 健康检查
-    for i in $(seq 1 30); do
-        if curl -s "http://localhost:${API_PORT}/docs" > /dev/null 2>&1; then
-            log_info "API Server 就绪 (端口 ${API_PORT})"
-            return 0
+    rm -f "$pid_file"
+    if pid="$(find_owned_listener "$API_PORT" api_process_matches)"; then
+        echo "$pid" > "$pid_file"
+        log_warn "API Server PID 文件已修复，接管现有目标进程 (PID: $pid)"
+        curl -fsS --max-time 5 "http://localhost:${API_PORT}/docs" >/dev/null 2>&1
+        return $?
+    fi
+    if [ -n "$(port_listener_pids "$API_PORT")" ]; then
+        log_error "端口 ${API_PORT} 已被非本实例 API 进程占用，拒绝启动"; return 1
+    fi
+    cd "$BACKEND_DIR" || return 1
+    DATABASE_PATH="$DATABASE_PATH" OUTPUT_PATH="$OUTPUT_PATH" UPLOAD_PATH="$UPLOAD_PATH" API_PORT="$API_PORT" \
+    JWT_EXPIRE_MINUTES="$JWT_EXPIRE_MINUTES" REDIS_QUEUE_ENABLED="$REDIS_QUEUE_ENABLED" REDIS_HOST="$REDIS_HOST" \
+    REDIS_PORT="$REDIS_PORT" REDIS_DB="$REDIS_DB" REDIS_PASSWORD="$REDIS_PASSWORD" REDIS_QUEUE_KEY="$REDIS_QUEUE_KEY" \
+    REDIS_PROCESSING_KEY="$REDIS_PROCESSING_KEY" REDIS_CLAIM_MAINTENANCE_KEY="$REDIS_CLAIM_MAINTENANCE_KEY" \
+    REDIS_CLAIM_PAUSE_KEY="$REDIS_CLAIM_PAUSE_KEY" SQLITE_QUEUE_FALLBACK="$SQLITE_QUEUE_FALLBACK" \
+    REDIS_TASK_TIMEOUT="$REDIS_TASK_TIMEOUT" nohup "$PYTHON_BIN" api_server.py > "$log_file" 2>&1 &
+    pid=$!; echo "$pid" > "$pid_file"
+    for _ in $(seq 1 30); do
+        if api_process_matches "$pid" && curl -fsS --max-time 5 "http://localhost:${API_PORT}/docs" >/dev/null 2>&1; then
+            log_info "API Server 就绪 (PID: $pid, 端口 ${API_PORT})"; return 0
         fi
-        echo -n "."
+        api_process_matches "$pid" || break
         sleep 2
     done
-    echo ""
-    log_error "API Server 启动超时，查看: $log_file"
-    return 1
+    log_error "API Server 启动失败或身份校验未通过，查看: $log_file"; return 1
 }
 
 stop_api() {
     log_step "停止 API Server"
-
-    local pid_file="${API_LOG_DIR}/api.pid"
-    if [ -f "$pid_file" ]; then
-        terminate_pid_file "$pid_file" "python.*api_server.py"
+    local pid_file="${API_LOG_DIR}/api.pid" pid
+    if [ -f "$pid_file" ] && api_process_matches "$(cat "$pid_file" 2>/dev/null)"; then
+        terminate_pid_file "$pid_file" "python.*api_server.py" || return 1
+    else
+        rm -f "$pid_file"
+        terminate_owned_listener "$API_PORT" api_process_matches "API Server" || return 1
     fi
     log_info "API Server 已停止"
 }
 
 status_api() {
     echo -e "${CYAN}API Server (端口 ${API_PORT})${NC}"
-    if curl -s "http://localhost:${API_PORT}/docs" > /dev/null 2>&1; then
-        echo "  ✅ 运行中 - http://localhost:${API_PORT}/docs"
-    else
-        echo "  ❌ 未运行"
+    local pid_file="${API_LOG_DIR}/api.pid" pid
+    if [ -f "$pid_file" ] && api_process_matches "$(cat "$pid_file" 2>/dev/null)"; then
+        pid="$(cat "$pid_file")"
+        if curl -fsS --max-time 5 "http://localhost:${API_PORT}/docs" >/dev/null 2>&1; then
+            echo "  ✅ 运行中 (PID: ${pid}) - http://localhost:${API_PORT}/docs"; return 0
+        fi
+        echo "  ⚠️  目标进程存在但健康检查失败 (PID: ${pid})"; return 1
     fi
+    if pid="$(find_owned_listener "$API_PORT" api_process_matches)"; then
+        echo "  ⚠️  目标进程运行中但 PID 文件缺失/失效 (PID: ${pid})；执行 start api 可接管"; return 1
+    fi
+    if [ -n "$(port_listener_pids "$API_PORT")" ]; then
+        echo "  ⚠️  端口被非本实例进程占用"; return 1
+    fi
+    echo "  ❌ 未运行"; return 1
 }
 
 # ============================================================================
@@ -949,13 +950,14 @@ start_mcp() {
     local log_file="${API_LOG_DIR}/mcp.log"
 
     # 跳过已运行的实例
-    if pid_file_matches "$pid_file" "python.*mcp_server.py"; then
+    if pid_file_owns_instance "$pid_file" "python.*mcp_server.py"; then
         log_info "MCP Server 已在运行 (PID: $(cat "$pid_file"))"
         return 0
     fi
 
     cd "$BACKEND_DIR"
 
+    INSTANCE_ID="$INSTANCE_ID" \
     DATABASE_PATH="$DATABASE_PATH" \
     OUTPUT_PATH="$OUTPUT_PATH" \
     API_BASE_URL="http://localhost:${API_PORT}" \
@@ -989,11 +991,12 @@ stop_mcp() {
 
 status_mcp() {
     echo -e "${CYAN}MCP Server (端口 ${MCP_PORT})${NC}"
-    if curl -s "http://localhost:${MCP_PORT}/mcp" > /dev/null 2>&1; then
-        echo "  ✅ 运行中 - http://0.0.0.0:${MCP_PORT}/mcp"
-    else
-        echo "  ❌ 未运行"
+    local pid_file="${API_LOG_DIR}/mcp.pid" pid
+    pid="$(cat "$pid_file" 2>/dev/null)"
+    if mcp_process_matches "$pid" && curl -sS --max-time 5 "http://localhost:${MCP_PORT}/mcp" >/dev/null 2>&1; then
+        echo "  ✅ 运行中 (PID: ${pid}) - http://0.0.0.0:${MCP_PORT}/mcp"; return 0
     fi
+    echo "  ❌ 未运行或进程实例身份不匹配"; return 1
 }
 
 # ============================================================================
@@ -1130,7 +1133,7 @@ worker_vllm_api_list() {
     if [ "${VLLM_ENDPOINT_STRATEGY:-local}" = "ring3" ]; then
         local out="["
         local sep=""
-        for n in $(seq 0 $((VLLM_NUM_INSTANCES - 1))); do
+        for n in $(active_instance_indices); do
             out="${out}${sep}\"http://localhost:$((VLLM_BASE_PORT + n))/v1\""
             sep=","
         done
@@ -1143,7 +1146,9 @@ worker_vllm_api_list() {
 worker_is_running() {
     local index="$1"
     local port=$((WORKER_BASE_PORT + index))
-    pid_file_matches "$(worker_pid_file "$index")" "$(worker_expected_cmd)" "$port"
+    local pid
+    pid="$(cat "$(worker_pid_file "$index")" 2>/dev/null)"
+    pid_matches "$pid" "$(worker_expected_cmd)" "$port" && pid_owns_instance_data "$pid"
 }
 
 pid_exists() {
@@ -1445,13 +1450,15 @@ start_workers() {
     local failed=0
 
     if [ -n "$target_index" ]; then
+        instance_index_active "$target_index" || { log_error "Worker #${target_index} 未包含在 MINERU_ACTIVE_INSTANCE_INDICES=${MINERU_ACTIVE_INSTANCE_INDICES}"; return 1; }
         log_step "启动 Worker #${target_index}"
         start_worker_instance "$target_index"
         return $?
     fi
 
-    log_step "启动 Workers (${WORKER_NUM_INSTANCES} 个独立进程)"
-    for i in $(seq 0 $((WORKER_NUM_INSTANCES - 1))); do
+    validate_active_instance_indices || return 1
+    log_step "启动 Workers (激活实例: ${MINERU_ACTIVE_INSTANCE_INDICES})"
+    for i in $(active_instance_indices); do
         if start_worker_instance "$i"; then
             started=$((started + 1))
         else
@@ -1459,7 +1466,7 @@ start_workers() {
         fi
     done
 
-    log_info "Worker 启动完成: ${started}/${WORKER_NUM_INSTANCES}"
+    log_info "Worker 启动完成: ${started} 个成功, ${failed} 个失败"
     [ "$failed" -eq 0 ]
 }
 
@@ -1530,6 +1537,15 @@ wait_worker_drain() {
     return 2
 }
 
+mark_worker_drain() {
+    local i="$1"
+    worker_index_valid "$i" || return 1
+    mkdir -p "$WORKER_RUNTIME_DIR" "$(worker_activity_dir "$i")"
+    echo "$(date +%s)" > "$(worker_drain_file "$i")"
+    echo "$(date +%s)" > "$(worker_disabled_file "$i")"
+    log_info "Worker #${i} 已标记 drain/disabled"
+}
+
 drain_worker_instance() {
     local i="$1"
     local wait_seconds="${2:-${DRAIN_WAIT_SECONDS:-300}}"
@@ -1574,6 +1590,7 @@ restart_compute_instance() {
 
     worker_index_valid "$i" || { log_error "无效 Worker 编号: $i"; return 1; }
     vllm_index_valid "$i" || { log_error "无效 VLLM 编号: $i"; return 1; }
+    instance_index_active "$i" || { log_error "Compute #${i} 未包含在 MINERU_ACTIVE_INSTANCE_INDICES=${MINERU_ACTIVE_INSTANCE_INDICES}"; return 1; }
     if [ "${VLLM_ENDPOINT_STRATEGY:-local}" = "ring3" ]; then
         log_error "restart compute ${i} 不支持 VLLM_ENDPOINT_STRATEGY=ring3；跨端点 worker 可能仍在使用该 vLLM"
         return 1
@@ -1600,23 +1617,29 @@ restart_compute_instance() {
 }
 
 status_workers() {
-    echo -e "${CYAN}Workers (${WORKER_NUM_INSTANCES} 个独立进程)${NC}"
-    local running=0
+    echo -e "${CYAN}Workers (激活: ${MINERU_ACTIVE_INSTANCE_INDICES})${NC}"
+    local i port running=0 required=0 failed=0
     for i in $(seq 0 $((WORKER_NUM_INSTANCES - 1))); do
-        local port=$((WORKER_BASE_PORT + i))
-        if [ -f "$(worker_drain_file "$i")" ]; then
+        port=$((WORKER_BASE_PORT + i))
+        if ! instance_index_active "$i"; then
+            echo "  ⏹️  Worker #${i} (Port ${port}) - 未配置"
+        elif [ -f "$(worker_drain_file "$i")" ]; then
+            required=$((required + 1)); failed=1
             echo "  ⏸️  Worker #${i} (Port ${port}) - Drain 中"
             worker_is_running "$i" && running=$((running + 1))
         elif [ -f "$(worker_disabled_file "$i")" ]; then
+            required=$((required + 1)); failed=1
             echo "  ⏹️  Worker #${i} (Port ${port}) - Disabled"
         elif worker_is_running "$i"; then
+            required=$((required + 1)); running=$((running + 1))
             echo "  ✅ Worker #${i} (Port ${port}) - 运行中"
-            running=$((running + 1))
         else
-            echo "  ❌ Worker #${i} (Port ${port}) - 已停止"
+            required=$((required + 1)); failed=1
+            echo "  ❌ Worker #${i} (Port ${port}) - 已停止或实例身份不匹配"
         fi
     done
-    echo "  运行中: ${running}/${WORKER_NUM_INSTANCES}"
+    echo "  运行中: ${running}/${required} 个激活实例"
+    return "$failed"
 }
 
 # ============================================================================
@@ -1629,7 +1652,7 @@ start_watchdog() {
     local pid_file="${WORKER_LOG_DIR}/watchdog.pid"
     local log_file="${WORKER_LOG_DIR}/watchdog.log"
 
-    if pid_file_matches "$pid_file" "tianshu-watchdog"; then
+    if pid_file_owns_instance "$pid_file" "tianshu-watchdog"; then
         log_info "Watchdog 已在运行 (PID: $(cat "$pid_file"))"
         return 0
     fi
@@ -1643,7 +1666,7 @@ start_watchdog() {
         WORKER_LOG_DIR="'"${WORKER_LOG_DIR}"'"
         WORKER_RUNTIME_DIR="'"${WORKER_RUNTIME_DIR}"'"
         WORKER_BASE_PORT='"${WORKER_BASE_PORT}"'
-        EXPECTED='"${WORKER_NUM_INSTANCES}"'
+        ACTIVE_INDICES='"${MINERU_ACTIVE_INSTANCE_INDICES}"'
         API_PORT='"${API_PORT}"'
         INTERVAL=60
         API_RESTART_COOLDOWN=300
@@ -1670,13 +1693,11 @@ start_watchdog() {
             sleep "$INTERVAL"
             NOW=$(date +%s)
 
-            idx=0
-            while [ "$idx" -lt "$EXPECTED" ]; do
+            for idx in $(printf "%s" "$ACTIVE_INDICES" | tr "," " "); do
                 if ! worker_ok "$idx"; then
                     echo "[$(date "+%F %T")] watchdog: worker #$idx missing/stale, starting only this instance" >> "'"${log_file}"'"
                     bash "$TIANSHU_SCRIPT" start worker "$idx" >> "'"${log_file}"'" 2>&1
                 fi
-                idx=$((idx + 1))
             done
 
             if ! curl -fsS --max-time 10 "http://localhost:${API_PORT}/docs" > /dev/null 2>&1; then
@@ -1707,10 +1728,12 @@ stop_watchdog() {
 status_watchdog() {
     echo -e "${CYAN}Watchdog (Worker + API)${NC}"
     local pid_file="${WORKER_LOG_DIR}/watchdog.pid"
-    if pid_file_matches "$pid_file" "tianshu-watchdog"; then
+    if pid_file_owns_instance "$pid_file" "tianshu-watchdog"; then
         echo "  ✅ 运行中 (PID: $(cat "$pid_file")), 每 60s 巡检 Worker 单实例 + API"
+        return 0
     else
         echo "  ❌ 未运行"
+        return 1
     fi
 }
 
@@ -1726,14 +1749,14 @@ start_scheduler() {
     local pid_file="${SCHEDULER_LOG_DIR}/scheduler.pid"
     local log_file="${SCHEDULER_LOG_DIR}/scheduler.log"
 
-    if pid_file_matches "$pid_file" "python.*task_scheduler.py"; then
+    if pid_file_owns_instance "$pid_file" "python.*task_scheduler.py"; then
         log_info "Task Scheduler 已在运行 (PID: $(cat "$pid_file"))"
         return 0
     fi
 
     # 预检查: worker 至少有一个通过 PID/cmdline/port 校验
     local running_workers=0
-    for i in $(seq 0 $((WORKER_NUM_INSTANCES - 1))); do
+    for i in $(active_instance_indices); do
         worker_is_running "$i" && running_workers=$((running_workers + 1))
     done
     if [ "$running_workers" -eq 0 ]; then
@@ -1804,15 +1827,17 @@ stop_scheduler() {
 status_scheduler() {
     echo -e "${CYAN}Task Scheduler (孤儿恢复阈值 ${SCHEDULER_STALE_TIMEOUT}m)${NC}"
     local pid_file="${SCHEDULER_LOG_DIR}/scheduler.pid"
-    if pid_file_matches "$pid_file" "python.*task_scheduler.py"; then
+    if pid_file_owns_instance "$pid_file" "python.*task_scheduler.py"; then
         echo "  ✅ 运行中 (PID: $(cat "$pid_file"))"
         # 显示最近一次 orphan recovery 日志
         if [ -f "${SCHEDULER_LOG_DIR}/scheduler.log" ]; then
             local last=$(grep "recover_orphans\|Orphan recovery" "${SCHEDULER_LOG_DIR}/scheduler.log" 2>/dev/null | tail -1)
             [ -n "$last" ] && echo "  最近恢复: $last"
         fi
+        return 0
     else
         echo "  ❌ 未运行"
+        return 1
     fi
 }
 
@@ -1982,8 +2007,10 @@ status_redis() {
         local clients
         clients=$("$redis_cli_bin" -p "$REDIS_PORT" -a "$REDIS_PASSWORD" --no-auth-warning info clients 2>/dev/null | grep "^connected_clients:" | cut -d: -f2 | tr -d '\r')
         echo "  ✅ 运行中 - localhost:${REDIS_PORT} (connected_clients: ${clients:-?})"
+        return 0
     else
         echo "  ❌ 未运行"
+        return 1
     fi
 }
 
@@ -1991,16 +2018,51 @@ status_redis() {
 # 组合命令
 # ============================================================================
 
-run_parent_merge_reconciler() {
-    local apply="${PARENT_MERGE_RECONCILE_APPLY:-false}"
+start_parent_merge_reconciler() {
+    log_step "启动 Parent Merge Reconciler"
+    mkdir -p "$MERGE_LOG_DIR"
+    local pid_file="${MERGE_LOG_DIR}/reconciler.pid"
+    local log_file="${MERGE_LOG_DIR}/reconciler.log"
     local reconciler="${SCRIPT_DIR}/reconcile_parent_merges.py"
-    local args=(--report-json)
-    [ -f "$reconciler" ] || return 0
-    if [ "$apply" = "true" ]; then
-        args+=(--apply)
+    if pid_file_owns_instance "$pid_file" "python.*reconcile_parent_merges.py"; then
+        log_info "Parent Merge Reconciler 已在运行 (PID: $(cat "$pid_file"))"
+        return 0
     fi
-    "$PYTHON_BIN" "$reconciler" "${args[@]}" || \
-        log_warn "parent merge reconciler failed"
+    [ -f "$reconciler" ] || { log_error "缺少 $reconciler"; return 1; }
+    DATABASE_PATH="$DATABASE_PATH" OUTPUT_PATH="$OUTPUT_PATH" \
+    nohup "$PYTHON_BIN" "$reconciler" \
+        --apply --watch --report-json \
+        --interval-seconds "${PARENT_MERGE_INTERVAL_SECONDS:-30}" \
+        --stale-seconds "${PARENT_MERGE_STALE_SECONDS:-300}" \
+        --max-attempts "${PARENT_MERGE_MAX_ATTEMPTS:-3}" \
+        --child-retention-hours "${PARENT_CHILD_RETENTION_HOURS:-24}" \
+        > "$log_file" 2>&1 &
+    local pid=$!
+    echo "$pid" > "$pid_file"
+    sleep 1
+    if pid_matches "$pid" "python.*reconcile_parent_merges.py"; then
+        log_info "Parent Merge Reconciler 就绪 (PID: $pid)"
+    else
+        log_error "Parent Merge Reconciler 启动失败，查看: $log_file"
+        return 1
+    fi
+}
+
+stop_parent_merge_reconciler() {
+    log_step "停止 Parent Merge Reconciler"
+    terminate_pid_file "${MERGE_LOG_DIR}/reconciler.pid" "python.*reconcile_parent_merges.py"
+}
+
+status_parent_merge_reconciler() {
+    echo -e "${CYAN}Parent Merge Reconciler (子任务保留 ${PARENT_CHILD_RETENTION_HOURS:-24}h)${NC}"
+    local pid_file="${MERGE_LOG_DIR}/reconciler.pid"
+    if pid_file_owns_instance "$pid_file" "python.*reconcile_parent_merges.py"; then
+        echo "  ✅ 运行中 (PID: $(cat "$pid_file"))"
+        return 0
+    else
+        echo "  ❌ 未运行"
+        return 1
+    fi
 }
 
 cmd_configure() {
@@ -2043,6 +2105,7 @@ cmd_start() {
         worker)   start_workers "$instance_index" || rc=1 ;;
         watchdog) start_watchdog || rc=1 ;;
         scheduler) start_scheduler || rc=1 ;;
+        reconciler) start_parent_merge_reconciler || rc=1 ;;
         frontend) start_frontend || rc=1 ;;
         all)
             start_redis    || rc=1
@@ -2052,9 +2115,10 @@ cmd_start() {
             start_workers  || rc=1
             start_watchdog || rc=1
             start_scheduler || rc=1
+            start_parent_merge_reconciler || rc=1
             start_frontend || rc=1
             ;;
-        *) log_error "未知服务: $target (可选: vllm|api|redis|mcp|worker|watchdog|scheduler|frontend|all)"; exit 1 ;;
+        *) log_error "未知服务: $target (可选: vllm|api|redis|mcp|worker|watchdog|scheduler|reconciler|frontend|all)"; exit 1 ;;
     esac
 
     echo ""
@@ -2078,10 +2142,12 @@ cmd_stop() {
         worker)   stop_workers "$instance_index" ;;
         watchdog) stop_watchdog ;;
         scheduler) stop_scheduler ;;
+        reconciler) stop_parent_merge_reconciler ;;
         frontend) stop_frontend ;;
         redis)    stop_redis ;;
         all)
             stop_frontend
+            stop_parent_merge_reconciler
             stop_scheduler
             stop_watchdog
             stop_workers
@@ -2090,7 +2156,7 @@ cmd_stop() {
             stop_vllm
             stop_redis
             ;;
-        *) log_error "未知服务: $target (可选: vllm|api|redis|mcp|worker|watchdog|scheduler|frontend|all)"; exit 1 ;;
+        *) log_error "未知服务: $target (可选: vllm|api|redis|mcp|worker|watchdog|scheduler|reconciler|frontend|all)"; exit 1 ;;
     esac
 
     # 仅在停止整个实例(all)时释放数据目录锁;单服务停止不释放(api 仍占用目录)
@@ -2099,10 +2165,81 @@ cmd_stop() {
     fi
 }
 
+rollback_core_restart() {
+    local i
+    log_warn "核心重启未进入切换阶段，恢复 API、Worker 与控制器"
+    start_api || true
+    for i in $(active_instance_indices); do
+        rm -f "$(worker_drain_file "$i")" "$(worker_disabled_file "$i")"
+        worker_is_running "$i" || start_worker_instance "$i" || true
+    done
+    start_parent_merge_reconciler || true
+    start_scheduler || true
+    start_watchdog || true
+}
+
+restart_core() {
+    local force="${1:-}" i drain_failed=0 rc=0
+    [ -z "$force" ] || [ "$force" = "--force" ] || { log_error "restart core 仅接受 --force"; return 1; }
+    init_dirs
+    source_ascend_env
+    validate_active_instance_indices || return 1
+    check_instance_conflict || return 1
+
+    status_redis >/dev/null || { log_error "Redis 未就绪；core 重启不会重启 Redis"; return 1; }
+    for i in $(active_instance_indices); do
+        if ! vllm_is_running "$i" || ! vllm_http_ready "$i"; then
+            log_error "VLLM #${i} 未就绪；core 重启不会重启 vLLM"
+            return 1
+        fi
+    done
+
+    log_step "安全重启核心服务 (实例 ${INSTANCE_ID}, Worker ${MINERU_ACTIVE_INSTANCE_INDICES})"
+    # 先停止自动拉起组件，避免切换期间发生竞态；再停止 API 阻止新任务进入。
+    stop_watchdog || rc=1
+    stop_scheduler || rc=1
+    stop_parent_merge_reconciler || rc=1
+    stop_api || rc=1
+    [ "$rc" -eq 0 ] || { rollback_core_restart; return 1; }
+
+    # 同时标记全部 worker，再并行进入排空窗口，避免逐个标记时仍向后面的 worker 派发任务。
+    for i in $(active_instance_indices); do mark_worker_drain "$i" || drain_failed=1; done
+    local drain_pids=() drain_pid
+    for i in $(active_instance_indices); do
+        wait_worker_drain "$i" "${DRAIN_WAIT_SECONDS:-300}" &
+        drain_pids+=("$!")
+    done
+    for drain_pid in "${drain_pids[@]}"; do wait "$drain_pid" || drain_failed=1; done
+    if [ "$drain_failed" -ne 0 ] && [ "$force" != "--force" ] && [ "${DRAIN_FORCE_STOP:-false}" != "true" ]; then
+        log_warn "至少一个 Worker 未在超时内完成 drain；未停止 Worker。可审查任务后使用 restart core --force"
+        rollback_core_restart
+        return 2
+    fi
+    [ "$drain_failed" -eq 0 ] || log_warn "使用 force 继续，可能中断 in-flight task"
+
+    for i in $(active_instance_indices); do stop_worker_instance "$i" || rc=1; done
+    [ "$rc" -eq 0 ] || { rollback_core_restart; return 1; }
+
+    start_api || rc=1
+    for i in $(active_instance_indices); do
+        start_worker_instance "$i" || { rc=1; continue; }
+        wait_worker_instance_ready "$i" "$WORKER_READY_TIMEOUT" || { log_error "Worker #${i} 未稳定就绪"; rc=1; }
+    done
+    start_parent_merge_reconciler || rc=1
+    start_scheduler || rc=1
+    start_watchdog || rc=1
+    [ "$rc" -eq 0 ] || return 1
+    cmd_status --strict
+}
+
 cmd_restart() {
     local target="${1:-all}"
     local instance_index="${2:-}"
     local force_flag="${3:-}"
+    if [ "$target" = "core" ]; then
+        restart_core "$instance_index"
+        return $?
+    fi
     if [ -n "$instance_index" ]; then
         case "$target" in
             worker)
@@ -2194,13 +2331,13 @@ supervise_node() {
 
     cmd_supervise control &
     supervisor_pids+=("$!")
-    local i=0
-    while [ "$i" -lt "$VLLM_NUM_INSTANCES" ]; do
+    local i compute_count=0
+    for i in $(active_instance_indices); do
         supervise_compute_instance "$i" &
         supervisor_pids+=("$!")
-        i=$((i + 1))
+        compute_count=$((compute_count + 1))
     done
-    log_info "Node supervisor watching control + ${VLLM_NUM_INSTANCES} compute supervisors"
+    log_info "Node supervisor watching control + ${compute_count} active compute supervisors (${MINERU_ACTIVE_INSTANCE_INDICES})"
 
     wait -n "${supervisor_pids[@]}"
     local rc=$?
@@ -2214,6 +2351,7 @@ supervise_compute_instance() {
     local i="$1"
     worker_index_valid "$i" || { log_error "无效 Compute 编号: $i"; return 1; }
     vllm_index_valid "$i" || { log_error "无效 Compute 编号: $i"; return 1; }
+    instance_index_active "$i" || { log_error "Compute #${i} 未包含在 MINERU_ACTIVE_INSTANCE_INDICES=${MINERU_ACTIVE_INSTANCE_INDICES}"; return 1; }
 
     separator
     echo -e "${CYAN}  MinerU Tianshu - 监督 Compute #${i}${NC}"
@@ -2393,7 +2531,6 @@ cmd_supervise() {
         return 1
     fi
 
-    run_parent_merge_reconciler
     separator
     echo -e "${CYAN}  MinerU Tianshu - 监督 Watchdog/Scheduler${NC}"
     separator
@@ -2405,40 +2542,42 @@ cmd_supervise() {
     local watchdog_supervisor=$!
     supervise_child "scheduler" start_scheduler "${SCHEDULER_LOG_DIR}/scheduler.pid" "python.*task_scheduler.py" &
     local scheduler_supervisor=$!
+    supervise_child "parent-merge" start_parent_merge_reconciler "${MERGE_LOG_DIR}/reconciler.pid" "python.*reconcile_parent_merges.py" &
+    local merge_supervisor=$!
 
-    trap 'kill "$watchdog_supervisor" "$scheduler_supervisor" 2>/dev/null || true; wait "$watchdog_supervisor" "$scheduler_supervisor" 2>/dev/null || true; stop_watchdog; stop_scheduler; exit 0' INT TERM EXIT
-    wait -n "$watchdog_supervisor" "$scheduler_supervisor"
+    trap 'kill "$watchdog_supervisor" "$scheduler_supervisor" "$merge_supervisor" 2>/dev/null || true; wait "$watchdog_supervisor" "$scheduler_supervisor" "$merge_supervisor" 2>/dev/null || true; stop_watchdog; stop_scheduler; stop_parent_merge_reconciler; exit 0' INT TERM EXIT
+    wait -n "$watchdog_supervisor" "$scheduler_supervisor" "$merge_supervisor"
     local rc=$?
-    kill "$watchdog_supervisor" "$scheduler_supervisor" 2>/dev/null || true
-    wait "$watchdog_supervisor" "$scheduler_supervisor" 2>/dev/null || true
+    kill "$watchdog_supervisor" "$scheduler_supervisor" "$merge_supervisor" 2>/dev/null || true
+    wait "$watchdog_supervisor" "$scheduler_supervisor" "$merge_supervisor" 2>/dev/null || true
     return "$rc"
 }
 
 cmd_status() {
+    local mode="${1:-}" failed=0
     separator
     echo -e "${CYAN}  MinerU Tianshu - 服务状态${NC}"
     separator
     echo -e "  实例: ${INSTANCE_ID}    数据目录: ${INSTANCE_DATA_DIR}"
+    echo -e "  激活计算实例: ${MINERU_ACTIVE_INSTANCE_INDICES}"
     echo ""
-    status_redis
-    echo ""
-    status_vllm
-    echo ""
-    status_api
-    echo ""
-    status_mcp
-    echo ""
-    status_workers
-    echo ""
-    status_watchdog
-    echo ""
-    status_scheduler
-    echo ""
-    status_frontend
+    status_redis || failed=1
+    echo ""; status_vllm || failed=1
+    echo ""; status_api || failed=1
+    echo ""; status_mcp || true
+    echo ""; status_workers || failed=1
+    echo ""; status_watchdog || failed=1
+    echo ""; status_scheduler || failed=1
+    echo ""; status_parent_merge_reconciler || failed=1
+    echo ""; status_frontend || true
     echo ""
     separator
     echo -e "  日志目录: ${LOG_DIR}"
+    if [ "$mode" = "--strict" ]; then
+        [ "$failed" -eq 0 ] && echo "  严格检查: ✅ 核心服务全部就绪" || echo "  严格检查: ❌ 核心服务未全部就绪"
+    fi
     separator
+    [ "$mode" != "--strict" ] || [ "$failed" -eq 0 ]
 }
 
 cmd_logs() {
@@ -2450,11 +2589,12 @@ cmd_logs() {
         worker)    tail -f "${WORKER_LOG_DIR}"/worker_*.log ;;
         watchdog)  tail -f "${WORKER_LOG_DIR}/watchdog.log" ;;
         scheduler) tail -f "${SCHEDULER_LOG_DIR}"/*.log ;;
+        reconciler) tail -f "${MERGE_LOG_DIR}"/*.log ;;
         api)       tail -f "${API_LOG_DIR}"/*.log ;;
         mcp)       tail -f "${API_LOG_DIR}/mcp.log" ;;
         frontend)  tail -f "${LOG_DIR}/frontend.log" ;;
         all)       tail -f "${LOG_DIR}"/*/*.log "${LOG_DIR}"/frontend.log "${LOG_DIR}"/redis.log ;;
-        *) log_error "未知服务: $target (可选: vllm|worker|watchdog|scheduler|api|mcp|redis|frontend|all)"; exit 1 ;;
+        *) log_error "未知服务: $target (可选: vllm|worker|watchdog|scheduler|reconciler|api|mcp|redis|frontend|all)"; exit 1 ;;
     esac
 }
 
@@ -2482,29 +2622,32 @@ cmd_test() {
     echo ""
     log_info "[2/6] 检查 VLLM 服务..."
     local vllm_ok=0
-    for i in $(seq 0 $((VLLM_NUM_INSTANCES - 1))); do
+    for i in $(active_instance_indices); do
         local port=$((VLLM_BASE_PORT + i))
         if curl -s "http://localhost:${port}/v1/models" > /dev/null 2>&1; then
             vllm_ok=$((vllm_ok + 1))
         fi
     done
-    if [ "$vllm_ok" -eq "$VLLM_NUM_INSTANCES" ]; then
-        log_info "VLLM: ${vllm_ok}/${VLLM_NUM_INSTANCES} 就绪"
+    local active_count
+    active_count="$(active_instance_indices | wc -w)"
+    if [ "$vllm_ok" -eq "$active_count" ]; then
+        log_info "VLLM: ${vllm_ok}/${active_count} 个激活实例就绪"
         pass=$((pass + 1))
     else
-        log_error "VLLM: ${vllm_ok}/${VLLM_NUM_INSTANCES} 就绪"
+        log_error "VLLM: ${vllm_ok}/${active_count} 个激活实例就绪"
         fail=$((fail + 1))
     fi
 
     # 3. Worker 进程
     echo ""
     log_info "[3/6] 检查 Worker 进程..."
-    local worker_count=$(ps aux | grep "litserve_worker.py" | grep -v grep | wc -l)
-    if [ "$worker_count" -ge "$WORKER_NUM_INSTANCES" ]; then
+    local worker_count=0
+    for i in $(active_instance_indices); do worker_is_running "$i" && worker_count=$((worker_count + 1)); done
+    if [ "$worker_count" -ge "$active_count" ]; then
         log_info "Worker: ${worker_count} 个进程运行中"
         pass=$((pass + 1))
     else
-        log_error "Worker: 仅 ${worker_count} 个进程 (期望 ${WORKER_NUM_INSTANCES})"
+        log_error "Worker: 仅 ${worker_count} 个进程 (期望 ${active_count})"
         fail=$((fail + 1))
     fi
 
@@ -2558,7 +2701,8 @@ MinerU Tianshu - 统一启动脚本
   start [服务]   启动服务 (默认: all)
   stop [服务]    停止服务 (默认: all)
   restart        重启所有服务
-  status         查看所有服务状态
+  restart core [--force] 安全重启 API、0-3 Workers 和控制器（不动 Redis/vLLM/MCP/Frontend）
+  status [--strict] 查看状态；--strict 在核心服务异常时返回非零
   logs [服务]    实时查看日志 (默认: all)
   drain worker N 将指定 Worker 置为 drain 模式
   supervise      前台监督 control、指定 compute 或完整 node，适配容器 PID1
@@ -2567,12 +2711,13 @@ MinerU Tianshu - 统一启动脚本
 
 服务 (可选，不指定则操作全部):
   redis          Redis 队列服务 (端口 ${REDIS_PORT})
-  vllm           VLLM 推理服务 (端口 ${VLLM_BASE_PORT}-${VLLM_BASE_PORT}$((VLLM_NUM_INSTANCES-1)))
+  vllm           VLLM 推理服务 (端口 ${VLLM_BASE_PORT}-$((VLLM_BASE_PORT + VLLM_NUM_INSTANCES - 1)))
   api            API Server (端口 ${API_PORT})
   mcp            MCP Server (端口 ${MCP_PORT})
-  worker         Workers (端口 ${WORKER_BASE_PORT}-${WORKER_BASE_PORT}$((WORKER_NUM_INSTANCES-1)))
+  worker         Workers (端口 ${WORKER_BASE_PORT}-$((WORKER_BASE_PORT + WORKER_NUM_INSTANCES - 1)))
   watchdog       看门狗 (Worker 崩溃补齐 + API 端口探活自动恢复,每 60s)
   scheduler      任务调度器 (孤儿恢复+队列监控,默认 10 分钟判定孤儿)
+  reconciler     父任务合并恢复与 24h 子任务产物清理
   frontend       前端界面 (端口 ${FRONTEND_PORT})
   all            所有服务
 
@@ -2584,19 +2729,23 @@ MinerU Tianshu - 统一启动脚本
   bash scripts/tianshu.sh restart worker 3 # drain 验证完成后重启 Worker #3
   bash scripts/tianshu.sh restart worker 3 --force # 明确允许中断后强制重启
   bash scripts/tianshu.sh drain worker 3  # 将 Worker #3 置为 drain
-  bash scripts/tianshu.sh supervise       # 前台监督 watchdog/scheduler
+  bash scripts/tianshu.sh supervise       # 前台监督 watchdog/scheduler/reconciler
   bash scripts/tianshu.sh supervise compute 0 # 前台拥有并回收 Compute #0 子进程
-  bash scripts/tianshu.sh supervise node  # Kubernetes PID1:监督 control + 8 组 compute
-  bash scripts/tianshu.sh restart         # 重启所有
-  bash scripts/tianshu.sh status          # 查看状态
+  bash scripts/tianshu.sh supervise node  # Kubernetes PID1:监督 control + 激活的 compute
+  bash scripts/tianshu.sh restart core    # 推荐：安全重启 API/Workers/控制器
+  bash scripts/tianshu.sh restart core --force # drain 超时后明确允许中断任务
+  bash scripts/tianshu.sh restart         # 重启所有（包括 Redis/vLLM，不建议日常使用）
+  bash scripts/tianshu.sh status --strict # 严格验证核心服务和实例身份
   bash scripts/tianshu.sh logs worker     # 查看 Worker 日志
   bash scripts/tianshu.sh logs scheduler  # 查看调度器日志
+  bash scripts/tianshu.sh logs reconciler # 查看父任务合并恢复日志
   bash scripts/tianshu.sh test            # 运行验证测试
 
 配置:
   脚本顶部可修改以下配置:
-    DATA_ROOT            数据根(所有实例在 <DATA_ROOT>/<INSTANCE_ID>/ 下隔离存放)
-    INSTANCE_ID          实例标识(默认 hostname;export 覆盖可指定特定实例)
+    DATA_ROOT            数据根(实例数据位于 <DATA_ROOT>/<INSTANCE_ID>/)
+    TIANSHU_INSTANCE_ID  专用实例覆盖；默认固定 mineru-runner-worker-0（普通 INSTANCE_ID 会被忽略）
+    MINERU_ACTIVE_INSTANCE_INDICES 激活的 NPU/Worker 编号，默认 0,1,2,3
     VLLM_MODEL_PATH      模型路径
     VLLM_BASE_PORT       VLLM 起始端口
     VLLM_NUM_INSTANCES   VLLM 实例数量
@@ -2624,7 +2773,7 @@ case "${1:-help}" in
     drain)    cmd_drain "$2" "$3" ;;
     configure) cmd_configure "$2" "$3" "$4" "$5" "$6" "$7" ;;
     supervise) cmd_supervise "$2" "$3" ;;
-    status)   cmd_status ;;
+    status)   cmd_status "$2" ;;
     logs)     cmd_logs "$2" ;;
     test)     cmd_test ;;
     help|--help|-h) cmd_help ;;
