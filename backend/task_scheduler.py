@@ -87,11 +87,14 @@ class TaskScheduler:
         self.task_p99_seconds = self._optional_positive_float(
             task_p99_seconds if task_p99_seconds is not None else os.getenv("SCHEDULER_TASK_P99_SECONDS")
         )
-        self.heartbeat_interval_seconds = self._optional_positive_float(
-            heartbeat_interval_seconds
-            if heartbeat_interval_seconds is not None
-            else os.getenv("WORKER_HEARTBEAT_INTERVAL_SECONDS")
-        ) or DEFAULT_HEARTBEAT_INTERVAL_SECONDS
+        self.heartbeat_interval_seconds = (
+            self._optional_positive_float(
+                heartbeat_interval_seconds
+                if heartbeat_interval_seconds is not None
+                else os.getenv("WORKER_HEARTBEAT_INTERVAL_SECONDS")
+            )
+            or DEFAULT_HEARTBEAT_INTERVAL_SECONDS
+        )
         self.heartbeat_freshness_seconds = math.ceil(3 * self.heartbeat_interval_seconds)
         self.stale_task_timeout = self._effective_stale_timeout_minutes(
             stale_task_timeout,
@@ -103,14 +106,14 @@ class TaskScheduler:
         self.worker_auto_mode = worker_auto_mode
         self.orphan_recovery_apply = orphan_recovery_apply
         self.orphan_recovery_batch_size = max(1, int(orphan_recovery_batch_size or DEFAULT_ORPHAN_RECOVERY_BATCH_SIZE))
-        
+
         # 初始化数据库连接
         db_path = os.getenv("DATABASE_PATH")
         if db_path:
             self.db = TaskDB(db_path)
         else:
             self.db = TaskDB()
-            
+
         self.running = True
 
     @staticmethod
@@ -228,9 +231,7 @@ class TaskScheduler:
             merge_attempts = "COALESCE(p.merge_attempts, 0)" if "merge_attempts" in columns else "0"
             child_completed = "p.child_completed" if "child_completed" in columns else "0"
             child_failed = (
-                "SUM(CASE WHEN c.status = 'failed' THEN 1 ELSE 0 END)"
-                if "parent_task_id" in columns
-                else "0"
+                "SUM(CASE WHEN c.status = 'failed' THEN 1 ELSE 0 END)" if "parent_task_id" in columns else "0"
             )
             real_child_completed = (
                 "SUM(CASE WHEN c.status = 'completed' THEN 1 ELSE 0 END)"
@@ -589,6 +590,17 @@ class TaskScheduler:
                     except Exception as e:
                         logger.error(f"Failed to get queue stats: {e}")
 
+                    # Keep automatic checkpoints out of foreground write transactions.
+                    try:
+                        storage = self.db.storage_health()
+                        if storage["wal_bytes"] >= int(
+                            os.getenv("SQLITE_WAL_CHECKPOINT_THRESHOLD_BYTES", str(256 * 1024 * 1024))
+                        ):
+                            checkpoint = self.db.checkpoint_wal("PASSIVE")
+                            logger.info(f"SQLite WAL passive checkpoint: {checkpoint} storage={storage}")
+                    except Exception as e:
+                        logger.warning(f"SQLite WAL checkpoint skipped: {e}")
+
                     # 2. 定期健康检查
                     health_check_counter += 1
                     if health_check_counter * self.monitor_interval >= self.health_check_interval:
@@ -712,17 +724,15 @@ async def health_check(litserve_url: str) -> bool:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MinerU Tianshu Task Scheduler (Optional)")
-    
+
     parser.add_argument("--litserve-url", type=str, default="http://localhost:8001/predict", help="LitServe worker URL")
-    
+
     # ✅ 修复：同时支持 --monitor-interval 和 --interval (兼容 docker-compose)
     parser.add_argument(
         "--monitor-interval", type=int, default=300, help="Monitor interval in seconds (default: 300s = 5 minutes)"
     )
-    parser.add_argument(
-        "--interval", type=int, dest="monitor_interval", help="Alias for --monitor-interval"
-    )
-    
+    parser.add_argument("--interval", type=int, dest="monitor_interval", help="Alias for --monitor-interval")
+
     parser.add_argument(
         "--health-check-interval",
         type=int,

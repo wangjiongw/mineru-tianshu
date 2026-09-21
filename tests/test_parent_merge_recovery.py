@@ -11,7 +11,7 @@ for path in (BACKEND, SCRIPTS):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from parent_merge import ParentMergeInputError, merge_parent_task_results
+from parent_merge import ParentMergeInputError, build_completion_payload, merge_parent_task_results
 import task_db as task_db_module
 from task_db import TaskDB
 import reconcile_parent_merges
@@ -1024,6 +1024,30 @@ def _call_submit_task_for_api_test(api_server, file_obj, user, **overrides):
     return api_server.submit_task(**kwargs)
 
 
+def test_api_submit_returns_retryable_503_for_sqlite_busy(tmp_path, monkeypatch):
+    import io
+    from types import SimpleNamespace
+    import api_server
+
+    class FakeUser:
+        user_id = "owner"
+
+    class BusyDB:
+        def create_task(self, **kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(api_server, "db", BusyDB())
+    monkeypatch.setattr(api_server, "UPLOAD_DIR", tmp_path)
+    upload = SimpleNamespace(filename="busy.pdf", file=io.BytesIO(b"%PDF-1.4"))
+    response = _call_submit_task_for_api_test(api_server, upload, FakeUser())
+    payload = json.loads(response.body)
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == "2"
+    assert payload["detail"]["code"] == "SQLITE_WRITE_BUSY"
+    assert payload["detail"]["retryable"] is True
+    assert not list(tmp_path.glob("*_busy.pdf"))
+
+
 def test_api_submit_returns_503_for_initial_enqueue_failure(tmp_path, monkeypatch):
     import io
     from types import SimpleNamespace
@@ -1480,3 +1504,38 @@ def test_parent_merge_rejects_unresolved_remote_image_reference(tmp_path):
         assert "non-local image references" in str(exc)
     else:
         raise AssertionError("unresolved remote image reference must reject parent merge")
+
+
+def test_parent_merge_rewrites_images_inside_json_html_and_ignores_directory_marker(tmp_path):
+    db, parent_id, child_ids = _make_parent_with_children(tmp_path)
+    children = _prepare_artifact_merge(db, parent_id, preserve_all=False)
+    for idx, child in enumerate(children):
+        result_dir = Path(child["result_path"])
+        embedded = (
+            '<table><tr><td><img src="/api/v1/files/output/child/images/same.jpg"></td>'
+            '<td>images/</td></tr></table>'
+        )
+        (result_dir / "result.json").write_text(
+            json.dumps([{"page_idx": 0, "table_body": embedded, "image_dir": "images/"}]),
+            encoding="utf-8",
+        )
+    assert db.claim_parent_merge(parent_id, "worker-a")
+    out = merge_parent_task_results(
+        task_db=db, parent_task_id=parent_id, output_dir=str(tmp_path / "out"),
+        merge_owner="worker-a", cleanup_child_files=False,
+    )
+    content = json.loads((out / "result.json").read_text(encoding="utf-8"))
+    assert 'src="images/same.jpg"' in content[0]["table_body"]
+    assert 'src="images/p2_same.jpg"' in content[1]["table_body"]
+    assert [item["image_dir"] for item in content] == ["images/", "images/"]
+
+
+def test_completion_payload_is_compact_by_default(monkeypatch):
+    monkeypatch.delenv("TASK_DATA_PAYLOAD_MODE", raising=False)
+    payload = json.loads(build_completion_payload(
+        {"pdf_path": "/tmp/a.pdf", "content": "large", "json_content": [1], "markdown_file": "full.md"},
+        page_count=1, worker_group_index=2, worker_child_index=3, processing_seconds=4.0,
+    ))
+    assert payload["schema_version"] == 2
+    assert payload["storage"] == "filesystem"
+    assert "markdown" not in payload and "json_content" not in payload

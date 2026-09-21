@@ -3,6 +3,7 @@
 
 Dry-run is the default. Use --apply to claim and merge eligible parents.
 """
+
 import argparse
 import json
 import os
@@ -19,8 +20,12 @@ if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
 from parent_merge import (
-    child_end_page, child_page_count, child_start_page,
-    rebuild_completed_parent_artifacts, merge_parent_task_results, validate_parent_merge_inputs,
+    child_end_page,
+    child_page_count,
+    child_start_page,
+    rebuild_completed_parent_artifacts,
+    merge_parent_task_results,
+    validate_parent_merge_inputs,
 )
 from task_db import TaskDB
 from utils.pdf_utils import split_pdf_file
@@ -84,8 +89,12 @@ def regenerate_and_requeue_parent_children(args, db, parent):
             if start <= 0 or end is None or count is None or end - start + 1 != count:
                 raise ValueError(f"child {child.get('task_id')} has invalid chunk_info")
             chunks = split_pdf_file(
-                source_pdf, staging, chunk_size=count, parent_task_id=child["task_id"],
-                start_page=start - 1, end_page=end - 1,
+                source_pdf,
+                staging,
+                chunk_size=count,
+                parent_task_id=child["task_id"],
+                start_page=start - 1,
+                end_page=end - 1,
             )
             if len(chunks) != 1:
                 raise RuntimeError(f"expected one regenerated PDF for child {child['task_id']}")
@@ -100,10 +109,7 @@ def regenerate_and_requeue_parent_children(args, db, parent):
         shutil.rmtree(staging, ignore_errors=True)
     result = db.requeue_completed_parent_children(parent["task_id"])
     if result.get("enqueue_failed_task_ids"):
-        raise RuntimeError(
-            "failed to enqueue regenerated children: "
-            + ", ".join(result["enqueue_failed_task_ids"])
-        )
+        raise RuntimeError("failed to enqueue regenerated children: " + ", ".join(result["enqueue_failed_task_ids"]))
     return result
 
 
@@ -281,7 +287,9 @@ def emit(report, as_json):
             )
         return
     mode = "apply" if report["applied"] else "dry-run"
-    print(f"mode={mode} finalizable={summary.get('finalizable', 0)} remergeable={summary.get('remergeable', 0)} blocked={summary.get('blocked', 0)}")
+    print(
+        f"mode={mode} finalizable={summary.get('finalizable', 0)} remergeable={summary.get('remergeable', 0)} blocked={summary.get('blocked', 0)}"
+    )
     for item in report["tasks"]:
         suffix = ""
         if item.get("merged"):
@@ -299,6 +307,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.rebuild_completed and args.watch:
         parser.error("--rebuild-completed cannot be combined with --watch")
+    if args.force and not args.task_id:
+        parser.error("--force requires --task-id to avoid broad attempt-limit bypass")
     if args.reparse_missing_children and (not args.rebuild_completed or not args.apply):
         parser.error("--reparse-missing-children requires --rebuild-completed --apply")
     owner = f"reconcile-parent-merges:{os.getpid()}"
@@ -306,9 +316,7 @@ def main(argv=None):
         report = run_once(args, owner)
         if args.apply and not args.rebuild_completed and not args.disable_child_cleanup:
             db = TaskDB(args.db_path)
-            cleaned = cleanup_expired_child_artifacts(
-                db, args.output_dir, args.child_retention_hours
-            )
+            cleaned = cleanup_expired_child_artifacts(db, args.output_dir, args.child_retention_hours)
             report["cleaned_child_artifacts"] = cleaned
         emit(report, args.report_json)
         if not args.watch:

@@ -47,6 +47,14 @@ _SQLITE_LOCK_DEADLINE_SECONDS = float(os.getenv("SQLITE_LOCK_DEADLINE_SECONDS", 
 _SQLITE_BUSY_BASE_SLEEP_SECONDS = float(os.getenv("SQLITE_BUSY_BASE_SLEEP_SECONDS", "0.02"))
 _SQLITE_BUSY_MAX_SLEEP_SECONDS = float(os.getenv("SQLITE_BUSY_MAX_SLEEP_SECONDS", "0.5"))
 _SQLITE_BUSY_ERRORS = ("database is locked", "database table is locked", "SQLITE_BUSY", "SQLITE_LOCKED")
+_SQLITE_SYNCHRONOUS = os.getenv("SQLITE_SYNCHRONOUS", "NORMAL").upper()
+if _SQLITE_SYNCHRONOUS not in {"OFF", "NORMAL", "FULL", "EXTRA"}:
+    raise ValueError(f"Invalid SQLITE_SYNCHRONOUS={_SQLITE_SYNCHRONOUS}")
+_SQLITE_WAL_AUTOCHECKPOINT = int(os.getenv("SQLITE_WAL_AUTOCHECKPOINT", "0"))
+_SQLITE_JOURNAL_SIZE_LIMIT_BYTES = int(os.getenv("SQLITE_JOURNAL_SIZE_LIMIT_BYTES", str(256 * 1024 * 1024)))
+_SQLITE_WAL_WARNING_BYTES = int(os.getenv("SQLITE_WAL_WARNING_BYTES", str(256 * 1024 * 1024)))
+_SQLITE_WAL_CRITICAL_BYTES = int(os.getenv("SQLITE_WAL_CRITICAL_BYTES", str(1024 * 1024 * 1024)))
+_SQLITE_LOCK_WARN_SECONDS = float(os.getenv("SQLITE_LOCK_WARN_SECONDS", "5"))
 
 
 def _sqlite_queue_fallback_enabled() -> bool:
@@ -64,17 +72,25 @@ def _is_sqlite_busy(exc: Exception) -> bool:
     return any(token in message for token in _SQLITE_BUSY_ERRORS)
 
 
+def is_retryable_sqlite_busy(exc: Exception) -> bool:
+    """Public classification helper for API adapters."""
+    return isinstance(exc, RetryableSQLiteWriteTimeout) or _is_sqlite_busy(exc)
+
+
 class RetryableSQLiteWriteTimeout(sqlite3.OperationalError):
     """Raised when the local SQLite write lock cannot be acquired in time."""
 
 
 class _SQLiteWriteLock:
-    def __init__(self, db_path: str, deadline_seconds: float = _SQLITE_LOCK_DEADLINE_SECONDS):
+    def __init__(self, db_path: str, deadline_seconds: float = _SQLITE_LOCK_DEADLINE_SECONDS, operation: str = "write"):
         digest = hashlib.sha256(str(Path(db_path).resolve()).encode()).hexdigest()[:16]
         self.path = Path(tempfile.gettempdir()) / f"mineru_tianshu_sqlite_{digest}.lock"
         self.deadline_seconds = deadline_seconds
         self._fh = None
-        self.deadline = time.monotonic() + deadline_seconds
+        self.operation = operation
+        self.wait_started = time.monotonic()
+        self.acquired_at = None
+        self.deadline = self.wait_started + deadline_seconds
 
     def __enter__(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -83,17 +99,43 @@ class _SQLiteWriteLock:
         while True:
             try:
                 fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.acquired_at = time.monotonic()
+                metadata = {
+                    "pid": os.getpid(),
+                    "role": os.getenv("SERVICE_ROLE") or os.getenv("WORKER_ID") or "unknown",
+                    "operation": self.operation,
+                    "acquired_at": time.time(),
+                }
+                self._fh.seek(0)
+                self._fh.truncate()
+                self._fh.write(json.dumps(metadata))
+                self._fh.flush()
+                waited = self.acquired_at - self.wait_started
+                if waited >= _SQLITE_LOCK_WARN_SECONDS:
+                    logger.warning(f"SQLite write lock waited {waited:.3f}s operation={self.operation}")
                 return self.deadline
             except OSError as exc:
                 if exc.errno not in (errno.EACCES, errno.EAGAIN) or time.monotonic() >= self.deadline:
-                    raise RetryableSQLiteWriteTimeout(f"database is locked: timed out waiting for {self.path}") from exc
-                sleep_for = min(_SQLITE_BUSY_MAX_SLEEP_SECONDS, _SQLITE_BUSY_BASE_SLEEP_SECONDS * (2 ** attempt))
+                    holder = "unknown"
+                    try:
+                        self._fh.seek(0)
+                        holder = self._fh.read().strip() or "unknown"
+                    except Exception:
+                        pass
+                    raise RetryableSQLiteWriteTimeout(
+                        f"database is locked: timed out waiting for {self.path}; holder={holder}"
+                    ) from exc
+                sleep_for = min(_SQLITE_BUSY_MAX_SLEEP_SECONDS, _SQLITE_BUSY_BASE_SLEEP_SECONDS * (2**attempt))
                 time.sleep(random.uniform(0, sleep_for))
                 attempt += 1
 
     def __exit__(self, exc_type, exc, tb):
         if self._fh is not None:
             try:
+                if self.acquired_at is not None:
+                    held = time.monotonic() - self.acquired_at
+                    if held >= _SQLITE_LOCK_WARN_SECONDS:
+                        logger.warning(f"SQLite write lock held {held:.3f}s operation={self.operation}")
                 fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
             finally:
                 self._fh.close()
@@ -101,7 +143,18 @@ class _SQLiteWriteLock:
 
 
 class _LazyLockingCursor:
-    WRITE_PREFIXES = ("INSERT", "UPDATE", "DELETE", "REPLACE", "CREATE", "DROP", "ALTER", "BEGIN IMMEDIATE", "BEGIN EXCLUSIVE", "VACUUM")
+    WRITE_PREFIXES = (
+        "INSERT",
+        "UPDATE",
+        "DELETE",
+        "REPLACE",
+        "CREATE",
+        "DROP",
+        "ALTER",
+        "BEGIN IMMEDIATE",
+        "BEGIN EXCLUSIVE",
+        "VACUUM",
+    )
     WRITE_PRAGMAS = ("PRAGMA JOURNAL_MODE", "PRAGMA WAL_CHECKPOINT")
 
     def __init__(self, cursor, db_path: str):
@@ -130,9 +183,10 @@ class _LazyLockingCursor:
         normalized = sql.lstrip().upper()
         return normalized.startswith(self.WRITE_PREFIXES) or normalized.startswith(self.WRITE_PRAGMAS)
 
-    def _ensure_write_lock(self) -> None:
+    def _ensure_write_lock(self, sql: str = "") -> None:
         if self._lock is None:
-            self._lock = _SQLiteWriteLock(self._db_path)
+            operation = " ".join(sql.lstrip().split()[:2]).upper() or "WRITE"
+            self._lock = _SQLiteWriteLock(self._db_path, operation=operation)
             self._deadline = self._lock.__enter__()
 
     def _retry(self, func, *args, **kwargs):
@@ -143,23 +197,23 @@ class _LazyLockingCursor:
             except sqlite3.OperationalError as exc:
                 if not _is_sqlite_busy(exc) or time.monotonic() >= self._deadline:
                     raise
-                sleep_for = min(_SQLITE_BUSY_MAX_SLEEP_SECONDS, _SQLITE_BUSY_BASE_SLEEP_SECONDS * (2 ** attempt))
+                sleep_for = min(_SQLITE_BUSY_MAX_SLEEP_SECONDS, _SQLITE_BUSY_BASE_SLEEP_SECONDS * (2**attempt))
                 time.sleep(random.uniform(0, sleep_for))
                 attempt += 1
 
     def execute(self, sql, *args, **kwargs):
         if self._needs_write_lock(sql):
-            self._ensure_write_lock()
+            self._ensure_write_lock(sql)
         return self._retry(self._cursor.execute, sql, *args, **kwargs)
 
     def executemany(self, sql, *args, **kwargs):
         if self._needs_write_lock(sql):
-            self._ensure_write_lock()
+            self._ensure_write_lock(sql)
         return self._retry(self._cursor.executemany, sql, *args, **kwargs)
 
     def executescript(self, sql, *args, **kwargs):
         if any(self._needs_write_lock(part) for part in sql.split(";")):
-            self._ensure_write_lock()
+            self._ensure_write_lock(sql)
         return self._retry(self._cursor.executescript, sql, *args, **kwargs)
 
 
@@ -207,7 +261,10 @@ class TaskDB:
         else:
             conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30.0)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout=30000")  # 锁等待 30s，避免高并发下立刻报 database is locked
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute(f"PRAGMA synchronous={_SQLITE_SYNCHRONOUS}")
+        if not self.read_only:
+            conn.execute(f"PRAGMA wal_autocheckpoint={_SQLITE_WAL_AUTOCHECKPOINT}")
         return conn
 
     @contextmanager
@@ -217,9 +274,13 @@ class TaskDB:
         cursor = _LazyLockingCursor(conn.cursor(), self.db_path)
         try:
             yield cursor
+            commit_started = time.monotonic()
             while True:
                 try:
                     conn.commit()
+                    commit_seconds = time.monotonic() - commit_started
+                    if commit_seconds >= _SQLITE_LOCK_WARN_SECONDS:
+                        logger.warning(f"SQLite commit took {commit_seconds:.3f}s db={self.db_path}")
                     break
                 except sqlite3.OperationalError as exc:
                     if not cursor.has_write_lock or not _is_sqlite_busy(exc) or time.monotonic() >= cursor.deadline:
@@ -232,14 +293,49 @@ class TaskDB:
             cursor.close_lock()
             conn.close()  # 关闭连接
 
+    def storage_health(self) -> Dict:
+        """Cheap filesystem-level SQLite/WAL health signal for APIs and operators."""
+        sizes = {}
+        for label, suffix in (("database_bytes", ""), ("wal_bytes", "-wal"), ("shm_bytes", "-shm")):
+            path = Path(self.db_path + suffix)
+            sizes[label] = path.stat().st_size if path.exists() else 0
+        wal_bytes = sizes["wal_bytes"]
+        level = (
+            "critical"
+            if wal_bytes >= _SQLITE_WAL_CRITICAL_BYTES
+            else "warning"
+            if wal_bytes >= _SQLITE_WAL_WARNING_BYTES
+            else "ok"
+        )
+        return {
+            **sizes,
+            "level": level,
+            "synchronous": _SQLITE_SYNCHRONOUS,
+            "wal_autocheckpoint_pages": _SQLITE_WAL_AUTOCHECKPOINT,
+            "journal_size_limit_bytes": _SQLITE_JOURNAL_SIZE_LIMIT_BYTES,
+        }
+
+    def checkpoint_wal(self, mode: str = "PASSIVE") -> Dict:
+        """Run an explicit SQLite WAL checkpoint without taking the application write lock."""
+        mode = mode.upper()
+        if mode not in {"PASSIVE", "FULL", "RESTART", "TRUNCATE"}:
+            raise ValueError(f"Unsupported checkpoint mode: {mode}")
+        conn = sqlite3.connect(self.db_path, timeout=1.0)
+        try:
+            conn.execute("PRAGMA busy_timeout=1000")
+            row = conn.execute(f"PRAGMA wal_checkpoint({mode})").fetchone()
+            return {"mode": mode, "busy": row[0], "log_pages": row[1], "checkpointed_pages": row[2]}
+        finally:
+            conn.close()
 
     def _init_db(self):
         """初始化数据库表"""
         with self.get_cursor() as cursor:
             # 启用 WAL 模式：允许并发读写（8 workers + API + scheduler 同时写入不再互斥）
             cursor.execute("PRAGMA journal_mode=WAL")
-            cursor.execute("PRAGMA synchronous=NORMAL")
-            cursor.execute("PRAGMA wal_autocheckpoint=1000")
+            cursor.execute(f"PRAGMA synchronous={_SQLITE_SYNCHRONOUS}")
+            cursor.execute(f"PRAGMA wal_autocheckpoint={_SQLITE_WAL_AUTOCHECKPOINT}")
+            cursor.execute(f"PRAGMA journal_size_limit={_SQLITE_JOURNAL_SIZE_LIMIT_BYTES}")
 
             # 创建表（如果不存在）
             cursor.execute("""
@@ -330,9 +426,7 @@ class TaskDB:
                 cursor.execute("SELECT preserve_all_artifacts FROM tasks LIMIT 1")
             except sqlite3.OperationalError:
                 logger.info("📊 Migrating database schema: adding artifact policy field")
-                cursor.execute(
-                    "ALTER TABLE tasks ADD COLUMN preserve_all_artifacts INTEGER DEFAULT 0"
-                )
+                cursor.execute("ALTER TABLE tasks ADD COLUMN preserve_all_artifacts INTEGER DEFAULT 0")
                 logger.info("✅ Artifact policy field added")
 
             # 迁移：添加 data 字段（如果不存在）
@@ -421,7 +515,9 @@ class TaskDB:
             for statement in statements:
                 locked_cursor.execute(statement)
 
-    def get_task_by_dedup(self, file_hash: str, backend: str, lang: str, method: str, preserve_all_artifacts: bool = False) -> Optional[Dict]:
+    def get_task_by_dedup(
+        self, file_hash: str, backend: str, lang: str, method: str, preserve_all_artifacts: bool = False
+    ) -> Optional[Dict]:
         with self.get_cursor() as cursor:
             cursor.execute(
                 """
@@ -847,13 +943,12 @@ class TaskDB:
             if not success and status in ["completed", "failed"]:
                 from loguru import logger
 
-                logger.debug(f"Status update failed: task_id={task_id}, status={status}, " f"worker_id={worker_id}")
+                logger.debug(f"Status update failed: task_id={task_id}, status={status}, worker_id={worker_id}")
 
-            # 通知 Redis 任务完成/失败（清理 processing set）
-            if success and status in ["completed", "failed"]:
-                self._notify_redis_task_done(task_id, worker_id or "", status)
-
-            return success
+        # SQLite commit has completed and the global write lock is released before Redis I/O.
+        if success and status in ["completed", "failed"]:
+            self._notify_redis_task_done(task_id, worker_id or "", status)
+        return success
 
     def _notify_redis_task_done(self, task_id: str, worker_id: str, status: str):
         """通知 Redis 任务已完成/失败"""
@@ -926,7 +1021,7 @@ class TaskDB:
     def _delete_task_files(self, task_row):
         """辅助方法：安全删除任务的源文件和结果目录"""
         task_id = task_row["task_id"]
-        
+
         # 1. 删除上传的源文件
         if task_row["file_path"]:
             try:
@@ -936,7 +1031,7 @@ class TaskDB:
                     logger.debug(f"Deleted source file for task {task_id}")
             except Exception as e:
                 logger.warning(f"Failed to delete source file for task {task_id}: {e}")
-        
+
         # 2. 删除结果目录
         if task_row["result_path"]:
             try:
@@ -951,24 +1046,30 @@ class TaskDB:
         """清理旧任务"""
         with self.get_cursor() as cursor:
             # 先查询要删除的任务及其文件路径
-            cursor.execute("""
+            cursor.execute(
+                """
                 SELECT task_id, file_path, result_path FROM tasks
                 WHERE completed_at < datetime('now', '-' || ? || ' days')
                 AND status IN ('completed', 'failed')
-            """, (days,))
+            """,
+                (days,),
+            )
             old_tasks = cursor.fetchall()
-            
+
             # 删除所有相关文件
             for task in old_tasks:
                 self._delete_task_files(task)
-            
+
             # 删除数据库记录
-            cursor.execute("""
+            cursor.execute(
+                """
                 DELETE FROM tasks
                 WHERE completed_at < datetime('now', '-' || ? || ' days')
                 AND status IN ('completed', 'failed')
-            """, (days,))
-            
+            """,
+                (days,),
+            )
+
             return cursor.rowcount
 
     def reset_stale_tasks(self, timeout_minutes: int = 60) -> int:
@@ -1126,13 +1227,13 @@ class TaskDB:
             # 1. 查询所有 failed 任务
             cursor.execute("SELECT task_id, file_path, result_path FROM tasks WHERE status = 'failed'")
             failed_tasks = cursor.fetchall()
-            
+
             count = 0
             # 2. 物理删除
             for task in failed_tasks:
                 self._delete_task_files(task)
                 count += 1
-            
+
             # 3. 数据库删除
             cursor.execute("DELETE FROM tasks WHERE status = 'failed'")
             logger.info(f"🧹 Cleared {cursor.rowcount} failed tasks (files deleted for {count} tasks)")
@@ -1180,9 +1281,7 @@ class TaskDB:
                 )
                 existing_count = int(cursor.fetchone()["count"])
                 if existing_count:
-                    raise RuntimeError(
-                        f"refusing to discard {existing_count} existing children for {task_id}"
-                    )
+                    raise RuntimeError(f"refusing to discard {existing_count} existing children for {task_id}")
                 cursor.execute(
                     """
                     UPDATE tasks
@@ -1235,9 +1334,7 @@ class TaskDB:
             )
             existing_count = int(cursor.fetchone()["count"])
             if existing_count:
-                raise RuntimeError(
-                    f"refusing to replace {existing_count} existing children for {parent_task_id}"
-                )
+                raise RuntimeError(f"refusing to replace {existing_count} existing children for {parent_task_id}")
             cursor.execute("SELECT task_id FROM tasks WHERE task_id = ?", (parent_task_id,))
             if cursor.fetchone() is None:
                 raise ValueError(f"parent task not found: {parent_task_id}")
@@ -1279,8 +1376,14 @@ class TaskDB:
                     ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
                     """,
                     (
-                        child_id, parent_task_id, chunk["file_name"], chunk["path"],
-                        backend, json.dumps(child_options), priority, user_id,
+                        child_id,
+                        parent_task_id,
+                        chunk["file_name"],
+                        chunk["path"],
+                        backend,
+                        json.dumps(child_options),
+                        priority,
+                        user_id,
                         int(bool(child_options.get("preserve_all_artifacts", False))),
                     ),
                 )
@@ -1288,7 +1391,8 @@ class TaskDB:
         failed = []
         for child_id, chunk in zip(child_ids, chunks):
             accepted = self._enqueue_to_redis(
-                child_id, priority,
+                child_id,
+                priority,
                 {"file_name": chunk["file_name"], "backend": backend, "parent_task_id": parent_task_id},
             )
             if REDIS_QUEUE_AVAILABLE and not accepted and not _sqlite_queue_fallback_enabled():
@@ -1346,11 +1450,15 @@ class TaskDB:
             )
 
         # 入 Redis 队列,让 Redis-first worker 能及时拉到子任务
-        self._enqueue_to_redis(task_id, priority, {
-            "file_name": file_name,
-            "backend": backend,
-            "parent_task_id": parent_task_id,
-        })
+        self._enqueue_to_redis(
+            task_id,
+            priority,
+            {
+                "file_name": file_name,
+                "backend": backend,
+                "parent_task_id": parent_task_id,
+            },
+        )
 
         logger.debug(f"📄 Created child task: {task_id} (parent: {parent_task_id})")
         return task_id
@@ -1405,7 +1513,7 @@ class TaskDB:
                         )
                      )
                   )
-                  AND (? IS NULL OR COALESCE(merge_attempts, 0) < ?)
+                  AND (? = 1 OR ? IS NULL OR COALESCE(merge_attempts, 0) < ?)
                 """,
                 (
                     completed_children,
@@ -1415,6 +1523,7 @@ class TaskDB:
                     1 if force else 0,
                     stale_seconds,
                     stale_seconds,
+                    1 if force else 0,
                     max_attempts,
                     max_attempts,
                 ),
@@ -1541,11 +1650,14 @@ class TaskDB:
                     )
                     is_stale = bool(cursor.fetchone()["stale"])
                 has_open_merge_lease = bool(item.get("merge_owner")) and bool(item.get("merge_claimed_at"))
-                if attempts >= max_attempts or item.get("child_failed"):
+                force_over_attempt_limit = bool(force and task_id == item.get("task_id"))
+                if (attempts >= max_attempts and not force_over_attempt_limit) or item.get("child_failed"):
                     classification = "blocked"
                 elif completed >= child_count and status in ("processing", "pending"):
                     classification = "finalizable"
-                elif completed >= child_count and status == "merging" and (force or not has_open_merge_lease or is_stale):
+                elif (
+                    completed >= child_count and status == "merging" and (force or not has_open_merge_lease or is_stale)
+                ):
                     classification = "remergeable"
                 else:
                     classification = "blocked"
@@ -1636,7 +1748,9 @@ class TaskDB:
                 return parent_task_id
             logger.info(f"↩️ Merge already claimed by another owner for {parent_task_id}")
         elif parent:
-            logger.info(f"⏳ Subtask progress: {completed_children}/{parent['child_count']} for parent task {parent_task_id}")
+            logger.info(
+                f"⏳ Subtask progress: {completed_children}/{parent['child_count']} for parent task {parent_task_id}"
+            )
         return None
 
     def on_child_task_failed(self, child_task_id: str, error_message: str):
@@ -1795,7 +1909,11 @@ class TaskDB:
                         merge_error = NULL
                     WHERE task_id = ?
                     """,
-                    (f"Retry enqueue failed for {len(failed_task_ids)} child task(s)", completed_children, parent_task_id),
+                    (
+                        f"Retry enqueue failed for {len(failed_task_ids)} child task(s)",
+                        completed_children,
+                        parent_task_id,
+                    ),
                 )
 
     def retry_failed_logical_task(self, task_id: str) -> Dict:
@@ -1939,7 +2057,9 @@ class TaskDB:
             "mode": mode,
             "status": status,
             "requeued_task_ids": [item["task_id"] for item in successful_requeued_tasks],
-            "requeued_child_count": sum(1 for item in successful_requeued_tasks if item.get("parent_task_id") == task_id),
+            "requeued_child_count": sum(
+                1 for item in successful_requeued_tasks if item.get("parent_task_id") == task_id
+            ),
             "enqueue_failed_task_ids": enqueue_failed_task_ids,
         }
 
@@ -1952,9 +2072,7 @@ class TaskDB:
             if not parent or not parent["is_parent"] or int(parent["child_count"] or 0) <= 0:
                 raise ValueError(f"completed split parent not found: {parent_task_id}")
             if parent["status"] != "completed":
-                raise ValueError(
-                    f"parent {parent_task_id} must be completed before artifact reparse"
-                )
+                raise ValueError(f"parent {parent_task_id} must be completed before artifact reparse")
             cursor.execute(
                 """
                 SELECT task_id, priority, file_name, backend, parent_task_id, file_path
@@ -1972,10 +2090,7 @@ class TaskDB:
                 )
             missing_inputs = [item["task_id"] for item in children if not Path(item["file_path"]).is_file()]
             if missing_inputs:
-                raise ValueError(
-                    "child PDF inputs must be regenerated before requeue: "
-                    + ", ".join(missing_inputs)
-                )
+                raise ValueError("child PDF inputs must be regenerated before requeue: " + ", ".join(missing_inputs))
             child_ids = [item["task_id"] for item in children]
             placeholders = ",".join("?" for _ in child_ids)
             cursor.execute(
@@ -2031,7 +2146,7 @@ class TaskDB:
                 SET status = 'paused' 
                 WHERE task_id = ? AND status = 'pending'
                 """,
-                (task_id,)
+                (task_id,),
             )
             return cursor.rowcount > 0
 
@@ -2046,7 +2161,7 @@ class TaskDB:
                 SET status = 'pending' 
                 WHERE task_id = ? AND status = 'paused'
                 """,
-                (task_id,)
+                (task_id,),
             )
             return cursor.rowcount > 0
 
@@ -2061,7 +2176,7 @@ class TaskDB:
                 SET result_path = 'CLEARED' 
                 WHERE task_id = ?
                 """,
-                (task_id,)
+                (task_id,),
             )
             return cursor.rowcount > 0
 

@@ -328,7 +328,7 @@ class WorkerEndpointStrategyTest(unittest.TestCase):
         self.assertEqual(api.task_db.status, "completed")
         self.assertEqual(api.task_db.calls[-1]["worker_id"], "worker-b")
 
-    def test_completion_payload_includes_backward_compatible_metrics(self):
+    def test_completion_payload_is_compact_and_keeps_typed_metrics(self):
         api = worker.MinerUWorkerAPI(enable_worker_loop=False, worker_group_index=4)
         api.worker_id = "worker-b"
         api.worker_child_index = 2
@@ -348,7 +348,10 @@ class WorkerEndpointStrategyTest(unittest.TestCase):
 
         self.assertTrue(completed)
         payload = json.loads(api.task_db.calls[-1]["data"])
-        self.assertEqual(payload["markdown"], "ok")
+        self.assertEqual(payload["schema_version"], 2)
+        self.assertEqual(payload["storage"], "filesystem")
+        self.assertNotIn("markdown", payload)
+        self.assertNotIn("json_content", payload)
         self.assertEqual(payload["pdf_path"], "/tmp/out/source.pdf")
         self.assertEqual(payload["metrics"]["page_count"], 2)
         self.assertEqual(payload["metrics"]["worker_group_index"], 4)

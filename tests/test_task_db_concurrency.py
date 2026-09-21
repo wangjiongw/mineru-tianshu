@@ -362,3 +362,26 @@ def test_create_task_no_redis_module_keeps_sqlite_fallback_semantics(tmp_path, m
     assert result["enqueue_failed"] is False
     assert result["enqueue_failed_task_ids"] == []
     assert db.get_task(result["task_id"])["status"] == "pending"
+
+
+def test_storage_health_and_manual_passive_checkpoint(tmp_path):
+    db = TaskDB(tmp_path / "tasks.db")
+    db.create_task("health.pdf", "/tmp/health.pdf")
+    health = db.storage_health()
+    assert health["database_bytes"] > 0
+    assert health["level"] in {"ok", "warning", "critical"}
+    checkpoint = db.checkpoint_wal("PASSIVE")
+    assert checkpoint["mode"] == "PASSIVE"
+    assert set(checkpoint) == {"mode", "busy", "log_pages", "checkpointed_pages"}
+
+
+def test_force_claim_can_bypass_attempt_limit_only_when_explicit(tmp_path):
+    db = TaskDB(tmp_path / "tasks.db")
+    parent = db.create_task("parent.pdf", "/tmp/parent.pdf")["task_id"]
+    db.convert_to_parent_task(parent, child_count=0)
+    child = db.create_child_task(parent, "child.pdf", "/tmp/child.pdf")
+    with db.get_cursor() as cursor:
+        cursor.execute("UPDATE tasks SET status='completed' WHERE task_id=?", (child,))
+        cursor.execute("UPDATE tasks SET status='merging', merge_attempts=3 WHERE task_id=?", (parent,))
+    assert not db.claim_parent_merge(parent, "normal", max_attempts=3)
+    assert db.claim_parent_merge(parent, "forced", max_attempts=3, force=True)

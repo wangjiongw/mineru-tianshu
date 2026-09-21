@@ -108,9 +108,7 @@ def _load_content_list_v2(child: dict) -> list:
         raise ValueError("MinerU content-list v2 must be a list of page lists")
     expected = child_page_count(child)
     if expected is not None and len(data) != expected:
-        raise ValueError(
-            f"MinerU content-list v2 page count mismatch: pages={len(data)} expected={expected}"
-        )
+        raise ValueError(f"MinerU content-list v2 page count mismatch: pages={len(data)} expected={expected}")
     return data
 
 
@@ -137,14 +135,10 @@ def _validate_chunk_sequence(parent_task: dict, children: list[dict]) -> list[st
             reasons.append(f"child {child_id} has invalid chunk_info")
             continue
         if end - start + 1 != count:
-            reasons.append(
-                f"child {child_id} range/count mismatch: {start}-{end} count={count}"
-            )
+            reasons.append(f"child {child_id} range/count mismatch: {start}-{end} count={count}")
         if previous_end is not None and start != previous_end + 1:
             kind = "overlap" if start <= previous_end else "gap"
-            reasons.append(
-                f"child range {kind}: previous_end={previous_end} next_start={start}"
-            )
+            reasons.append(f"child range {kind}: previous_end={previous_end} next_start={start}")
         previous_end = end
         try:
             content = _load_content_list(child)
@@ -162,8 +156,7 @@ def _validate_chunk_sequence(parent_task: dict, children: list[dict]) -> list[st
             model_pages = _load_model_pages(child)
             if len(model_pages) != count:
                 reasons.append(
-                    f"mineru model page count mismatch for child {child_id}: "
-                    f"pages={len(model_pages)} expected={count}"
+                    f"mineru model page count mismatch for child {child_id}: pages={len(model_pages)} expected={count}"
                 )
         except Exception as exc:
             reasons.append(f"invalid mineru model for child {child_id}: {exc}")
@@ -175,13 +168,9 @@ def _validate_chunk_sequence(parent_task: dict, children: list[dict]) -> list[st
         expected_pages = int(split_info.get("processed_pages", expected_end - expected_start + 1))
         actual_pages = sum(child_page_count(child) or 0 for child in ordered)
         if child_start_page(ordered[0]) != expected_start:
-            reasons.append(
-                f"first child starts at {child_start_page(ordered[0])}, expected {expected_start}"
-            )
+            reasons.append(f"first child starts at {child_start_page(ordered[0])}, expected {expected_start}")
         if child_end_page(ordered[-1]) != expected_end:
-            reasons.append(
-                f"last child ends at {child_end_page(ordered[-1])}, expected {expected_end}"
-            )
+            reasons.append(f"last child ends at {child_end_page(ordered[-1])}, expected {expected_end}")
         if actual_pages != expected_pages:
             reasons.append(f"merged page count {actual_pages}, expected {expected_pages}")
     return reasons
@@ -213,19 +202,32 @@ def build_completion_payload(
     worker_child_index: Optional[int],
     processing_seconds: Optional[float],
 ) -> str:
-    payload = {
-        "pdf_path": result.get("pdf_path"),
-        "json_content": result.get("json_content"),
-        "markdown": result.get("content"),
-        "markdown_file": result.get("markdown_file"),
-        "metrics": {
-            "page_count": page_count,
-            "worker_group_index": worker_group_index,
-            "worker_child_index": worker_child_index,
-            "processing_seconds": processing_seconds,
-        },
+    metrics = {
+        "page_count": page_count,
+        "worker_group_index": worker_group_index,
+        "worker_child_index": worker_child_index,
+        "processing_seconds": processing_seconds,
     }
-    return json.dumps(payload)
+    if os.getenv("TASK_DATA_PAYLOAD_MODE", "compact").lower() == "legacy":
+        return json.dumps(
+            {
+                "schema_version": 1,
+                "pdf_path": result.get("pdf_path"),
+                "json_content": result.get("json_content"),
+                "markdown": result.get("content"),
+                "markdown_file": result.get("markdown_file"),
+                "metrics": metrics,
+            }
+        )
+    return json.dumps(
+        {
+            "schema_version": 2,
+            "storage": "filesystem",
+            "pdf_path": result.get("pdf_path"),
+            "markdown_file": result.get("markdown_file"),
+            "metrics": metrics,
+        }
+    )
 
 
 def _child_result_dir(child: dict) -> Optional[Path]:
@@ -258,9 +260,7 @@ def _find_child_content_list(child: dict) -> Optional[Path]:
         if candidate.is_file():
             return candidate
     candidates = sorted(
-        path
-        for path in result_dir.rglob("*.json")
-        if "content_list" in path.name and "_v2" not in path.name
+        path for path in result_dir.rglob("*.json") if "content_list" in path.name and "_v2" not in path.name
     )
     return candidates[0] if candidates else None
 
@@ -269,9 +269,10 @@ def _find_child_content_list_v2(child: dict) -> Optional[Path]:
     result_dir = _child_result_dir(child)
     if result_dir is None:
         return None
-    candidate = result_dir / "result_content_list_v2.json"
-    if candidate.is_file():
-        return candidate
+    for name in ("content_list_v2.json", "result_content_list_v2.json"):
+        candidate = result_dir / name
+        if candidate.is_file():
+            return candidate
     candidates = sorted(result_dir.rglob("*_content_list_v2.json"))
     return candidates[0] if candidates else None
 
@@ -289,12 +290,7 @@ def _find_child_model(child: dict) -> Optional[Path]:
 
 def _is_mineru_parent(parent_task: dict) -> bool:
     backend = str(parent_task.get("backend") or "").lower()
-    return (
-        backend == "auto"
-        or "pipeline" in backend
-        or backend.startswith("hybrid-")
-        or backend.startswith("vlm-")
-    )
+    return backend == "auto" or "pipeline" in backend or backend.startswith("hybrid-") or backend.startswith("vlm-")
 
 
 def validate_parent_merge_inputs(parent_task: dict) -> tuple[list[dict], list[str]]:
@@ -306,9 +302,7 @@ def validate_parent_merge_inputs(parent_task: dict) -> tuple[list[dict], list[st
     completed_children = [child for child in children if child.get("status") == "completed"]
     reasons = []
     if len(children) != child_count:
-        reasons.append(
-            f"child row count mismatch for {parent_task_id}: rows={len(children)} expected={child_count}"
-        )
+        reasons.append(f"child row count mismatch for {parent_task_id}: rows={len(children)} expected={child_count}")
     if len(completed_children) != child_count:
         reasons.append(
             f"completed child count mismatch for {parent_task_id}: completed={len(completed_children)} expected={child_count}"
@@ -343,19 +337,16 @@ def validate_parent_merge_inputs(parent_task: dict) -> tuple[list[dict], list[st
     if require_content_v2:
         reasons.extend(
             f"child {child_id} has no MinerU content-list v2 artifact"
-            for child_id, path in content_v2_presence if path is None
+            for child_id, path in content_v2_presence
+            if path is None
         )
     if require_content:
         reasons.extend(
-            f"child {child_id} has no content-list artifact"
-            for child_id, path in content_presence
-            if path is None
+            f"child {child_id} has no content-list artifact" for child_id, path in content_presence if path is None
         )
     if require_model:
         reasons.extend(
-            f"child {child_id} has no mineru-model artifact"
-            for child_id, path in model_presence
-            if path is None
+            f"child {child_id} has no mineru-model artifact" for child_id, path in model_presence if path is None
         )
     if len(completed_children) == child_count and not any(
         "no content-list" in reason or "no mineru-model" in reason for reason in reasons
@@ -408,12 +399,33 @@ def _copy_child_images(child: dict, image_dir: Path, referenced_names: set[str])
     return mapping
 
 
+_MARKDOWN_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
+_HTML_IMAGE_RE = re.compile(r'<img([^>]*?)src=["\']([^"\']+)["\']([^>]*)>', re.IGNORECASE)
+
+
+def _direct_image_reference(value: str) -> Optional[str]:
+    """Return a standalone image path, not a directory or rich-text fragment."""
+    stripped = value.strip()
+    if not stripped or stripped.endswith("/") or "<" in stripped or "![" in stripped:
+        return None
+    path = urlsplit(stripped).path
+    name = Path(path).name
+    if name and Path(name).suffix.lower() in IMAGE_SUFFIXES and ("images/" in path or "/images/" in path):
+        return stripped
+    return None
+
+
+def _image_references_in_text(value: str) -> list[str]:
+    references = [match.group(2) for match in _MARKDOWN_IMAGE_RE.finditer(value)]
+    references.extend(match.group(2) for match in _HTML_IMAGE_RE.finditer(value))
+    direct = _direct_image_reference(value)
+    if direct:
+        references.append(direct)
+    return references
+
+
 def _collect_image_names(markdown: str, json_values: list) -> set[str]:
-    values = []
-    for left, right in re.findall(
-        r"!\[[^\]]*\]\(([^)]+)\)|<img[^>]+src=[\"']([^\"']+)", markdown
-    ):
-        values.append(left or right)
+    values = _image_references_in_text(markdown)
 
     def collect(value):
         if isinstance(value, dict):
@@ -423,13 +435,11 @@ def _collect_image_names(markdown: str, json_values: list) -> set[str]:
             for item in value:
                 collect(item)
         elif isinstance(value, str):
-            values.append(value)
+            values.extend(_image_references_in_text(value))
 
     collect(json_values)
     names = set()
     for value in values:
-        if not isinstance(value, str) or not ("images/" in value or "/images/" in value):
-            continue
         name = Path(urlsplit(value).path).name
         if name and Path(name).suffix.lower() in IMAGE_SUFFIXES:
             names.add(name)
@@ -464,9 +474,11 @@ def _rewrite_json_image_paths(value, mapping: dict[str, str]):
     if isinstance(value, list):
         return [_rewrite_json_image_paths(item, mapping) for item in value]
     if isinstance(value, str):
-        mapped = _mapped_image_name(value, mapping)
-        if mapped and ("images/" in value or "/images/" in value):
+        direct = _direct_image_reference(value)
+        mapped = _mapped_image_name(direct, mapping) if direct else None
+        if mapped:
             return f"images/{mapped}"
+        return _rewrite_markdown_image_paths(value, mapping)
     return value
 
 
@@ -481,8 +493,8 @@ def _rewrite_markdown_image_paths(content: str, mapping: dict[str, str]) -> str:
             return match.group(0)
         return f'<img{match.group(1)}src="images/{mapped}"{match.group(3)}>'
 
-    content = re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", replace_markdown, content)
-    return re.sub(r'<img([^>]*?)src=["\']([^"\']+)["\']([^>]*)>', replace_html, content)
+    content = _MARKDOWN_IMAGE_RE.sub(replace_markdown, content)
+    return _HTML_IMAGE_RE.sub(replace_html, content)
 
 
 def _offset_page_indexes(value, offset: int):
@@ -527,7 +539,9 @@ def _model_pages_from_child(child: dict, image_mapping: dict[str, str]) -> list:
     expected = child_page_count(child)
     if expected is not None and len(pages) != expected:
         raise ParentMergeInputError(
-            [f"mineru model page count mismatch for child {child.get('task_id')}: pages={len(pages)} expected={expected}"]
+            [
+                f"mineru model page count mismatch for child {child.get('task_id')}: pages={len(pages)} expected={expected}"
+            ]
         )
     return _rewrite_json_image_paths(pages, image_mapping)
 
@@ -557,17 +571,18 @@ def _api_markdown(local_markdown: str, parent_out: Path, output_dir: str) -> str
 def _validate_local_image_references(markdown: str, json_values: list, image_dir: Path) -> None:
     references = []
     invalid = []
-    for left, right in re.findall(
-        r"!\[[^\]]*\]\(([^)]+)\)|<img[^>]+src=[\"']([^\"']+)", markdown
-    ):
-        value = left or right
+
+    def validate(value: str):
         if value.startswith("data:"):
-            continue
+            return
         path = urlsplit(value).path
         if not path.startswith("images/"):
             invalid.append(value)
         else:
             references.append(path)
+
+    for value in _image_references_in_text(markdown):
+        validate(value)
 
     def collect(value):
         if isinstance(value, dict):
@@ -576,18 +591,15 @@ def _validate_local_image_references(markdown: str, json_values: list, image_dir
         elif isinstance(value, list):
             for item in value:
                 collect(item)
-        elif isinstance(value, str) and ("images/" in value or "/images/" in value):
-            path = urlsplit(value).path
-            if not path.startswith("images/"):
-                invalid.append(value)
-            else:
-                references.append(path)
+        elif isinstance(value, str):
+            for reference in _image_references_in_text(value):
+                validate(reference)
 
     collect(json_values)
     if invalid:
-        raise ParentMergeInputError([
-            "merged output contains non-local image references: " + ", ".join(sorted(set(invalid))[:10])
-        ])
+        raise ParentMergeInputError(
+            ["merged output contains non-local image references: " + ", ".join(sorted(set(invalid))[:10])]
+        )
     missing = sorted({ref for ref in references if not (image_dir / Path(ref).name).is_file()})
     if missing:
         raise ParentMergeInputError([f"merged output has missing image references: {', '.join(missing[:10])}"])
@@ -664,11 +676,13 @@ def build_parent_task_artifacts(
         "outputs": {},
     }
     split_info = _task_options(parent_task).get("split_info") or {}
-    manifest["source"].update({
-        "total_pages": split_info.get("source_total_pages"),
-        "processed_start_page": split_info.get("start_page"),
-        "processed_end_page": split_info.get("end_page"),
-    })
+    manifest["source"].update(
+        {
+            "total_pages": split_info.get("source_total_pages"),
+            "processed_start_page": split_info.get("start_page"),
+            "processed_end_page": split_info.get("end_page"),
+        }
+    )
     if not split_info:
         manifest["validation"]["warnings"].append(
             "legacy parent has no split_info; range validated from child chunk_info only"
@@ -693,8 +707,10 @@ def build_parent_task_artifacts(
             content_v2_handle.write("[\n")
         if model_handle:
             model_handle.write("[\n")
-        with (staging_dir / "full.md").open("w", encoding="utf-8") as full_md, \
-             (staging_dir / "result.md").open("w", encoding="utf-8") as result_md:
+        with (
+            (staging_dir / "full.md").open("w", encoding="utf-8") as full_md,
+            (staging_dir / "result.md").open("w", encoding="utf-8") as result_md,
+        ):
             for index, child in enumerate(completed_children, start=1):
                 markdown_file = find_child_markdown(child)
                 if markdown_file is None:
@@ -703,9 +719,7 @@ def build_parent_task_artifacts(
                 raw_content = _load_content_list(child) if has_content_lists else []
                 raw_content_v2 = _load_content_list_v2(child) if has_content_lists_v2 else []
                 raw_model = _load_model_pages(child) if has_model_outputs else []
-                referenced_names = _collect_image_names(
-                    raw_markdown, [raw_content, raw_content_v2, raw_model]
-                )
+                referenced_names = _collect_image_names(raw_markdown, [raw_content, raw_content_v2, raw_model])
                 image_mapping = _copy_child_images(child, image_dir, referenced_names)
 
                 markdown = _rewrite_markdown_image_paths(raw_markdown, image_mapping)
@@ -715,9 +729,7 @@ def build_parent_task_artifacts(
                 )
                 content_v2_pages = _rewrite_json_image_paths(raw_content_v2, image_mapping)
                 model_pages = _rewrite_json_image_paths(raw_model, image_mapping)
-                _validate_local_image_references(
-                    markdown, [content_items, content_v2_pages, model_pages], image_dir
-                )
+                _validate_local_image_references(markdown, [content_items, content_v2_pages, model_pages], image_dir)
 
                 if index > 1:
                     full_md.write("\n\n\n\n")
@@ -727,27 +739,27 @@ def build_parent_task_artifacts(
                 if content_handle:
                     content_first = _write_json_items(content_handle, content_items, content_first)
                 if content_v2_handle:
-                    content_v2_first = _write_json_items(
-                        content_v2_handle, content_v2_pages, content_v2_first
-                    )
+                    content_v2_first = _write_json_items(content_v2_handle, content_v2_pages, content_v2_first)
                 if model_handle:
                     model_first = _write_json_items(model_handle, model_pages, model_first)
 
                 start_page = child_start_page(child)
                 end_page = child_end_page(child)
                 page_count = child_page_count(child) or 0
-                manifest["chunks"].append({
-                    "task_id": child.get("task_id"),
-                    "index": child_index(child),
-                    "start_page": start_page,
-                    "end_page": end_page,
-                    "page_count": page_count,
-                    "model_pages": len(model_pages),
-                    "content_items": len(content_items),
-                    "content_v2_pages": len(content_v2_pages),
-                    "markdown_characters": len(markdown),
-                    "referenced_images": len(referenced_names),
-                })
+                manifest["chunks"].append(
+                    {
+                        "task_id": child.get("task_id"),
+                        "index": child_index(child),
+                        "start_page": start_page,
+                        "end_page": end_page,
+                        "page_count": page_count,
+                        "model_pages": len(model_pages),
+                        "content_items": len(content_items),
+                        "content_v2_pages": len(content_v2_pages),
+                        "markdown_characters": len(markdown),
+                        "referenced_images": len(referenced_names),
+                    }
+                )
                 manifest["totals"]["pages"] += page_count
                 manifest["totals"]["content_items"] += len(content_items)
                 manifest["totals"]["markdown_characters"] += len(markdown)
@@ -767,6 +779,7 @@ def build_parent_task_artifacts(
             content_v2_handle.write("\n]\n")
             content_v2_handle.close()
             content_v2_handle = None
+            _link_or_copy(content_v2_path, staging_dir / "content_list_v2.json")
         if model_handle:
             model_handle.write("\n]\n")
             model_handle.close()
@@ -775,18 +788,28 @@ def build_parent_task_artifacts(
         _copy_parent_pdf(parent_task, staging_dir, parent_out, ensure_pdf_in_output)
         source_pdf = next((path for path in sorted(staging_dir.glob("*.pdf")) if path.is_file()), None)
         if source_pdf:
-            manifest["source"].update({
-                "file": source_pdf.name,
-                "sha256": _sha256(source_pdf),
-                "bytes": source_pdf.stat().st_size,
-            })
-        manifest["totals"].update({
-            "images": sum(1 for path in image_dir.iterdir() if path.is_file()),
-            "image_bytes": sum(path.stat().st_size for path in image_dir.iterdir() if path.is_file()),
-        })
+            manifest["source"].update(
+                {
+                    "file": source_pdf.name,
+                    "sha256": _sha256(source_pdf),
+                    "bytes": source_pdf.stat().st_size,
+                }
+            )
+        manifest["totals"].update(
+            {
+                "images": sum(1 for path in image_dir.iterdir() if path.is_file()),
+                "image_bytes": sum(path.stat().st_size for path in image_dir.iterdir() if path.is_file()),
+            }
+        )
         for name in (
-            "full.md", "result.md", "result.json", "content_list.json",
-            "result_content_list.json", "result_content_list_v2.json", "mineru_model.json",
+            "full.md",
+            "result.md",
+            "result.json",
+            "content_list.json",
+            "result_content_list.json",
+            "content_list_v2.json",
+            "result_content_list_v2.json",
+            "mineru_model.json",
         ):
             path = staging_dir / name
             if path.is_file():
@@ -804,6 +827,7 @@ def build_parent_task_artifacts(
             model_handle.close()
         shutil.rmtree(staging_dir, ignore_errors=True)
     return parent_out
+
 
 def rebuild_completed_parent_artifacts(*, task_db, parent_task_id: str, output_dir: str) -> Path:
     parent_task = task_db.get_task_with_children(parent_task_id)
@@ -830,8 +854,11 @@ def merge_parent_task_results(
         output_dir=output_dir,
         ensure_pdf_in_output=ensure_pdf_in_output,
         lease_refresh=(
-            lambda: task_db.refresh_parent_merge_lease(parent_task_id, merge_owner)
-            if hasattr(task_db, "refresh_parent_merge_lease") else True
+            lambda: (
+                task_db.refresh_parent_merge_lease(parent_task_id, merge_owner)
+                if hasattr(task_db, "refresh_parent_merge_lease")
+                else True
+            )
         ),
     )
     if not task_db.complete_parent_merge(parent_task_id, str(parent_out), merge_owner):
