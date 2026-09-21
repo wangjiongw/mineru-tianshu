@@ -262,9 +262,10 @@ class TaskDB:
             conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=30000")
-        conn.execute(f"PRAGMA synchronous={_SQLITE_SYNCHRONOUS}")
-        if not self.read_only:
-            conn.execute(f"PRAGMA wal_autocheckpoint={_SQLITE_WAL_AUTOCHECKPOINT}")
+        # Do not change durability/checkpoint PRAGMAs on every connection here.
+        # On the production shared filesystem this can fail with disk I/O error
+        # before the application write lock is acquired. _init_db applies the
+        # configured values once under the serialized initialization path.
         return conn
 
     @contextmanager
