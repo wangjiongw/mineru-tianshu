@@ -45,22 +45,39 @@ def submit_task(
     lang: str,
     method: str,
     preserve_all_artifacts: bool = False,
+    max_retries: int = 4,
+    retry_base_seconds: float = 2.0,
 ) -> str:
-    """Submit a single PDF task and return task_id."""
+    """Submit a PDF, retrying only responses that are safe and explicitly transient."""
     url = f"{base_url}/api/v1/tasks/submit"
     headers = {"Authorization": f"Bearer {token}"}
-    with pdf_path.open("rb") as f:
-        files = {"file": (pdf_path.name, f, "application/pdf")}
-        data = {
-            "backend": backend,
-            "lang": lang,
-            "method": method,
-            "preserve_all_artifacts": str(preserve_all_artifacts).lower(),
-        }
-        resp = requests.post(url, headers=headers, files=files, data=data, timeout=600)
-    resp.raise_for_status()
-    result = resp.json()
-    return result["task_id"]
+    data = {
+        "backend": backend,
+        "lang": lang,
+        "method": method,
+        "preserve_all_artifacts": str(preserve_all_artifacts).lower(),
+    }
+    for attempt in range(max_retries + 1):
+        with pdf_path.open("rb") as f:
+            files = {"file": (pdf_path.name, f, "application/pdf")}
+            resp = requests.post(url, headers=headers, files=files, data=data, timeout=600)
+        body = resp.text.lower()
+        retryable = resp.status_code in {429, 503} or (
+            resp.status_code == 500 and ("database is locked" in body or "sqlite_write_busy" in body)
+        )
+        if resp.ok:
+            return resp.json()["task_id"]
+        if not retryable or attempt >= max_retries:
+            resp.raise_for_status()
+        retry_after = resp.headers.get("Retry-After")
+        try:
+            delay = float(retry_after) if retry_after is not None else retry_base_seconds * (2**attempt)
+        except ValueError:
+            delay = retry_base_seconds * (2**attempt)
+        delay = min(max(delay, 0.0), 30.0)
+        log(f"Transient submit failure HTTP {resp.status_code}; retry {attempt + 1}/{max_retries} in {delay:.1f}s")
+        time.sleep(delay)
+    raise RuntimeError("unreachable submit retry state")
 
 
 def retry_task(base_url: str, token: str, task_id: str) -> None:
@@ -199,9 +216,7 @@ def save_result(
 
     json_content = data.get("json_content")
     if json_content is not None:
-        (out_dir / "result.json").write_text(
-            json.dumps(json_content, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        (out_dir / "result.json").write_text(json.dumps(json_content, ensure_ascii=False, indent=2), encoding="utf-8")
 
     mineru_model_content = data.get("mineru_model_content")
     if mineru_model_content is not None:
@@ -329,6 +344,8 @@ def main() -> None:
     )
     parser.add_argument("--batch-size", type=int, default=100, help="Max PDFs per submit batch")
     parser.add_argument("--max-retries", type=int, default=0, help="Max retries per task (failed/timeout)")
+    parser.add_argument("--submit-max-retries", type=int, default=4, help="Retries for transient submit HTTP failures")
+    parser.add_argument("--submit-retry-base-seconds", type=float, default=2.0, help="Initial submit retry delay")
     parser.add_argument("--tasks-file", help="Tasks state JSON file")
     parser.add_argument("--summary-json", help="Summary JSON output path")
     parser.add_argument("--summary-csv", help="Summary CSV output path")
@@ -424,7 +441,7 @@ def main() -> None:
     log(f"Pending tasks: {total_pending}")
 
     for batch_start in range(0, total_pending, args.batch_size):
-        batch_rels = pending_rels[batch_start: batch_start + args.batch_size]
+        batch_rels = pending_rels[batch_start : batch_start + args.batch_size]
         log(f"Stage 4/6: submit batch {batch_start // args.batch_size + 1} ({len(batch_rels)} tasks)")
 
         for rel in batch_rels:
@@ -451,6 +468,8 @@ def main() -> None:
                     args.lang,
                     args.method,
                     preserve_all_artifacts=preserve_all_artifacts,
+                    max_retries=args.submit_max_retries,
+                    retry_base_seconds=args.submit_retry_base_seconds,
                 )
                 item["task_id"] = task_id
                 item["status"] = "pending"
@@ -462,6 +481,8 @@ def main() -> None:
                 item["error"] = str(e)
                 item["last_update"] = datetime.now().isoformat()
                 log(f"Submit failed: {rel} ({e})")
+            finally:
+                save_tasks(tasks_file, tasks)
 
         save_tasks(tasks_file, tasks)
 
