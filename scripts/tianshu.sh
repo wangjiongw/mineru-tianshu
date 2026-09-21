@@ -50,6 +50,14 @@ VLLM_MODEL_PATH="/share/wangjiong/model_zoo/modelscope/models/OpenDataLab/MinerU
 VLLM_BASE_PORT=30025
 VLLM_NUM_INSTANCES="${VLLM_NUM_INSTANCES:-4}"
 MINERU_ACTIVE_INSTANCE_INDICES="${MINERU_ACTIVE_INSTANCE_INDICES:-0,1,2,3}"
+# JSON array of platform-managed OpenAI-compatible endpoints. When set, this
+# script manages only Tianshu and never starts/stops local vLLM processes.
+MINERU_VLLM_API_LIST="${MINERU_VLLM_API_LIST:-}"
+if [ -n "$MINERU_VLLM_API_LIST" ]; then
+    VLLM_ENDPOINT_STRATEGY="${VLLM_ENDPOINT_STRATEGY:-ring3}"
+else
+    VLLM_ENDPOINT_STRATEGY="${VLLM_ENDPOINT_STRATEGY:-local}"
+fi
 VLLM_MAX_MODEL_LEN=8192
 VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.60}" # 实测 c8 峰值 HBM < 86%，为 8 个任务进程保留安全余量
 VLLM_PERFORMANCE_MODE="${VLLM_PERFORMANCE_MODE:-throughput}" # 吞吐模式实测比 balanced 提升约 11%；可用 NPU<n> 覆盖
@@ -592,6 +600,28 @@ vllm_index_valid() {
 vllm_pid_file() { echo "${VLLM_LOG_DIR}/vllm_npu${1}.pid"; }
 vllm_expected_cmd() { echo "vllm.*serve.*${VLLM_MODEL_PATH}"; }
 
+external_vllm_enabled() { [ -n "$MINERU_VLLM_API_LIST" ]; }
+
+external_vllm_endpoints() {
+    "$PYTHON_BIN" -c '
+import json, sys
+endpoints = json.loads(sys.argv[1])
+if not isinstance(endpoints, list) or not endpoints or not all(isinstance(x, str) and x.startswith(("http://", "https://")) for x in endpoints):
+    raise SystemExit("MINERU_VLLM_API_LIST must be a non-empty JSON array of http(s) URLs")
+print("\n".join(x.rstrip("/") for x in endpoints))
+' "$MINERU_VLLM_API_LIST"
+}
+
+external_vllm_http_ready() {
+    local endpoints endpoint
+    endpoints="$(external_vllm_endpoints)" || return 1
+    local ready=1
+    while IFS= read -r endpoint; do
+        curl -fsS --max-time "${1:-$SUPERVISOR_HEALTH_PROBE_TIMEOUT_SECONDS}" "${endpoint}/models" > /dev/null 2>&1 && ready=0
+    done <<< "$endpoints"
+    return "$ready"
+}
+
 vllm_http_ready() {
     local index="$1"
     local timeout="${2:-$SUPERVISOR_HEALTH_PROBE_TIMEOUT_SECONDS}"
@@ -802,6 +832,11 @@ stop_vllm_instance() {
 # ============================================================================
 
 start_vllm() {
+    if external_vllm_enabled; then
+        external_vllm_http_ready || { log_error "外部 VLLM 无可用端点或配置无效"; return 1; }
+        log_info "使用平台托管的外部 VLLM，跳过本地启动"
+        return 0
+    fi
     validate_active_instance_indices || return 1
     log_step "启动 VLLM 服务 (激活实例: ${MINERU_ACTIVE_INSTANCE_INDICES})"
     local i started=0 failed=0 expected=0
@@ -814,6 +849,10 @@ start_vllm() {
 }
 
 stop_vllm() {
+    if external_vllm_enabled; then
+        log_info "外部 VLLM 由平台托管，跳过停止"
+        return 0
+    fi
     log_step "停止 VLLM 服务"
 
     for i in $(seq 0 $((VLLM_NUM_INSTANCES - 1))); do
@@ -829,6 +868,15 @@ stop_vllm() {
 }
 
 status_vllm() {
+    if external_vllm_enabled; then
+        echo -e "${CYAN}VLLM 服务 (平台托管)${NC}"
+        if external_vllm_http_ready; then
+            echo "  ✅ 外部端点至少一个可用"
+            return 0
+        fi
+        echo "  ❌ 外部端点未全部就绪或配置无效"
+        return 1
+    fi
     echo -e "${CYAN}VLLM 服务 (激活: ${MINERU_ACTIVE_INSTANCE_INDICES})${NC}"
     local i port pid_file running=0 required=0 failed=0
     for i in $(seq 0 $((VLLM_NUM_INSTANCES - 1))); do
@@ -1150,6 +1198,10 @@ handle_supervised_worker_restart_request() {
 
 worker_vllm_api_list() {
     local index="$1"
+    if external_vllm_enabled; then
+        echo "$MINERU_VLLM_API_LIST"
+        return 0
+    fi
     if [ "${VLLM_ENDPOINT_STRATEGY:-local}" = "ring3" ]; then
         local out="["
         local sep=""
@@ -1359,7 +1411,12 @@ check_worker_dependencies() {
     local index="$1"
     local vllm_port=$((VLLM_BASE_PORT + index))
 
-    if ! vllm_http_ready "$index"; then
+    if external_vllm_enabled; then
+        if ! external_vllm_http_ready; then
+            log_error "外部 VLLM 无可用端点或配置无效"
+            return 1
+        fi
+    elif ! vllm_http_ready "$index"; then
         log_error "VLLM #${index} 未就绪 (端口 ${vllm_port})"
         return 1
     fi
@@ -1378,8 +1435,6 @@ start_worker_instance() {
     check_worker_dependencies "$i" || return 1
 
     local port=$((WORKER_BASE_PORT + i))
-    local vllm_port=$((VLLM_BASE_PORT + i))
-    local vllm_api="http://localhost:${vllm_port}/v1"
     local vllm_api_list
     local worker_max_tasks
     local worker_hybrid_ratio=""
@@ -1408,7 +1463,7 @@ start_worker_instance() {
     find "$(worker_activity_dir "$i")" -mindepth 1 -type f -delete 2>/dev/null || true
     rm -f "$pid_file"
 
-    log_info "启动 Worker #${i}: Port=${port}, VLLM=${vllm_api}, hybrid_batch_ratio=${worker_hybrid_display}, max_concurrent_tasks=${worker_max_tasks}, config_revision=${worker_config_revision}"
+    log_info "启动 Worker #${i}: Port=${port}, VLLM=${vllm_api_list}, hybrid_batch_ratio=${worker_hybrid_display}, max_concurrent_tasks=${worker_max_tasks}, config_revision=${worker_config_revision}"
     cd "$BACKEND_DIR"
 
     DATABASE_PATH="$DATABASE_PATH" \
@@ -1611,6 +1666,10 @@ restart_compute_instance() {
     worker_index_valid "$i" || { log_error "无效 Worker 编号: $i"; return 1; }
     vllm_index_valid "$i" || { log_error "无效 VLLM 编号: $i"; return 1; }
     instance_index_active "$i" || { log_error "Compute #${i} 未包含在 MINERU_ACTIVE_INSTANCE_INDICES=${MINERU_ACTIVE_INSTANCE_INDICES}"; return 1; }
+    if external_vllm_enabled; then
+        log_error "外部 VLLM 由平台托管；请使用 restart worker ${i}"
+        return 1
+    fi
     if [ "${VLLM_ENDPOINT_STRATEGY:-local}" = "ring3" ]; then
         log_error "restart compute ${i} 不支持 VLLM_ENDPOINT_STRATEGY=ring3；跨端点 worker 可能仍在使用该 vLLM"
         return 1
@@ -2268,12 +2327,16 @@ restart_core() {
     check_instance_conflict || return 1
 
     status_redis >/dev/null || { log_error "Redis 未就绪；core 重启不会重启 Redis"; return 1; }
-    for i in $(active_instance_indices); do
-        if ! vllm_is_running "$i" || ! vllm_http_ready "$i"; then
-            log_error "VLLM #${i} 未就绪；core 重启不会重启 vLLM"
-            return 1
-        fi
-    done
+    if external_vllm_enabled; then
+        external_vllm_http_ready || { log_error "外部 VLLM 无可用端点或配置无效"; return 1; }
+    else
+        for i in $(active_instance_indices); do
+            if ! vllm_is_running "$i" || ! vllm_http_ready "$i"; then
+                log_error "VLLM #${i} 未就绪；core 重启不会重启 vLLM"
+                return 1
+            fi
+        done
+    fi
 
     log_step "安全重启核心服务 (实例 ${INSTANCE_ID}, Worker ${MINERU_ACTIVE_INSTANCE_INDICES})"
     # 先停止自动拉起组件，避免切换期间发生竞态；再停止 API 阻止新任务进入。
@@ -2431,7 +2494,7 @@ supervise_node() {
 supervise_compute_instance() {
     local i="$1"
     worker_index_valid "$i" || { log_error "无效 Compute 编号: $i"; return 1; }
-    vllm_index_valid "$i" || { log_error "无效 Compute 编号: $i"; return 1; }
+    external_vllm_enabled || vllm_index_valid "$i" || { log_error "无效 Compute 编号: $i"; return 1; }
     instance_index_active "$i" || { log_error "Compute #${i} 未包含在 MINERU_ACTIVE_INSTANCE_INDICES=${MINERU_ACTIVE_INSTANCE_INDICES}"; return 1; }
 
     separator
@@ -2441,7 +2504,7 @@ supervise_compute_instance() {
     source_ascend_env
     check_instance_conflict || return 1
 
-    if worker_is_running "$i" || vllm_is_running "$i"; then
+    if worker_is_running "$i" || { ! external_vllm_enabled && vllm_is_running "$i"; }; then
         if [ "${SUPERVISE_COMPUTE_REPLACE:-false}" != "true" ]; then
             log_error "Compute #${i} 已有运行进程；先安全停止，或显式设置 SUPERVISE_COMPUTE_REPLACE=true"
             return 2
@@ -2454,7 +2517,7 @@ supervise_compute_instance() {
             drain_worker_instance "$i" "${DRAIN_WAIT_SECONDS:-300}" || return 2
             stop_worker_instance "$i" || return 1
         fi
-        if vllm_is_running "$i"; then
+        if ! external_vllm_enabled && vllm_is_running "$i"; then
             stop_vllm_instance "$i" || return 1
         fi
     fi
@@ -2477,7 +2540,7 @@ supervise_compute_instance() {
 
     stop_owned_compute() {
         stop_worker_instance "$i" || true
-        stop_vllm_instance "$i" || true
+        external_vllm_enabled || stop_vllm_instance "$i" || true
         [ -z "$worker_pid" ] || wait "$worker_pid" 2>/dev/null || true
         [ -z "$vllm_pid" ] || wait "$vllm_pid" 2>/dev/null || true
         worker_pid=""
@@ -2502,13 +2565,15 @@ supervise_compute_instance() {
     write_compute_supervisor_state "$i"
 
     while true; do
-        if ! start_vllm_instance "$i"; then
-            log_warn "Compute #${i} supervisor could not start VLLM; retrying after ${backoff}s"
-            stop_owned_compute
-            wait_compute_backoff
-            continue
+        if ! external_vllm_enabled; then
+            if ! start_vllm_instance "$i"; then
+                log_warn "Compute #${i} supervisor could not start VLLM; retrying after ${backoff}s"
+                stop_owned_compute
+                wait_compute_backoff
+                continue
+            fi
+            vllm_pid="$(cat "$(vllm_pid_file "$i")" 2>/dev/null)"
         fi
-        vllm_pid="$(cat "$(vllm_pid_file "$i")" 2>/dev/null)"
 
         if ! start_worker_instance "$i"; then
             log_warn "Compute #${i} supervisor could not start Worker; retrying pair after ${backoff}s"
@@ -2517,7 +2582,11 @@ supervise_compute_instance() {
             continue
         fi
         worker_pid="$(cat "$(worker_pid_file "$i")" 2>/dev/null)"
-        log_info "Compute #${i} supervisor watching VLLM PID ${vllm_pid}, Worker PID ${worker_pid}"
+        if external_vllm_enabled; then
+            log_info "Compute #${i} supervisor watching external VLLM + Worker PID ${worker_pid}"
+        else
+            log_info "Compute #${i} supervisor watching VLLM PID ${vllm_pid}, Worker PID ${worker_pid}"
+        fi
         write_compute_supervisor_state "$i"
         if ! wait_worker_instance_ready "$i" "$WORKER_READY_TIMEOUT"; then
             log_warn "Compute #${i} Worker did not become ready within ${WORKER_READY_TIMEOUT}s; restarting pair after ${backoff}s"
@@ -2544,7 +2613,7 @@ supervise_compute_instance() {
             fi
             write_compute_supervisor_state "$i"
 
-            if ! pid_matches "$vllm_pid" "$(vllm_expected_cmd)" "$((VLLM_BASE_PORT + i))"; then
+            if ! external_vllm_enabled && ! pid_matches "$vllm_pid" "$(vllm_expected_cmd)" "$((VLLM_BASE_PORT + i))"; then
                 failed_component="VLLM"
                 failure_reason="process exited"
                 break
@@ -2557,7 +2626,7 @@ supervise_compute_instance() {
 
             now="$(date +%s)"
             if [ $((now - last_health_check)) -ge "$health_interval" ]; then
-                if vllm_http_healthy "$i" "$health_probe_timeout"; then
+                if { external_vllm_enabled && external_vllm_http_ready "$health_probe_timeout"; } || { ! external_vllm_enabled && vllm_http_healthy "$i" "$health_probe_timeout"; }; then
                     vllm_health_failures=0
                 else
                     vllm_health_failures=$((vllm_health_failures + 1))
@@ -2583,7 +2652,7 @@ supervise_compute_instance() {
             fi
 
             if [ $((now - last_heartbeat)) -ge "$heartbeat_seconds" ]; then
-                log_info "Compute #${i} supervisor heartbeat: VLLM PID ${vllm_pid}, Worker PID ${worker_pid}, health=ok"
+                log_info "Compute #${i} supervisor heartbeat: VLLM ${vllm_pid:-external}, Worker PID ${worker_pid}, health=ok"
                 last_heartbeat="$now"
             fi
             sleep "$poll_seconds"
@@ -2591,7 +2660,7 @@ supervise_compute_instance() {
 
         log_error "Compute #${i} supervisor detected ${failed_component} failure: ${failure_reason}"
         stop_owned_compute
-        log_warn "Compute #${i} supervisor restarting owned pair after ${backoff}s"
+        log_warn "Compute #${i} supervisor restarting owned services after ${backoff}s"
         wait_compute_backoff
     done
 }
@@ -2832,6 +2901,7 @@ MinerU Tianshu - 统一启动脚本
     VLLM_BASE_PORT       VLLM 起始端口
     VLLM_NUM_INSTANCES   VLLM 实例数量
     VLLM_READY_TIMEOUT   VLLM 健康检查超时秒数(默认 900;首次加载/kernel 编译慢可调大)
+    MINERU_VLLM_API_LIST 平台托管端点 JSON 数组；设置后不管理本地 vLLM，默认 ring3 分配
     WORKER_BASE_PORT     Worker 起始端口
     WORKER_NUM_INSTANCES Worker 数量
     DATABASE_PATH        数据库路径(自动派生自 INSTANCE_DATA_DIR)

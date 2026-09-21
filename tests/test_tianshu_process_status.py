@@ -285,6 +285,52 @@ class TianshuProcessStatusTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), '["http://localhost:30027/v1"]')
 
+    def test_external_vllm_list_is_validated_and_used_verbatim(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            endpoints = '["http://vllm-a:8000/v1/", "https://vllm-b/v1"]'
+            result = run_bash(
+                f"PYTHON_BIN=python3 MINERU_VLLM_API_LIST='{endpoints}'; "
+                'external_vllm_endpoints; worker_vllm_api_list 2',
+                tmp_path,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.splitlines(),
+            ["http://vllm-a:8000/v1", "https://vllm-b/v1", endpoints],
+        )
+
+    def test_external_vllm_lifecycle_never_manages_local_processes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            result = run_bash(
+                "MINERU_VLLM_API_LIST='[\"http://vllm/v1\"]'; "
+                'external_vllm_http_ready() { return 0; }; '
+                'validate_active_instance_indices() { echo local-start; }; '
+                'start_vllm; stop_vllm',
+                tmp_path,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("local-start", result.stdout)
+        self.assertIn("跳过本地启动", result.stdout)
+        self.assertIn("跳过停止", result.stdout)
+
+    def test_external_vllm_health_accepts_ring_failover(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            result = run_bash(
+                "PYTHON_BIN=python3 MINERU_VLLM_API_LIST='[\"http://vllm-a/v1\",\"http://vllm-b/v1\"]'; "
+                'curl() { [[ "$*" == *vllm-b* ]]; }; '
+                'external_vllm_http_ready; echo available:$?; '
+                'curl() { return 1; }; external_vllm_http_ready; echo unavailable:$?',
+                tmp_path,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ["available:0", "unavailable:1"])
+
     def test_worker_vllm_api_list_ring3_uses_all_active_local_endpoints(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -532,7 +578,7 @@ class TianshuProcessStatusTests(unittest.TestCase):
         self.assertIn('failed_component="VLLM"', implementation)
         self.assertIn('failed_component="Worker"', implementation)
         self.assertIn('stop_owned_compute', implementation)
-        self.assertIn('supervisor restarting owned pair after ${backoff}s', implementation)
+        self.assertIn('supervisor restarting owned services after ${backoff}s', implementation)
         self.assertIn('SUPERVISOR_MAX_BACKOFF', implementation)
 
     def test_compute_supervisor_probes_vllm_and_worker_health(self) -> None:
@@ -634,7 +680,7 @@ class TianshuProcessStatusTests(unittest.TestCase):
         implementation = text[start:end]
 
         self.assertIn('COMPUTE_SUPERVISOR_HEARTBEAT_SECONDS', implementation)
-        self.assertIn('supervisor heartbeat: VLLM PID', implementation)
+        self.assertIn('supervisor heartbeat: VLLM ${vllm_pid:-external}', implementation)
 
     def test_compute_health_probes_are_bounded_http_requests(self) -> None:
         text = SCRIPT.read_text()
