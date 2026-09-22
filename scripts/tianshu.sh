@@ -1846,7 +1846,7 @@ start_watchdog() {
                     echo "[$(date "+%F %T")] watchdog: API restart cooldown (${ELAPSED}s/${API_RESTART_COOLDOWN}s), skip" >> "'"${log_file}"'"
                 else
                     echo "[$(date "+%F %T")] watchdog: restarting API server via controlled lifecycle" >> "'"${log_file}"'"
-                    bash "$TIANSHU_SCRIPT" stop api >> "'"${log_file}"'" 2>&1
+                    TIANSHU_SKIP_WATCHDOG_STOP=1 bash "$TIANSHU_SCRIPT" stop api >> "'"${log_file}"'" 2>&1
                     bash "$TIANSHU_SCRIPT" start api >> "'"${log_file}"'" 2>&1
                     API_LAST_RESTART=$NOW
                 fi
@@ -2276,10 +2276,19 @@ cmd_stop() {
     local instance_index="${2:-}"
 
     case "$target" in
-        vllm)     stop_vllm ;;
-        api)      stop_api ;;
+        vllm)
+            [ "${TIANSHU_SKIP_WATCHDOG_STOP:-0}" = "1" ] || stop_watchdog
+            stop_vllm
+            ;;
+        api)
+            [ "${TIANSHU_SKIP_WATCHDOG_STOP:-0}" = "1" ] || stop_watchdog
+            stop_api
+            ;;
         mcp)      stop_mcp ;;
-        worker)   stop_workers "$instance_index" ;;
+        worker)
+            [ "${TIANSHU_SKIP_WATCHDOG_STOP:-0}" = "1" ] || stop_watchdog
+            stop_workers "$instance_index"
+            ;;
         watchdog) stop_watchdog ;;
         scheduler) stop_scheduler ;;
         reconciler) stop_parent_merge_reconciler ;;
@@ -2398,9 +2407,18 @@ cmd_restart() {
                 ;;
         esac
     fi
+    local restart_watchdog=0
+    case "$target" in
+        api|worker|vllm)
+            pid_file_owns_instance "${WORKER_LOG_DIR}/watchdog.pid" "tianshu-watchdog" && restart_watchdog=1
+            ;;
+    esac
     cmd_stop "$target" "$instance_index"
     sleep 3
     cmd_start "$target" "$instance_index"
+    if [ "$restart_watchdog" -eq 1 ]; then
+        start_watchdog
+    fi
 }
 
 cmd_drain() {
